@@ -2,7 +2,7 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-FROM quay.io/ascend/cann:9.0.1-a3-ubuntu22.04-py3.12
+FROM quay.io/ascend/cann:9.0.1-a3-ubuntu22.04-py3.11
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
@@ -69,12 +69,12 @@ RUN pip install pyyaml && \
     git submodule sync --recursive && \
     git submodule update --init --recursive && \
     git cherry-pick -n f495de675bce38a2fa21edbf067b73d2a5f26733 && \
-    bash ci/build.sh --python=3.12 && \
+    bash ci/build.sh --python=3.11 && \
     pip install dist/torch_npu-2.9.0*.whl && \
     git config --global --unset url."https://${GITEE_USER}:${GITEE_PASS}@gitee.com/".insteadOf
 
 RUN cd /root && rm -rf /root/pytorch && \
-    python -m pip install --no-cache-dir triton-ascend==3.2.1 \
+    python -m pip install --no-cache-dir triton-ascend==3.2.0 \
     --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple \
     --trusted-host triton-ascend.osinfra.cn && \
     pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
