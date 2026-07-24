@@ -2,7 +2,7 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-FROM quay.io/ascend/cann:8.5.1-a3-ubuntu22.04-py3.11
+FROM quay.io/ascend/cann:9.0.1-a3-ubuntu22.04-py3.12
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
@@ -69,12 +69,14 @@ RUN pip install pyyaml && \
     git submodule sync --recursive && \
     git submodule update --init --recursive && \
     git cherry-pick -n f495de675bce38a2fa21edbf067b73d2a5f26733 && \
-    bash ci/build.sh --python=3.11 && \
+    bash ci/build.sh --python=3.12 && \
     pip install dist/torch_npu-2.9.0*.whl && \
     git config --global --unset url."https://${GITEE_USER}:${GITEE_PASS}@gitee.com/".insteadOf
 
 RUN cd /root && rm -rf /root/pytorch && \
-    pip install triton-ascend==3.2.0 && \
+    python -m pip install --no-cache-dir triton-ascend==3.2.1 \
+    --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple \
+    --trusted-host triton-ascend.osinfra.cn && \
     pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps
 
@@ -129,7 +131,7 @@ RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu
 # Install Relax
 RUN cd /root/Relax && pip install -e .
 
-RUN pip install ray==2.55.1 && pip install protobuf==6.33.6
+RUN pip install ray==2.55.1 && pip install protobuf==6.33.6 && pip install fastapi==0.139.1
 
 #Clean cache
 RUN pip cache purge && \
