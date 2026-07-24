@@ -78,7 +78,7 @@ RUN cd /root && rm -rf /root/pytorch && \
     --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple \
     --trusted-host triton-ascend.osinfra.cn && \
     pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps
+    git clone https://github.com/redai-infra/TransferQueue.git /tmp/TransferQueue && cd /tmp/TransferQueue && git checkout dcc78f0a021284412921217fde71fea7cb276ffc && pip install . --no-deps
 
     # Clone Megatron-LM, MindSpeed, MindSpeed-Bridge, Megatron-Bridge and install
 RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
