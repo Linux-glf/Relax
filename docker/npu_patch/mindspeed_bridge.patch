@@ -31,6 +31,28 @@ index 818af29..ef97078 100644
              self.gated_delta_rule = chunk_gated_delta_rule
          elif self.use_ascend_gdn:
              self.gated_delta_rule = flash_gated_delta_rule
+diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+index 32939f8..9f054c2 100644
+--- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py
++++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+@@ -501,7 +501,7 @@ class Qwen3VLModel(MegatronModule):
+                 combined_embeddings = split_data_cp_rank(combined_embeddings, cp_size, 0, cp_rank)
+             if packed_seq_params is not None:
+                 if attention_mask is None:
+-                    attention_mask = torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
++                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
+                 input_ids_thd, _ = preprocess_packed_seqs(
+                     input_ids,
+                     attention_mask,
+@@ -560,7 +560,7 @@ class Qwen3VLModel(MegatronModule):
+             # convert lm_input_ids to THD format so it matches position_ids.
+             if packed_seq_params is not None:
+                 if attention_mask is None:
+-                    attention_mask = torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
++                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
+                 lm_input_ids, _ = preprocess_packed_seqs(
+                     input_ids,
+                     attention_mask,
 diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
 index 529eaa3..1df512c 100644
 --- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py

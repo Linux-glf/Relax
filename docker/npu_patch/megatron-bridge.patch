@@ -18,3 +18,28 @@ index 5a66e719..3d411c17 100644
  
              # Set the cleaned value (or None if it was removed)
              setattr(cleaned_obj, attr_name, cleaned_value)
+diff --git a/src/megatron/bridge/peft/utils.py b/src/megatron/bridge/peft/utils.py
+index 1ca5b18bd..4797e2e42 100644
+--- a/src/megatron/bridge/peft/utils.py
++++ b/src/megatron/bridge/peft/utils.py
+@@ -33,6 +33,7 @@ from megatron.core.transformer.moe.router import TopKRouter
+
+ from megatron.bridge.utils.import_utils import safe_import_from
+
++from relax.utils.device import is_npu_available
+
+ TEColumnParallelLinear, HAVE_TE_COL_LINEAR = safe_import_from(
+     "megatron.core.extensions.transformer_engine", "TEColumnParallelLinear"
+@@ -62,7 +63,10 @@ HAVE_TE = all(
+     )
+ )
+
+-MixedFusedLayerNorm, HAVE_APEX = safe_import_from("apex.normalization.fused_layer_norm", "MixedFusedLayerNorm")
++if is_npu_available:
++    MixedFusedLayerNorm, HAVE_APEX = None, False
++else:
++    MixedFusedLayerNorm, HAVE_APEX = safe_import_from("apex.normalization.fused_layer_norm", "MixedFusedLayerNorm")
+
+ TECL = (TEColumnParallelLinear, TELayerNormColumnParallelLinear, TEColumnParallelGroupedLinear)
+ TERL = (TERowParallelLinear, TERowParallelGroupedLinear)
+

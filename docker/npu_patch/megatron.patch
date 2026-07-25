@@ -655,10 +655,17 @@ index 4be974017..0dfdb0928 100644
          """
          Maintain the expert bias in float32.
 diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
-index 2edb652bf..58fb89c4e 100755
+index 2edb652bf..5cc0d2f55 100755
 --- a/megatron/core/transformer/multi_token_prediction.py
 +++ b/megatron/core/transformer/multi_token_prediction.py
-@@ -586,6 +586,102 @@ class MTPLossAutoScaler(torch.autograd.Function):
+@@ -1,5 +1,6 @@
+ # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ 
++import traceback
+ import warnings
+ from contextlib import nullcontext
+ from dataclasses import dataclass
+@@ -586,6 +587,102 @@ class MTPLossAutoScaler(torch.autograd.Function):
          MTPLossAutoScaler.main_loss_backward_scale = scale
  
  
@@ -761,7 +768,7 @@ index 2edb652bf..58fb89c4e 100755
  class MultiTokenPredictionLayer(MegatronModule):
      """The implementation for Multi-Token Prediction (MTP) which extends
      the prediction scope to multiple future tokens at each position.
-@@ -709,17 +805,19 @@ class MultiTokenPredictionLayer(MegatronModule):
+@@ -709,17 +806,19 @@ class MultiTokenPredictionLayer(MegatronModule):
              cp_group=self.cp_group,
              packed_seq_params=packed_seq_params,
          )
@@ -789,7 +796,7 @@ index 2edb652bf..58fb89c4e 100755
  
          return input_ids, position_ids, decoder_input, hidden_states
  
-@@ -821,22 +919,63 @@ class MultiTokenPredictionLayer(MegatronModule):
+@@ -821,22 +920,63 @@ class MultiTokenPredictionLayer(MegatronModule):
          return hidden_states
  
      def _checkpointed_forward(self, forward_func, *args, **kwargs):
@@ -857,6 +864,41 @@ index 2edb652bf..58fb89c4e 100755
                  )
  
          if self.config.recompute_method == 'uniform':
+@@ -1053,6 +1193,7 @@ class MultiTokenPredictionBlock(MegatronModule):
+         self._build_layers(pg_collection)
+         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
+         self.cp_group = pg_collection.cp
++        self._register_mtp_grad_hooks()
+ 
+     def _build_layers(self, pg_collection):
+         def build_layer(layer_spec, layer_number):
+@@ -1074,6 +1215,26 @@ class MultiTokenPredictionBlock(MegatronModule):
+             ]
+         )
+ 
++    def _register_mtp_grad_hooks(self):
++        if len(self.layers) == 0:
++            return
++
++        def _make_sync_hook():
++            def _hook(grad):
++                torch.npu.synchronize()
++            return _hook
++
++        sync_keys = [
++            "self_attention.linear_qkv.weight",
++            "eh_proj.weight",                    
++        ]
++
++        for name, param in self.layers[0].named_parameters():
++            for key in sync_keys:
++                if key in name:
++                    param.register_hook(_make_sync_hook())
++                    break
++
+     def forward(
+         self,
+         input_ids: Tensor,
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
 index eaae58590..0f01f6bc0 100644
 --- a/megatron/core/transformer/transformer_config.py

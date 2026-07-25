@@ -10,6 +10,8 @@ ARG NO_PROXY
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
+ARG GITEE_USER
+ARG GITEE_PASS
 
 ENV http_proxy=${HTTP_PROXY} \
     https_proxy=${HTTPS_PROXY} \
@@ -59,12 +61,16 @@ RUN pip install --upgrade pip packaging setuptools==80.10.2 && \
     pip install numpy==1.26.0
     # build torch_npu
 RUN pip install pyyaml && \
+    git config --global url."https://${GITEE_USER}:${GITEE_PASS}@gitee.com/".insteadOf "https://gitee.com/" && \
     git clone https://gitcode.com/Ascend/pytorch.git /root/pytorch && \
     cd /root/pytorch && \
     git checkout v2.9.0-7.3.0 && \
+    git submodule sync --recursive && \
+    git submodule update --init --recursive && \
     git cherry-pick -n f495de675bce38a2fa21edbf067b73d2a5f26733 && \
     bash ci/build.sh --python=3.11 && \
-    pip install dist/torch_npu-2.9.0*.whl
+    pip install dist/torch_npu-2.9.0*.whl && \
+    git config --global --unset url."https://${GITEE_USER}:${GITEE_PASS}@gitee.com/".insteadOf
 RUN cd /root && rm -rf /root/pytorch && \
     pip install triton-ascend==3.2.0 && \
     pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
@@ -121,7 +127,7 @@ RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu
 # Install Relax
 RUN cd /root/Relax && pip install -e .
 
-RUN pip install ray==2.55.1 && pip install protobuf==6.33.6
+RUN pip install ray==2.55.1 && pip install protobuf==6.33.6 && pip install fastapi==0.139.1
 
 #Clean cache
 RUN pip cache purge && \
