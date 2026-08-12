@@ -1,13 +1,176 @@
-From 1bf8b943fa46b025618857cf0efed7ac7b5fb9b5 Mon Sep 17 00:00:00 2001
-From: wuqiwei <wuqiwei4@huawei.com>
-Date: Thu, 23 Jul 2026 08:44:55 +0000
-Subject: [PATCH 1/5] sglang_npu_patch
-
----
- python/sglang/srt/layers/quantization/unquant.py | 8 ++++----
- python/sglang/srt/utils/common.py                | 4 +++-
- 2 files changed, 7 insertions(+), 5 deletions(-)
-
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
+index 7f506e7f1a..204b9382e8 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
+@@ -5,11 +5,6 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
+     fused_gdn_gating_kernel_without_sigmoid,
+     fused_gdn_gating_npu,
+ )
+-from sgl_kernel_npu.mamba.causal_conv1d import (
+-    causal_conv1d_fn_npu,
+-    causal_conv1d_update_npu,
+-    causal_conv1d_update_v2,
+-)
+ 
+ from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+     AscendMambaAttnBackendBase,
+@@ -26,8 +21,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
+ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+ 
+ fused_gdn_gating = fused_gdn_gating_npu
+-causal_conv1d_fn = causal_conv1d_fn_npu
+-causal_conv1d_update = causal_conv1d_update_npu
+ 
+ 
+ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -109,6 +102,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+         self._prepare_mamba_track_metadata(forward_batch)
+         self.graph_mode = False
+ 
++    def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
++        w = getattr(layer, "_conv_weights_t", None)
++        if w is None:
++            w = layer.conv_weights.transpose(0, 1).contiguous()
++            layer._conv_weights_t = w
++        return w
++
+     def forward_decode(
+         self,
+         layer: RadixLinearAttention,
+@@ -125,16 +125,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+         cache_indices = self.forward_metadata.mamba_cache_indices
+ 
+         assert isinstance(mixed_qkv, torch.Tensor)
+-        conv_states_tmp = conv_states.transpose(1, 2).clone()
+-        mixed_qkv = causal_conv1d_update(
++        mixed_qkv = torch.ops.npu.causal_conv1d(
+             mixed_qkv,
+-            conv_states_tmp,
+-            layer.conv_weights,
+-            layer.bias,
+-            layer.activation,
+-            conv_state_indices=cache_indices,
++            self._get_conv_weights_t(layer),
++            conv_states=conv_states,
++            bias=layer.bias,
++            query_start_loc=query_start_loc,
++            cache_indices=cache_indices,
++            activation_mode=1,
++            pad_slot_id=-1,
++            run_mode=1,
+         )
+-        conv_states[:] = conv_states_tmp.transpose(1, 2)
+ 
+         query, key, value = torch.split(
+             mixed_qkv,
+@@ -219,44 +220,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+                 dtype=torch.int32,
+                 device=mixed_qkv.device,
+             )
+-            mixed_qkv = causal_conv1d_update_v2(
+-                x=mixed_qkv.view(batch_size, draft_token_num, -1).contiguous(),
+-                conv_state=conv_states.contiguous(),
+-                weight=layer.conv_weights.transpose(0, 1).contiguous(),
++            mixed_qkv = torch.ops.npu.causal_conv1d(
++                mixed_qkv,
++                self._get_conv_weights_t(layer),
++                conv_states=conv_states,
+                 bias=layer.bias,
+-                activation=layer.activation,
+-                conv_state_indices=cache_indices,
++                query_start_loc=query_start_loc,
++                cache_indices=cache_indices,
+                 num_accepted_tokens=num_accepted_tokens,
++                activation_mode=1,
+                 pad_slot_id=-1,
+-                validate_data=False,
+-            ).view(seq_len, -1)
++                run_mode=1,
++            )
+         else:
+-            mixed_qkv = mixed_qkv.transpose(0, 1)
+             if forward_metadata.has_mamba_track_mask:
+-                mixed_qkv_to_track = mixed_qkv[
+-                    :, forward_metadata.track_conv_indices
+-                ].transpose(0, 1)
+-                conv_states.transpose(1, 2)[
+-                    forward_metadata.conv_states_mask_indices
+-                ] = mixed_qkv_to_track
++                mixed_qkv_to_track = mixed_qkv[forward_metadata.track_conv_indices]
++                conv_states[forward_metadata.conv_states_mask_indices] = (
++                    mixed_qkv_to_track
++                )
+             kernel_size = layer.conv_weights.shape[-1]
+-            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
+-            conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
+-
+-            mixed_qkv = causal_conv1d_fn(
++            conv_states_for_prefill = conv_states[
++                :, -(kernel_size - 1) :, :
++            ].contiguous()
++            mixed_qkv = torch.ops.npu.causal_conv1d(
+                 mixed_qkv,
+-                layer.conv_weights,
+-                layer.bias,
+-                activation=layer.activation,
+-                conv_states=conv_states_tmp,
+-                has_initial_state=has_initial_states,
+-                cache_indices=cache_indices,
++                self._get_conv_weights_t(layer),
++                conv_states=conv_states_for_prefill,
++                bias=layer.bias,
+                 query_start_loc=query_start_loc,
+-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+-            ).transpose(0, 1)[:seq_len]
+-            conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp.transpose(
+-                1, 2
+-            ).contiguous()
++                cache_indices=cache_indices,
++                has_initial_state=has_initial_states,
++                activation_mode=1,
++                pad_slot_id=-1,
++                run_mode=0,
++            )
++            conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
+         if is_target_verify:
+             g, beta = fused_gdn_gating_kernel_without_sigmoid(
+                 layer.A_log, a, b, layer.dt_bias
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+index 919f46619a..c8a185388a 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+@@ -37,6 +37,21 @@ if TYPE_CHECKING:
+         BaseCudaGraphRunner,
+     )
+ 
++@contextmanager
++def _disable_tms_during_graph_capture():
++    try:
++        from torch_memory_saver import torch_memory_saver
++        _impl = torch_memory_saver._impl
++    except Exception:
++        _impl = None
++
++    if _impl is not None:
++        _impl._binary_wrapper.cdll.tms_set_interesting_region(False)
++    try:
++        yield
++    finally:
++        if _impl is not None:
++            _impl._binary_wrapper.cdll.tms_set_interesting_region(True)
+ 
+ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+     """One torch.npu.NPUGraph per shape; attention metadata captured
+@@ -117,7 +132,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+             stream=self._capture_stream,
+             auto_dispatch_capture=True,
+         ):
+-            out = forward_fn()
++            with _disable_tms_during_graph_capture():
++                out = forward_fn()
+ 
+         self._graphs[shape_key] = graph
+         self._outputs[shape_key] = out
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
 index 82a3d77f05..25d4c21406 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
@@ -27,42 +190,332 @@ index 82a3d77f05..25d4c21406 100644
  
          return
  
-diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
-index 82db90da3b..aabd222d7e 100644
---- a/python/sglang/srt/utils/common.py
-+++ b/python/sglang/srt/utils/common.py
-@@ -73,6 +73,7 @@ from typing import (
-     TypeVar,
-     Union,
- )
-+from relax.utils.device import is_npu_available
- from unittest import SkipTest
- from unittest.case import _ShouldStop
- from urllib.parse import unquote, urlparse
-@@ -176,7 +177,8 @@ def is_npu() -> bool:
-     if not hasattr(torch, "npu"):
-         return False
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index e83e4157fa..19ed3f244b 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -81,6 +81,170 @@ class Sampler(nn.Module):
+         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
+         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
+         self.use_ascend_backend = get_flags().sampling_backend == "ascend"
++        # Generate uniform noise on a side stream while the model is running, and
++        # apply the exponential-race transform at consumption time on the main stream
++        self.enable_async_exponential = is_npu() and get_bool_env_var(
++            "SGLANG_NPU_ASYNC_EXPONENTIAL"
++        )
++        self._async_exponential_stream = None
++        self._async_exponential_event = None
++        self._async_exponential_u = None
++        self._async_exponential_pending = False
++        self._async_exp_min_bound = None
++
++    def can_prepare_async_exponential(
++        self, sampling_info: SamplingBatchInfo
++    ) -> bool:
++        """Return whether this batch can use precomputed uniform noise."""
++        return (
++            self.enable_async_exponential
++            and not sampling_info.is_all_greedy
++            and sampling_info.sampling_seed is None
++            and not sampling_info.need_top_p_sampling
++            and not sampling_info.need_top_k_sampling
++            and not sampling_info.need_min_p_sampling
++        )
++
++    @torch.no_grad()
++    def prepare_async_exponential(
++        self,
++        batch_size: int,
++        vocab_size: int,
++        sampling_info: SamplingBatchInfo,
++        device: torch.device,
++    ) -> bool:
++        """Enqueue U(0,1) noise before model forward on a dedicated NPU stream.
++
++        Reusing the buffer is safe because the side stream first waits for all
++        previously enqueued work on the current stream. The sampling path later
++        inserts a device-side event wait; it never synchronizes the CPU.
++        """
++        if not self.can_prepare_async_exponential(sampling_info):
++            return False
++
++        # A delayed sampler may still own the previous buffer. Do not overwrite it.
++        if self._async_exponential_pending:
++            logger.warning(
++                "Skip async exponential preparation because the previous batch "
++                "has not consumed its random buffer"
++            )
++            return False
++
++        if self._async_exponential_stream is None:
++            self._async_exponential_stream = torch.npu.Stream()
++            self._async_exponential_event = torch.npu.Event()
++            logger.info(
++                "Enabled asynchronous NPU exponential-race sampling "
++                "(uniform noise on side stream, stock-exponential argmax consumption)"
++            )
++
++        current_stream = torch.npu.current_stream()
++        self._async_exponential_stream.wait_stream(current_stream)
++
++        expected_shape = (batch_size, vocab_size)
++        with torch.npu.stream(self._async_exponential_stream):
++            u = self._async_exponential_u
++            if (
++                u is None
++                or tuple(u.shape) != expected_shape
++                or u.dtype != torch.float32
++                or u.device.type != torch.device(device).type
++            ):
++                # SGLang converts next-token logits to FP32 before sampling; the
++                # noise grid must match CANN's fp32 uniform to preserve the
++                # incumbent sampling distribution.
++                u = torch.empty(
++                    expected_shape,
++                    dtype=torch.float32,
++                    device=device,
++                )
++                self._async_exponential_u = u
++            u.uniform_()
++            self._async_exponential_event.record()
++
++        self._async_exponential_pending = True
++        return True
++
++    def _sample_with_async_exponential(
++        self, probs: torch.Tensor
++    ) -> Optional[torch.Tensor]:
++        """Consume precomputed U(0,1) noise using the exponential-race identity.
++
++        The full stock exponential_ transform (complement + clamp + -log) runs
++        here on the main stream (serial work that the sampling path owns
++        anyway), keeping the side stream free of AIV kernels so it cannot
++        slow down the model forward.
++        """
++        if not self._async_exponential_pending:
++            return None
++
++        u = self._async_exponential_u
++        self._async_exponential_pending = False
++        if (
++            u is None
++            or u.shape != probs.shape
++            or u.dtype != probs.dtype
++            or u.device != probs.device
++        ):
++            logger.warning(
++                "Async uniform buffer does not match probs; falling back to "
++                "torch.multinomial (u=%s/%s/%s, probs=%s/%s/%s)",
++                None if u is None else tuple(u.shape),
++                None if u is None else u.dtype,
++                None if u is None else u.device,
++                tuple(probs.shape),
++                probs.dtype,
++                probs.device,
++            )
++            return None
++
++        current_stream = torch.npu.current_stream()
++        current_stream.wait_event(self._async_exponential_event)
++        u.record_stream(current_stream)
++
++        # Do not modify probs in place: the standard backend reuses it for logprobs.
++        bound = self._async_exp_min_bound
++        if bound is None or bound.dtype != u.dtype or bound.device != u.device:
++            bound = torch.full(
++                (),
++                1.0 - torch.finfo(u.dtype).eps / 2.0,
++                dtype=u.dtype,
++                device=u.device,
++            )
++            self._async_exp_min_bound = bound
++        u.neg_().add_(1.0)
++        torch.minimum(u, bound, out=u)
++        u.log_().neg_()
++        sampled_index = torch.div(probs, u).argmax(dim=-1)
++        return sampled_index.view(-1).to(torch.int32)
  
--    if not torch.npu.is_available():
-+    # if not torch.npu.is_available():
-+    if not is_npu_available:
-         raise RuntimeError(
-             "torch_npu detected, but NPU device is not available or visible."
+     def _preprocess_logits(
+         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+@@ -115,6 +279,9 @@ class Sampler(nn.Module):
+                 to get the unique seed for each position.
+         """
+         logits = logits_output.next_token_logits
++        # In the plain probability path, keep the softmax output and apply log
++        # only to the values requested by the caller.
++        logprobs_are_probs = False
+ 
+         # Preprocess logits (custom processors and NaN handling)
+         logits = self._preprocess_logits(logits, sampling_info)
+@@ -180,9 +347,13 @@ class Sampler(nn.Module):
+                 # Standard path: do softmax and sample from probs.
+                 logits.div_(sampling_info.temperatures)
+ 
+-                # In-place op to save memory
+-                logits[:] = torch.softmax(logits, dim=-1)
+-                probs = logits
++                # Do not write the softmax output back into logits
++                probs = torch.softmax(logits, dim=-1)
+ 
+                 batch_next_token_ids = self._sample_from_probs(
+                     probs, sampling_info, positions, simple_sampling_case
+@@ -191,8 +362,9 @@ class Sampler(nn.Module):
+                     logprobs = (
+                         logprobs_via_logsoftmax_kernel
+                         if logprobs_via_logsoftmax_kernel is not None
+-                        else torch.log(probs)
++                        else probs
+                     )
++                    logprobs_are_probs = logprobs_via_logsoftmax_kernel is None
+                 del probs
+ 
+         # Attach logprobs to logits_output (in-place modification)
+@@ -206,6 +378,7 @@ class Sampler(nn.Module):
+                 token_ids_logprobs,
+                 sampling_info,
+                 batch_next_token_ids,
++                logprobs_are_probs,
+             )
+ 
+         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+@@ -225,11 +398,13 @@ class Sampler(nn.Module):
+         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
+         """
+         if simple_sampling_case:
+-            batch_next_token_ids = sampling_from_probs_torch(
+-                probs,
+-                sampling_seed=sampling_info.sampling_seed,
+-                positions=positions,
+-            )
++            batch_next_token_ids = self._sample_with_async_exponential(probs)
++            if batch_next_token_ids is None:
++                batch_next_token_ids = sampling_from_probs_torch(
++                    probs,
++                    sampling_seed=sampling_info.sampling_seed,
++                    positions=positions,
++                )
+         else:
+             backend = get_flags().sampling_backend
+             if backend == "flashinfer":
+@@ -302,7 +477,11 @@ class Sampler(nn.Module):
+                     probabilities, sampling_info.sampling_seed, positions
+                 ).view(-1)
+             else:
+-                batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
++                batch_next_token_ids = self._sample_with_async_exponential(probs)
++                if batch_next_token_ids is None:
++                    batch_next_token_ids = torch.multinomial(
++                        probs, num_samples=1
++                    ).view(-1)
+             return batch_next_token_ids.to(torch.int32)
+         else:
+             assert (
+@@ -353,9 +532,14 @@ class Sampler(nn.Module):
+         token_ids_logprobs: List[List[int]],
+         sampling_info: SamplingBatchInfo,
+         batch_next_token_ids: torch.Tensor,
++        logprobs_are_probs: bool,
+     ):
+-        # clamp to avoid -inf values
+-        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
++        # Clamp the extracted values instead of the full vocab
++        clamp_min = torch.finfo(logprobs.dtype).min
+ 
+         # Attach logprobs to logits_output (in-place modification)
+         if any(x > 0 for x in top_logprobs_nums):
+@@ -363,6 +547,20 @@ class Sampler(nn.Module):
+                 logits_output.next_token_top_logprobs_val,
+                 logits_output.next_token_top_logprobs_idx,
+             ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
++            # Same extraction as get_top_logprobs, but clamp the
++            # [batch, max_k] topk result in a single kernel before
++            # slicing per request.
++            max_k = max(top_logprobs_nums)
++            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
++            if logprobs_are_probs:
++                top_vals.log_()
++            top_vals.clamp_(min=clamp_min)
++            logits_output.next_token_top_logprobs_val = [
++                top_vals[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
++            logits_output.next_token_top_logprobs_idx = [
++                top_idx[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
+ 
+         if any(x is not None for x in token_ids_logprobs):
+             (
+@@ -372,10 +570,19 @@ class Sampler(nn.Module):
+                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
+             )
+ 
+-        logits_output.next_token_logprobs = logprobs[
+-            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
+-            batch_next_token_ids,
+-        ]
++            for row in logits_output.token_ids_logprobs_val:
++                if torch.is_tensor(row):
++                    if logprobs_are_probs:
++                        row.log_()
++                    row.clamp_(min=clamp_min)
++
++        # Gather one value per row directly; this removes the temporary arange
++        # and the 2-D advanced-index operation from the hot path.
++        token_indices = batch_next_token_ids.to(dtype=torch.long).view(-1, 1)
++        next_token_logprobs = torch.gather(logprobs, dim=1, index=token_indices).view(-1)
++        if logprobs_are_probs:
++            next_token_logprobs.log_()
++        logits_output.next_token_logprobs = next_token_logprobs.clamp_(min=clamp_min)
+ 
+     def _sync_token_ids_across_tp(
+         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 3db49daf82..fdc5f40d81 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -486,6 +486,35 @@ class TpModelWorker(BaseTpWorker):
+             can_run_cuda_graph=can_run_cuda_graph,
          )
--- 
-2.34.1
-
-
-From 6ba9e861e0c32c4b299ad5b7b6e7e11c8a441534 Mon Sep 17 00:00:00 2001
-From: David Wang <david.wang@modal.com>
-Date: Fri, 19 Jun 2026 00:19:40 +0000
-Subject: [PATCH 2/5] fix mamba radix partial page prefix matching
-
----
- .../sglang/srt/mem_cache/mamba_radix_cache.py |  9 ++++
- .../unit/mem_cache/test_mamba_unittest.py     | 52 +++++++++++++++++++
- 2 files changed, 61 insertions(+)
-
+ 
++    def _prepare_async_exponential(
++        self,
++        forward_batch: ForwardBatch,
++        is_verify: bool,
++    ) -> None:
++        """Start simple-sampling RNG before forward so it can overlap on NPU."""
++        if (
++            is_verify
++            or self.enable_spec
++            or forward_batch.is_prefill_only
++            or not forward_batch.forward_mode.is_decode()
++            or forward_batch.sampling_info is None
++            or forward_batch.sampling_info.grammars is not None
++        ):
++            return
++
++        sampler = self.model_runner.sampler
++        prepare = getattr(sampler, "prepare_async_exponential", None)
++        if prepare is None:
++            return
++
++        prepare(
++            batch_size=forward_batch.batch_size,
++            vocab_size=self.model_runner.model_config.vocab_size,
++            sampling_info=forward_batch.sampling_info,
++            device=forward_batch.input_ids.device,
++        )
++
++
+     def forward_batch_generation(
+         self,
+         batch: Optional[ScheduleBatch],
+@@ -511,6 +540,7 @@ class TpModelWorker(BaseTpWorker):
+             return self._forward_batch_generation_dllm(forward_batch)
+ 
+         if self.pp_group.is_last_rank:
++            self._prepare_async_exponential(forward_batch, is_verify)
+             out = self.model_runner.forward(
+                 forward_batch,
+                 pp_proxy_tensors=pp_proxy_tensors,
 diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
 index 368781d8d5..0856caae48 100644
 --- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
@@ -104,82 +557,172 @@ index 368781d8d5..0856caae48 100644
          child.value = child.value[split_len:].clone()
          new_node.parent.children[key.child_key(self.page_size)] = new_node
          new_node.hash_value, child.hash_value = split_node_hash_value(
-diff --git a/test/registered/unit/mem_cache/test_mamba_unittest.py b/test/registered/unit/mem_cache/test_mamba_unittest.py
-index 9ad577b42e..390a3721c5 100755
---- a/test/registered/unit/mem_cache/test_mamba_unittest.py
-+++ b/test/registered/unit/mem_cache/test_mamba_unittest.py
-@@ -419,6 +419,58 @@ class TestMamba(unittest.TestCase):
-         self.assertEqual(list(second_insert_events[0].token_ids), [5])
-         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 031ab4fe87..93e14ff483 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -49,7 +49,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+     ForwardBatchDeepSeekMHAMixin,
+ )
+ from sglang.srt.model_executor.triton_ops.position import compute_position_triton
+-from sglang.srt.runtime_context import get_parallel
++from sglang.srt.runtime_context import get_parallel, get_server_args
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     is_cuda,
+@@ -1053,11 +1053,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+         return mrope_positions
  
-+    def test_mamba_radix_cache_limited_partial_page_match_does_not_split(self):
-+        page_size = 64
-+        tree = self._setup_minimal_mamba_radix_cache(page_size)
-+        token_ids = array("q", range(page_size))
+     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
++        mm_inputs = batch.multimodal_inputs
++        rl_on_policy_target = get_server_args().rl_on_policy_target
 +
-+        tree.insert(
-+            InsertParams(
-+                key=RadixKey(token_ids, None),
-+                value=torch.arange(page_size),
-+                mamba_value=torch.tensor([0]),
++        if (
++            self.spec_info is None
++            and batch.dllm_config is None
++            and (
++                rl_on_policy_target is not None
++                or all(mm_input is None for mm_input in mm_inputs)
 +            )
++        ):
++            # Regular text generation does not need to rebuild mRoPE on the
++            # host. init_new has already produced the same flattened token
++            # positions on model_runner.device: clamp_position() for decode,
++            # or compute_position() for extend/mixed. Text mRoPE has identical
++            # temporal/height/width coordinates, so materialize the three rows
++            # directly and avoid the per-request host factories, cat, and H2D.
++            self.mrope_positions = (
++                self.positions.to(dtype=torch.int64).unsqueeze(0).repeat(3, 1)
++            )
++            return
+         # batch_size * [3 * seq_len]
+         batch_size = self.seq_lens_cpu.shape[0]
+         mrope_positions_list = [[]] * batch_size
+         for batch_idx in range(batch_size):
+-            mm_input = batch.multimodal_inputs[batch_idx]
++            mm_input = mm_inputs[batch_idx]
+             if self.forward_mode.is_decode():
+                 # 3 * N
+                 if (
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index d5aac381dc..fa16cd6670 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -37,6 +37,7 @@ from sglang.srt.distributed import (
+     moe_tensor_model_parallel_all_reduce,
+     tensor_model_parallel_all_reduce,
+ )
++from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+@@ -93,7 +94,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_executor.runner import get_is_capture_mode
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+-from sglang.srt.runtime_context import get_flags, get_parallel
++from sglang.srt.runtime_context import (
++    get_flags,
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     add_prefix,
+@@ -106,14 +113,6 @@ from sglang.srt.utils import (
+     make_layers,
+     use_intel_amx_backend,
+ )
+-
+-if is_npu():
+-    from sglang.srt.hardware_backend.npu.cmo import (
+-        shared_expert_on_independent_stream,
+-        wait_share_stream,
+-    )
+-
+-from sglang.srt.environ import envs
+ from sglang.srt.utils.hf_transformers_utils import get_rope_config
+ 
+ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+@@ -446,9 +445,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             # router_logits: (num_tokens, n_experts)
+             router_logits, _ = self.gate(hidden_states)
+             if enable_dual_stream:
+-                shared_output = shared_expert_on_independent_stream(
+-                    hidden_states.clone(), self._forward_shared_experts
+-                )
++                current_stream = torch.npu.current_stream()
++                self.alt_stream.wait_stream(current_stream)
++                with torch.npu.stream(self.alt_stream):
++                    shared_output = self._forward_shared_experts(hidden_states)
++                    shared_output.record_stream(self.alt_stream)
++                    shared_event = self.alt_stream.record_event()
+             else:
+                 shared_output = self._forward_shared_experts(hidden_states)
+             topk_output = self.topk(
+@@ -469,8 +471,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             hidden_states=hidden_states,
+             topk_output=topk_output,
+         )
+-        if enable_dual_stream:
+-            wait_share_stream()
++        if hidden_states.shape[0] > 0 and enable_dual_stream:
++            torch.npu.current_stream().wait_event(shared_event)
+ 
+         if shared_output is not None:
+             final_hidden_states.add_(shared_output)
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index fed78cf888..7b6505fa10 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -35,6 +35,7 @@ from sglang.srt.configs.qwen3_5 import (
+ 
+ # Distributed
+ from sglang.srt.distributed import get_pp_group
++from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ 
+@@ -608,7 +609,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+                 quant_config=quant_config,
+                 alt_stream=(
+                     alt_stream
+-                    if (_is_cuda or _disable_shared_experts_fusion())
++                    if (
++                        _is_cuda
++                        or _disable_shared_experts_fusion()
++                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
++                    )
+                     else None
+                 ),
+                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+@@ -824,7 +829,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+                 quant_config=quant_config,
+                 alt_stream=(
+                     alt_stream
+-                    if (_is_cuda or _disable_shared_experts_fusion())
++                    if (
++                        _is_cuda
++                        or _disable_shared_experts_fusion()
++                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
++                    )
+                     else None
+                 ),
+                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+@@ -1207,6 +1216,11 @@ class Qwen3_5ForCausalLM(nn.Module):
+             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
+ 
+         alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
++        alt_stream = (
++            torch.cuda.Stream()
++            if _is_cuda or _hip_use_alt_stream or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
++            else None
 +        )
-+
-+        match = tree.match_prefix(
-+            MatchPrefixParams(key=RadixKey(token_ids, None, limit=page_size - 1))
-+        )
-+
-+        self.assertEqual(len(match.device_indices), 0)
-+        self.assertEqual(self._non_root_key_lengths(tree), [page_size])
-+
-+    def _setup_minimal_mamba_radix_cache(self, page_size: int) -> MambaRadixCache:
-+        tree = MambaRadixCache.__new__(MambaRadixCache)
-+        tree.page_size = page_size
-+        tree.mamba_cache_chunk_size = page_size
-+        tree.disable = False
-+        tree.device = torch.device("cpu")
-+        tree.enable_kv_cache_events = False
-+        tree.kv_event_queue = []
-+        tree.full_evictable_size_ = 0
-+        tree.mamba_evictable_size_ = 0
-+        tree.full_protected_size_ = 0
-+        tree.mamba_protected_size_ = 0
-+
-+        tree.root_node = TreeNode()
-+        tree.root_node.key = RadixKey(array("q"), None)
-+        tree.root_node.value = []
-+        tree.root_node.hash_value = []
-+        tree.root_node.full_lock_ref = 1
-+        tree.root_node.mamba_lock_ref = 1
-+        tree.full_lru_list = LRUList(mamba=False)
-+        tree.mamba_lru_list = LRUList(mamba=True)
-+        return tree
-+
-+    def _non_root_key_lengths(self, tree: MambaRadixCache) -> list[int]:
-+        lengths = []
-+        stack = list(tree.root_node.children.values())
-+        while stack:
-+            node = stack.pop()
-+            lengths.append(len(node.key))
-+            stack.extend(node.children.values())
-+        return lengths
-+
-     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
-         """Helper to create a MambaRadixCache with allocator for testing."""
-         server_args = ServerArgs(model_path="dummy", page_size=1)
--- 
-2.34.1
-
-
-From 9f5d5ac59b474998956f2ac2e9e494ee2c6529a6 Mon Sep 17 00:00:00 2001
-From: wuqiwei <wuqiwei4@huawei.com>
-Date: Wed, 5 Aug 2026 09:26:57 +0000
-Subject: [PATCH 3/5] [NPU] Enable non-greedy MTP sampling- #32495 #32495
-
----
- python/sglang/srt/speculative/eagle_utils.py | 98 +++++++++++++-------
- 1 file changed, 67 insertions(+), 31 deletions(-)
-
+ 
+         # Embedding layer
+         if self.pp_group.is_first_rank:
 diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
 index daf9fa82e2..f00f718fd2 100644
 --- a/python/sglang/srt/speculative/eagle_utils.py
@@ -320,19 +863,28 @@ index daf9fa82e2..f00f718fd2 100644
          sampling_fn(
              predicts=predict,  # mutable
              accept_index=accept_index,  # mutable
--- 
-2.34.1
-
-
-From 32ffa124368440360bc966cdaca9f44dac5aaf72 Mon Sep 17 00:00:00 2001
-From: wuqiwei <wuqiwei4@huawei.com>
-Date: Thu, 6 Aug 2026 08:10:11 +0000
-Subject: [PATCH 4/5] for tms cuda_gragh
-
----
- python/sglang/srt/utils/torch_memory_saver_adapter.py | 9 ++++++---
- 1 file changed, 6 insertions(+), 3 deletions(-)
-
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index 82db90da3b..aabd222d7e 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -73,6 +73,7 @@ from typing import (
+     TypeVar,
+     Union,
+ )
++from relax.utils.device import is_npu_available
+ from unittest import SkipTest
+ from unittest.case import _ShouldStop
+ from urllib.parse import unquote, urlparse
+@@ -176,7 +177,8 @@ def is_npu() -> bool:
+     if not hasattr(torch, "npu"):
+         return False
+ 
+-    if not torch.npu.is_available():
++    # if not torch.npu.is_available():
++    if not is_npu_available:
+         raise RuntimeError(
+             "torch_npu detected, but NPU device is not available or visible."
+         )
 diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
 index ad98e59283..a5b2cdfd32 100644
 --- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
@@ -367,55 +919,66 @@ index ad98e59283..a5b2cdfd32 100644
          yield
  
      @contextmanager
--- 
-2.34.1
-
-
-From 8c023fdbdf6d0ccf062f88a26a52cb2545b0683a Mon Sep 17 00:00:00 2001
-From: wuqiwei <wuqiwei4@huawei.com>
-Date: Thu, 6 Aug 2026 08:10:48 +0000
-Subject: [PATCH 5/5] disable tms cuda_gragh
-
----
- .../npu/graph_runner/npu_cudagraph_backend.py  | 18 +++++++++++++++++-
- 1 file changed, 17 insertions(+), 1 deletion(-)
-
-diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
-index 919f46619a..c8a185388a 100644
---- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
-+++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
-@@ -37,6 +37,21 @@ if TYPE_CHECKING:
-         BaseCudaGraphRunner,
-     )
+diff --git a/test/registered/unit/mem_cache/test_mamba_unittest.py b/test/registered/unit/mem_cache/test_mamba_unittest.py
+index 9ad577b42e..390a3721c5 100755
+--- a/test/registered/unit/mem_cache/test_mamba_unittest.py
++++ b/test/registered/unit/mem_cache/test_mamba_unittest.py
+@@ -419,6 +419,58 @@ class TestMamba(unittest.TestCase):
+         self.assertEqual(list(second_insert_events[0].token_ids), [5])
+         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
  
-+@contextmanager
-+def _disable_tms_during_graph_capture():
-+    try:
-+        from torch_memory_saver import torch_memory_saver
-+        _impl = torch_memory_saver._impl
-+    except Exception:
-+        _impl = None
++    def test_mamba_radix_cache_limited_partial_page_match_does_not_split(self):
++        page_size = 64
++        tree = self._setup_minimal_mamba_radix_cache(page_size)
++        token_ids = array("q", range(page_size))
 +
-+    if _impl is not None:
-+        _impl._binary_wrapper.cdll.tms_set_interesting_region(False)
-+    try:
-+        yield
-+    finally:
-+        if _impl is not None:
-+            _impl._binary_wrapper.cdll.tms_set_interesting_region(True)
- 
- class NPUCudaGraphBackend(BaseCudaGraphBackend):
-     """One torch.npu.NPUGraph per shape; attention metadata captured
-@@ -117,7 +132,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
-             stream=self._capture_stream,
-             auto_dispatch_capture=True,
-         ):
--            out = forward_fn()
-+            with _disable_tms_during_graph_capture():
-+                out = forward_fn()
- 
-         self._graphs[shape_key] = graph
-         self._outputs[shape_key] = out
--- 
-2.34.1
-
++        tree.insert(
++            InsertParams(
++                key=RadixKey(token_ids, None),
++                value=torch.arange(page_size),
++                mamba_value=torch.tensor([0]),
++            )
++        )
++
++        match = tree.match_prefix(
++            MatchPrefixParams(key=RadixKey(token_ids, None, limit=page_size - 1))
++        )
++
++        self.assertEqual(len(match.device_indices), 0)
++        self.assertEqual(self._non_root_key_lengths(tree), [page_size])
++
++    def _setup_minimal_mamba_radix_cache(self, page_size: int) -> MambaRadixCache:
++        tree = MambaRadixCache.__new__(MambaRadixCache)
++        tree.page_size = page_size
++        tree.mamba_cache_chunk_size = page_size
++        tree.disable = False
++        tree.device = torch.device("cpu")
++        tree.enable_kv_cache_events = False
++        tree.kv_event_queue = []
++        tree.full_evictable_size_ = 0
++        tree.mamba_evictable_size_ = 0
++        tree.full_protected_size_ = 0
++        tree.mamba_protected_size_ = 0
++
++        tree.root_node = TreeNode()
++        tree.root_node.key = RadixKey(array("q"), None)
++        tree.root_node.value = []
++        tree.root_node.hash_value = []
++        tree.root_node.full_lock_ref = 1
++        tree.root_node.mamba_lock_ref = 1
++        tree.full_lru_list = LRUList(mamba=False)
++        tree.mamba_lru_list = LRUList(mamba=True)
++        return tree
++
++    def _non_root_key_lengths(self, tree: MambaRadixCache) -> list[int]:
++        lengths = []
++        stack = list(tree.root_node.children.values())
++        while stack:
++            node = stack.pop()
++            lengths.append(len(node.key))
++            stack.extend(node.children.values())
++        return lengths
++
+     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
+         """Helper to create a MambaRadixCache with allocator for testing."""
+         server_args = ServerArgs(model_path="dummy", page_size=1)
