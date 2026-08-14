@@ -19,9 +19,17 @@ index 99ccba5..8fa07a1 100644
              # Set the cleaned value (or None if it was removed)
              setattr(cleaned_obj, attr_name, cleaned_value)
 diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
-index 19a3b9d..1417c33 100644
+index 19a3b9d..3dd5e25 100644
 --- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
 +++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
+@@ -1,6 +1,6 @@
+ # pylint: disable=R0801
+ from typing import List, Optional, Tuple
+-
++import os
+ import torch
+ from torch import nn
+ import torch.nn.functional as F
 @@ -37,12 +37,11 @@ from megatron.core.ssm.gated_delta_net import (
  )
  
@@ -50,18 +58,20 @@ index 19a3b9d..1417c33 100644
  
  class GatedDeltaNet(MegatronModule):
      """Gated Delta Net (GDN) layer class
-@@ -191,8 +196,8 @@ class GatedDeltaNet(MegatronModule):
+@@ -191,9 +196,10 @@ class GatedDeltaNet(MegatronModule):
          )
          setattr(self.A_log, "tensor_model_parallel", True)
  
 -        if HAVE_FLA and self.use_triton_gdn:
--            self.gated_delta_rule = chunk_gated_delta_rule
-+        if HAVE_FLA:
-+            self.gated_delta_rule = flash_gated_delta_rule
-         elif self.use_ascend_gdn:
++        gdn_backend = os.environ.get("MINDSPEED_BRIDGE_GDN_BACKEND", "triton").strip().lower()
++        if gdn_backend == "triton":
+             self.gated_delta_rule = chunk_gated_delta_rule
+-        elif self.use_ascend_gdn:
++        elif gdn_backend=="ascendc":
              self.gated_delta_rule = flash_gated_delta_rule
          else:
-@@ -474,7 +479,7 @@ class GatedDeltaNet(MegatronModule):
+             self.gated_delta_rule = torch_chunk_gated_delta_rule
+@@ -474,7 +480,7 @@ class GatedDeltaNet(MegatronModule):
              beta=beta,
              initial_state=None,
              output_final_state=False,
@@ -70,7 +80,7 @@ index 19a3b9d..1417c33 100644
              cu_seqlens=cu_seqlens_q,
          )
          nvtx_range_pop(suffix="gated_delta_rule")
-@@ -555,7 +560,7 @@ class GatedDeltaNet(MegatronModule):
+@@ -555,7 +561,7 @@ class GatedDeltaNet(MegatronModule):
  
          # Apply L2 norm to query and key
          if self.use_qk_l2norm:
