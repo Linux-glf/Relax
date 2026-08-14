@@ -84,7 +84,7 @@ RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
 
 RUN cd /root/MindSpeed && git checkout core_r0.16.0 && pip install -r requirements.txt && pip install -e . && git checkout e4772499 && \
     cd /root/Megatron-LM && git checkout core_v0.16.1 && pip install -e . --no-build-isolation && \
-    cd /root/Megatron-Bridge && git checkout v0.3.1 && cp -r /root/Megatron-Bridge/src/megatron/bridge /root/Megatron-LM/megatron/ && \
+    cd /root/Megatron-Bridge && git checkout v0.3.1 && \
     cd /root/MindSpeed-Ops/ && git checkout 33ac80f7 && pip install -e . --no-build-isolation --no-deps && \
     cd /root/MindSpeed-Bridge/ && git checkout v0.3.1 && pip install -r requirements.txt && pip install -e . --no-deps
 
@@ -93,14 +93,19 @@ COPY . /root/Relax
 # Patch Megatron-LM, MindSpeed, MindSpeed-Bridge, MindSpeed-Ops
 RUN cd /root/Megatron-Bridge && \
     patch -p1 <   /root/Relax/docker/npu_patch/megatron-bridge.patch && \
+    git add . && git commit -m "base line" && \
     cd /root/Megatron-LM && \
     patch -p1 <   /root/Relax/docker/npu_patch/megatron.patch && \
+    git add . && git commit -m "base line" && \
     cd /root/MindSpeed-Bridge && \
     patch -p1 <   /root/Relax/docker/npu_patch/mindspeed-bridge.patch && \
+    git add . && git commit -m "base line" && \
     cd /root/MindSpeed-Ops && \
     patch -p1 <   /root/Relax/docker/npu_patch/mindspeed-ops.patch && \
+    git add . && git commit -m "base line" && \
     cd /root/MindSpeed && \
-    patch -p1 <   /root/Relax/docker/npu_patch/mindspeed.patch
+    patch -p1 <   /root/Relax/docker/npu_patch/mindspeed.patch && \
+    git add . && git commit -m "base line"
 
 
 # Install sglang
@@ -113,7 +118,8 @@ RUN git clone https://github.com/sgl-project/sglang.git /root/sglang && \
     git add . && git commit -m "install info" && \
     git fetch && \
     git cherry-pick ece02ffc9cc32e94382d4f1b553b2c755f83f722 && \
-    git am /root/Relax/docker/npu_patch/sglang-npu.patch
+    patch -p1 < /root/Relax/docker/npu_patch/sglang-npu.patch && \
+    git add . && git commit -m "sglang-npu.patch"
 
 
 # Install sgl-kernle-npu
@@ -143,7 +149,8 @@ RUN git clone https://github.com/flashserve/flash-linear-attention-npu.git /root
 
 # Install Relax
 # git clone https://github.com/redai-infra/Relax.git
-RUN cd /root/Relax && pip install -e .
+RUN cd /root/Relax && patch -p1 < /root/Relax/docker/npu_patch/relax.patch && \
+    pip install -e .
 
 
 RUN pip install ray==2.55.1 && pip install protobuf==6.33.6
