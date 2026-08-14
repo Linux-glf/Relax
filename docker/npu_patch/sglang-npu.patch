@@ -199,7 +199,16 @@ index e83e4157fa..19ed3f244b 100644
          self.use_log_softmax_logprob = self.rl_on_policy_target is not None
          self.use_ascend_backend = get_flags().sampling_backend == "ascend"
 +        # Generate uniform noise on a side stream while the model is running, and
-+        # apply the exponential-race transform at consumption time on the main stream
++        # apply the exponential-race transform at consumption time on the main
++        # stream, exactly matching stock aten::exponential_ semantics (NPU
++        # op-plugin composite): x = min(1 - u, 1 - eps/2), q = -log(x).
++        # uniform_() decomposes to DSARandomUniform plus an async
++        # D2D copy, i.e. pure DSA-engine work with no AIV transform kernels, so
++        # the side stream cannot contend with the model's vector-core kernels
++        # even when it overlaps the next forward (v1 ran the full exponential_()
++        # chain here and its AIV tail contended with forward).
++        # This is opt-in because it changes the random-number sequence, although it
++        # preserves the categorical sampling distribution.
 +        self.enable_async_exponential = is_npu() and get_bool_env_var(
 +            "SGLANG_NPU_ASYNC_EXPONENTIAL"
 +        )
@@ -320,6 +329,25 @@ index e83e4157fa..19ed3f244b 100644
 +        u.record_stream(current_stream)
 +
 +        # Do not modify probs in place: the standard backend reuses it for logprobs.
++        # argmax over probs / q with q ~ Exp(1): v1's production consumption
++        # form, kept because the stock argmax kernel is healthy while argmin at
++        # this shape is a slow legacy kernel (0.38ms vs ~0.13ms at bs=128).
++        # q is produced by transforming u in place with the exact stock
++        # aten::exponential_ values (NPU op-plugin composite, fp32 path):
++        #   x = min(1 - u, 1 - eps/2);  q = -log(x),  eps = finfo(dtype).eps
++        # The guard is a single torch.minimum against a cached 0-dim bound
++        # tensor: min(x, 1-eps/2) is bitwise-identical to stock's
++        # ge+masked_fill_ pair (x <= 1 always), and unlike clamp_max_ it stays
++        # on the template-grade aclnnMinimum kernel -- clamp_max_ routes to
++        # the legacy-family ClipByValueV2 op with two scalar->device uploads
++        # per call, which costs more than the unary-template kernels used by
++        # the rest of the chain. The cap keeps x below 1 so q can never be 0:
++        # u == 0 maps to q ~= 5.96e-8 and scores huge, exactly as stock (v2.3
++        # mapped it to +inf/+0.0 instead). For fp32 q stays within
++        # [~5.96e-8, ~16.6], finite and strictly positive, so the race has no
++        # inf/NaN edge.
++        # All transform ops run here on the main stream; the side stream stays
++        # pure DSA uniform with zero AIV kernels.
 +        bound = self._async_exp_min_bound
 +        if bound is None or bound.dtype != u.dtype or bound.device != u.device:
 +            bound = torch.full(
@@ -354,7 +382,12 @@ index e83e4157fa..19ed3f244b 100644
 -                # In-place op to save memory
 -                logits[:] = torch.softmax(logits, dim=-1)
 -                probs = logits
-+                # Do not write the softmax output back into logits
++                # Do not write the softmax output back into logits: the
++                # write-back costs a full-matrix TensorMove pass (~0.2 ms on
++                # NPU at bs=128 x vocab=248320 fp32). logits (now x/T) is not
++                # read again on this path and is overwritten by the next
++                # forward anyway. Trade-off: one extra live [batch, vocab]
++                # fp32 tensor during sampling. (post_sample v1 的 A1 改动)
 +                probs = torch.softmax(logits, dim=-1)
  
                  batch_next_token_ids = self._sample_from_probs(
@@ -418,7 +451,11 @@ index e83e4157fa..19ed3f244b 100644
      ):
 -        # clamp to avoid -inf values
 -        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
-+        # Clamp the extracted values instead of the full vocab
++        # Clamp the extracted values instead of the full [batch, vocab]
++        # matrix. clamp(min=const) is elementwise and monotone
++        # non-decreasing, so it commutes with topk/gather: clamping the
++        # small outputs gives identical results (-inf -> finfo.min) while
++        # skipping a full-matrix read+write pass (~0.4 ms/step on NPU).
 +        clamp_min = torch.finfo(logprobs.dtype).min
  
          # Attach logprobs to logits_output (in-place modification)
