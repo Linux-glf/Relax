@@ -2,10 +2,11 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.5-35B-A3B MTP SFT on pokemon-gpt4o-captions, 8xGPU single-node, ray-submit launch.
+# Qwen3.5-35B-A3B SFT on pokemon-gpt4o-captions, 8xGPU single-node, ray-submit launch.
+# This stage trains the main model without enabling the MTP auxiliary loss.
 #
 # Usage:
-#   bash scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-8xgpu.sh
+#   bash scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-8xgpu.sh
 
 set -ex
 set -o pipefail
@@ -21,7 +22,7 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/sft/pokemon}"
-EXP_NAME=qwen3.5-35B-A3B-mtp-sft-pokemon-gpu8
+EXP_NAME=qwen3.5-35B-A3B-sft-pokemon-gpu8
 EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
 DATA_DIR="${DATA_DIR:=${SCRIPT_DIR}/data}"
 TRAIN_FILES=(
@@ -29,15 +30,16 @@ TRAIN_FILES=(
     "'${DATA_DIR}/sft/data/pokemon-gpt4o-captions/pokemon_gpt4o_zh.parquet'"
 )
 PROMPT_DATA="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
-SAVE_DIR="${SAVE_DIR:=${SCRIPT_DIR}/../../../checkpoints/qwen3.5-35B-A3B-mtp-pokemon-sft}"
+SAVE_DIR="${SAVE_DIR:=${SCRIPT_DIR}/../../../checkpoints/qwen3.5-35B-A3B-pokemon-sft}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${EXP_DIR}/Qwen3.5-35B-A3B
    --ref-load ${EXP_DIR}/Qwen3.5-35B-A3B
    --megatron-to-hf-mode bridge
    --save ${SAVE_DIR}/sft/${EXP_NAME}
+   --save-hf ${SAVE_DIR}/sft/${EXP_NAME}-hf
    --load ${SAVE_DIR}/sft/${EXP_NAME}
-   --save-interval 100
+   --save-interval 1000
    --num-epoch 10
 )
 
@@ -54,19 +56,6 @@ SFT_ARGS=(
    --per-rank-fetch
    --sft-prefetch-num-workers 16
    --sft-prefetch-buffer-size 512
-)
-
-MTP_ARGS=(
-   --mtp-num-layers 1
-   --enable-mtp-training
-   --mtp-loss-scaling-factor 0.2
-   --mtp-detach-paths none
-   # --ci-test
-)
-
-EVAL_ARGS=(
-    --eval-size 0.1
-    --eval-interval 20
 )
 
 PREDICT_ARGS=(
@@ -144,10 +133,8 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${SFT_ARGS[@]}" \
-   "${MTP_ARGS[@]}" \
-   "${EVAL_ARGS[@]}" \
    "${PREDICT_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
    "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3.5-35B-A3B-mtp-sft-pokemon-gpu8-${now}.log
+   "${MISC_ARGS[@]}" 2>&1 | tee log/qwen3.5-35B-A3B-sft-pokemon-gpu8-${now}.log
