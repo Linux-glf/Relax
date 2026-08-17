@@ -89,28 +89,26 @@ index 19a3b9d..3dd5e25 100644
  
          # Split query and key
          split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
-diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py
-index a6f310a..d468fa5 100644
---- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py
-+++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py
-@@ -501,7 +501,7 @@ class Qwen3VLModel(MegatronModule):
-                 combined_embeddings = split_data_cp_rank(combined_embeddings, cp_size, 0, cp_rank)
-             if packed_seq_params is not None:
-                 if attention_mask is None:
--                    attention_mask = torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
-+                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
-                 input_ids_thd, _ = preprocess_packed_seqs(
-                     input_ids,
-                     attention_mask,
-@@ -560,7 +560,7 @@ class Qwen3VLModel(MegatronModule):
-             # convert lm_input_ids to THD format so it matches position_ids.
-             if packed_seq_params is not None:
-                 if attention_mask is None:
--                    attention_mask = torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
-+                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
-                 lm_input_ids, _ = preprocess_packed_seqs(
-                     input_ids,
-                     attention_mask,
+diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+index 529eaa3..1df512c 100644
+--- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
++++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+@@ -108,6 +108,7 @@ class Qwen3VLGPTModel(GPTModel):
+         # args for deepstack
+         visual_pos_masks: Optional[torch.Tensor] = None,
+         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
++        mtp_kwargs: Optional[dict] = None,
+     ) -> Tensor:
+         """Forward function of the GPT Model This function passes the input tensors
+         through the embedding layer, and then the decoeder and finally into the post
+@@ -195,6 +196,7 @@ class Qwen3VLGPTModel(GPTModel):
+             runtime_gather_output=runtime_gather_output,
+             extra_block_kwargs=extra_block_kwargs,
+             inference_context=inference_context,
++            mtp_kwargs=mtp_kwargs,
+         )
+ 
+         if _shadow_embedding:
 diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py
 index 5d03f85..2488ef7 100644
 --- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py
