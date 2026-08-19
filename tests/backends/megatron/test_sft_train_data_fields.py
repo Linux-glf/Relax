@@ -53,14 +53,23 @@ def test_sequence_classification_sft_requests_classification_labels():
     assert "sample_weights" not in fields
 
 
-def test_rl_data_fields_unchanged():
-    """RL path must keep the existing field set."""
+def test_rl_data_fields_include_replay_metadata():
+    """RL training exposes sample identity and reward metadata for replay."""
     from relax.utils.training.data_fields import build_data_fields
 
     args = _mk_actor_args(loss_type="policy_loss")
     fields = build_data_fields(args)
 
-    for required in ("tokens", "loss_masks", "rollout_log_probs", "rewards", "raw_reward", "group_index"):
+    for required in (
+        "tokens",
+        "loss_masks",
+        "rollout_log_probs",
+        "rewards",
+        "sample_indices",
+        "sample_index_mask_sums",
+        "raw_reward",
+        "group_index",
+    ):
         assert required in fields
 
 

@@ -903,8 +903,9 @@ def get_data_from_transfer_queue(
     if isinstance(rollout_data, TensorDict):
         new_rollout_data: Dict[str, Any] = {}
         for k, v in rollout_data.items():
-            # Convert length/reward-style fields to Python lists.
-            if "lengths" in k or "reward" in k:
+            # Keep scalar metadata as Python values across the TensorDict boundary,
+            # including NestedTensor values reconstructed by TransferQueue.
+            if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
                 new_rollout_data[k] = _tensor_to_python_values(v)
             elif k == "multimodal_train_inputs":
                 # Only reached on the per_rank_fetch path (the broadcast path

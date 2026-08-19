@@ -11,6 +11,8 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "loss_masks",
         "rollout_log_probs",
         "rewards",
+        "sample_indices",
+        "sample_index_mask_sums",
         "raw_reward",
         "group_index",
     ]
