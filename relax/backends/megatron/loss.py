@@ -24,7 +24,7 @@ from relax.utils.training.ppo_utils import (
     compute_approx_kl,
     compute_cispo_loss,
     compute_gspo_kl,
-    compute_log_probs,
+    compute_m2po_loss,
     compute_opsm_mask,
     compute_policy_loss,
     compute_rloo_loss,
@@ -311,9 +311,8 @@ def get_log_probs_and_entropy(
 
     For each sample, extracts response-aligned logits and tokens, then computes
     log-probabilities via softmax across the tensor-parallel group. Log-probs
-    are squeezed from `[R, 1]` to `[R]`. Entropy values are always appended
-    (even when `with_entropy=False`), but only included in the result dict
-    when requested.
+    are squeezed from `[R, 1]` to `[R]`. When entropy is requested only as a
+    metric (`entropy_coef == 0`), its backward activations are not retained.
 
     Args:
         logits: Policy logits with shape `[1, T, V]`. When ``lm_head_forward``
@@ -369,6 +368,9 @@ def get_log_probs_and_entropy(
             sft_chunk_size = 1024
     resolved_topk_k = topk_k if topk_k is not None else getattr(args, "opd_log_prob_top_k", 0)
     tp_group = mpu.get_tensor_model_parallel_group()
+    # Keep entropy metrics, but skip saving entropy-backward activations when
+    # the entropy term cannot affect the loss.
+    with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
     log_probs_list = []
     entropy_list = []
     topk_token_ids_list = []
@@ -399,14 +401,19 @@ def get_log_probs_and_entropy(
                 logits_sub = logits_sub.squeeze(1).float()
                 if args.rollout_temperature != 1.0:
                     logits_sub = logits_sub / args.rollout_temperature
-                chunk_lps.append(compute_log_probs(logits_sub, tokens_chunk[s:e], tp_group).squeeze(-1))
+                log_prob_sub, _ = calculate_log_probs_and_entropy(
+                    logits_sub,
+                    tokens_chunk[s:e],
+                    tp_group,
+                    with_entropy=False,
+                )
+                chunk_lps.append(log_prob_sub.squeeze(-1))
             log_prob = (
                 torch.cat(chunk_lps, dim=0)
                 if chunk_lps
-                # fp32 to match compute_log_probs's return dtype (Megatron's
-                # fused_vocab_parallel_cross_entropy returns fp32 because we
-                # upcast logits with .float() above). Mismatch would break the
-                # downstream torch.cat over per-sample log_probs.
+                # fp32 to match calculate_log_probs_and_entropy's return dtype;
+                # logits are upcast above. A mismatch would break the downstream
+                # torch.cat over per-sample log-probabilities.
                 else logits_chunk.new_zeros((0,), dtype=torch.float32)
             )
             entropy = None
@@ -416,6 +423,7 @@ def get_log_probs_and_entropy(
                 tokens_chunk,
                 tp_group,
                 with_entropy=with_entropy,
+                with_entropy_grad=with_entropy_grad,
                 chunk_size=args.log_probs_chunk_size,
             )
             log_prob = log_prob.squeeze(-1)
@@ -577,7 +585,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]:
+    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "m2po", "rloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         advantages = returns.copy()
@@ -979,6 +987,10 @@ def policy_loss_function(
             eps_clip=args.eps_clip,
             eps_clip_high=args.eps_clip_high,
         )
+    elif args.advantage_estimator == "m2po":
+        pg_loss, pg_clipfrac, _m2_now, _m2_after, _eps_low, _eps_high = compute_m2po_loss(
+            ppo_kl, advantages, args.m2po_kl2_budget, args.m2po_miniclip_low, args.m2po_miniclip_high
+        )
     elif args.advantage_estimator == "rloo":
         pg_loss, pg_clipfrac = compute_rloo_loss(
             log_probs=log_probs,
@@ -1163,6 +1175,12 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
+
+    if args.advantage_estimator == "m2po":
+        reported_loss["ppo_kl_m2_before"] = torch.tensor(_m2_now, device=ppo_kl.device).detach()
+        reported_loss["ppo_kl_m2_after"] = torch.tensor(_m2_after, device=ppo_kl.device).detach()
+        reported_loss["m2po_eps_low"] = torch.tensor(_eps_low, device=ppo_kl.device).detach()
+        reported_loss["m2po_eps_high"] = torch.tensor(_eps_high, device=ppo_kl.device).detach()
 
     return loss, reported_loss
 
@@ -1525,6 +1543,13 @@ def loss_function(
         )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    # M2PO scalar metrics are global (not per-token). When calculate_per_token_loss=True
+    # the framework divides all log values by num_tokens, so pre-multiply to cancel.
+    if args.calculate_per_token_loss and getattr(args, "advantage_estimator", None) == "m2po":
+        for key in ("ppo_kl_m2_before", "ppo_kl_m2_after", "m2po_eps_low", "m2po_eps_high"):
+            if key in log:
+                log[key] = log[key] * num_tokens
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding or all-masked). Without this, gradient doesn't flow through their attention
