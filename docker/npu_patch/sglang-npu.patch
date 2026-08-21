@@ -1,56 +1,421 @@
+From 1bf8b943fa46b025618857cf0efed7ac7b5fb9b5 Mon Sep 17 00:00:00 2001
+From: wuqiwei <wuqiwei4@huawei.com>
+Date: Thu, 23 Jul 2026 08:44:55 +0000
+Subject: [PATCH 1/5] sglang_npu_patch
+
+---
+ python/sglang/srt/layers/quantization/unquant.py | 8 ++++----
+ python/sglang/srt/utils/common.py                | 4 +++-
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
-index 1ade4ed9e4..0161bd398a 100644
+index 82a3d77f05..25d4c21406 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
 +++ b/python/sglang/srt/layers/quantization/unquant.py
-@@ -314,12 +314,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+@@ -402,10 +402,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+             layer.w2_weight.data = layer.w2_weight.data.reshape(
                  layer.num_local_experts, *new_shape_w2
              )
- 
 -        if _is_npu:
 -            for weight_name in ["w13_weight", "w2_weight"]:
 -                weight = getattr(layer, weight_name)
--                weight.data = weight.data.transpose(1, 2)
--                weight.data = npu_format_cast(weight.data)
--
+-                weight.data = npu_format_cast(weight)
++        # if _is_npu:
++        #     for weight_name in ["w13_weight", "w2_weight"]:
++        #         weight = getattr(layer, weight_name)
++        #         weight.data = npu_format_cast(weight)
+ 
          return
  
-     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
-@@ -646,7 +640,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
-         # gmm1: gate_up_proj
-         hidden_states = torch.ops.npu.npu_grouped_matmul(
-             x=[hidden_states],
--            weight=[layer.w13_weight],
-+            weight=[layer.w13_weight.transpose(1, 2)],
-             bias=w13_bias,
-             split_item=2,
-             group_list_type=1,
-@@ -670,7 +664,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
-         # gmm2: down_proj
-         hidden_states = torch.ops.npu.npu_grouped_matmul(
-             x=[hidden_states],
--            weight=[layer.w2_weight],
-+            weight=[layer.w2_weight.transpose(1, 2)],
-             bias=w2_bias,
-             split_item=2,
-             group_list_type=1,
 diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
-index f68721f3d0..3e85ee7c10 100644
+index 82db90da3b..aabd222d7e 100644
 --- a/python/sglang/srt/utils/common.py
 +++ b/python/sglang/srt/utils/common.py
-@@ -46,6 +46,7 @@ import types
- import uuid
- import warnings
- from collections import OrderedDict, defaultdict
+@@ -73,6 +73,7 @@ from typing import (
+     TypeVar,
+     Union,
+ )
 +from relax.utils.device import is_npu_available
- from contextlib import contextmanager
- from dataclasses import dataclass
- from decimal import Decimal
-@@ -150,7 +151,7 @@ def is_npu() -> bool:
+ from unittest import SkipTest
+ from unittest.case import _ShouldStop
+ from urllib.parse import unquote, urlparse
+@@ -176,7 +177,8 @@ def is_npu() -> bool:
      if not hasattr(torch, "npu"):
          return False
  
 -    if not torch.npu.is_available():
++    # if not torch.npu.is_available():
 +    if not is_npu_available:
          raise RuntimeError(
              "torch_npu detected, but NPU device is not available or visible."
          )
+-- 
+2.34.1
+
+
+From 6ba9e861e0c32c4b299ad5b7b6e7e11c8a441534 Mon Sep 17 00:00:00 2001
+From: David Wang <david.wang@modal.com>
+Date: Fri, 19 Jun 2026 00:19:40 +0000
+Subject: [PATCH 2/5] fix mamba radix partial page prefix matching
+
+---
+ .../sglang/srt/mem_cache/mamba_radix_cache.py |  9 ++++
+ .../unit/mem_cache/test_mamba_unittest.py     | 52 +++++++++++++++++++
+ 2 files changed, 61 insertions(+)
+
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index 368781d8d5..0856caae48 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -1089,6 +1089,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+         if self.disable or len(key) == 0:
+             return None
+ 
++        key = key.page_aligned(self.page_size)
++        if len(key) == 0:
++            return None
++
+         return key
+ 
+     def _match_post_processor(
+@@ -1158,6 +1162,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+         )
+ 
+     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
++        assert (
++            0 < split_len < len(child.key)
++        ), f"split_len must create non-empty nodes, {split_len=}, {len(child.key)=}"
+         # new_node -> child
+         new_node = TreeNode()
+         new_node.children = {key[split_len:].child_key(self.page_size): child}
+@@ -1166,6 +1173,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+         new_node.full_lock_ref = child.full_lock_ref
+         new_node.mamba_lock_ref = 0
+         new_node.key = child.key[:split_len]
++        assert len(new_node.key) > 0, f"new_node.key should not be empty"
+         new_node.value = child.value[:split_len].clone()
+ 
+         # child time should be later than parent's time for mamba tombstone
+@@ -1176,6 +1184,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+             self.mamba_lru_list.remove_node(child)
+         child.parent = new_node
+         child.key = child.key[split_len:]
++        assert len(child.key) > 0, f"child.key should not be empty"
+         child.value = child.value[split_len:].clone()
+         new_node.parent.children[key.child_key(self.page_size)] = new_node
+         new_node.hash_value, child.hash_value = split_node_hash_value(
+diff --git a/test/registered/unit/mem_cache/test_mamba_unittest.py b/test/registered/unit/mem_cache/test_mamba_unittest.py
+index 9ad577b42e..390a3721c5 100755
+--- a/test/registered/unit/mem_cache/test_mamba_unittest.py
++++ b/test/registered/unit/mem_cache/test_mamba_unittest.py
+@@ -419,6 +419,58 @@ class TestMamba(unittest.TestCase):
+         self.assertEqual(list(second_insert_events[0].token_ids), [5])
+         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
+ 
++    def test_mamba_radix_cache_limited_partial_page_match_does_not_split(self):
++        page_size = 64
++        tree = self._setup_minimal_mamba_radix_cache(page_size)
++        token_ids = array("q", range(page_size))
++
++        tree.insert(
++            InsertParams(
++                key=RadixKey(token_ids, None),
++                value=torch.arange(page_size),
++                mamba_value=torch.tensor([0]),
++            )
++        )
++
++        match = tree.match_prefix(
++            MatchPrefixParams(key=RadixKey(token_ids, None, limit=page_size - 1))
++        )
++
++        self.assertEqual(len(match.device_indices), 0)
++        self.assertEqual(self._non_root_key_lengths(tree), [page_size])
++
++    def _setup_minimal_mamba_radix_cache(self, page_size: int) -> MambaRadixCache:
++        tree = MambaRadixCache.__new__(MambaRadixCache)
++        tree.page_size = page_size
++        tree.mamba_cache_chunk_size = page_size
++        tree.disable = False
++        tree.device = torch.device("cpu")
++        tree.enable_kv_cache_events = False
++        tree.kv_event_queue = []
++        tree.full_evictable_size_ = 0
++        tree.mamba_evictable_size_ = 0
++        tree.full_protected_size_ = 0
++        tree.mamba_protected_size_ = 0
++
++        tree.root_node = TreeNode()
++        tree.root_node.key = RadixKey(array("q"), None)
++        tree.root_node.value = []
++        tree.root_node.hash_value = []
++        tree.root_node.full_lock_ref = 1
++        tree.root_node.mamba_lock_ref = 1
++        tree.full_lru_list = LRUList(mamba=False)
++        tree.mamba_lru_list = LRUList(mamba=True)
++        return tree
++
++    def _non_root_key_lengths(self, tree: MambaRadixCache) -> list[int]:
++        lengths = []
++        stack = list(tree.root_node.children.values())
++        while stack:
++            node = stack.pop()
++            lengths.append(len(node.key))
++            stack.extend(node.children.values())
++        return lengths
++
+     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
+         """Helper to create a MambaRadixCache with allocator for testing."""
+         server_args = ServerArgs(model_path="dummy", page_size=1)
+-- 
+2.34.1
+
+
+From 9f5d5ac59b474998956f2ac2e9e494ee2c6529a6 Mon Sep 17 00:00:00 2001
+From: wuqiwei <wuqiwei4@huawei.com>
+Date: Wed, 5 Aug 2026 09:26:57 +0000
+Subject: [PATCH 3/5] [NPU] Enable non-greedy MTP sampling- #32495 #32495
+
+---
+ python/sglang/srt/speculative/eagle_utils.py | 98 +++++++++++++-------
+ 1 file changed, 67 insertions(+), 31 deletions(-)
+
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index daf9fa82e2..f00f718fd2 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -617,7 +617,7 @@ def eagle_sample(
+ 
+     # Sample tokens
+     target_predict = None
+-    if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
++    if sampling_info.is_all_greedy or _is_hip or _is_xpu:
+         target_predict = torch.argmax(next_token_logits, dim=-1)
+         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+@@ -632,43 +632,80 @@ def eagle_sample(
+             topk=verify_input.tree_topk,
+         )
+     else:
+-        from sgl_kernel import (
+-            top_k_renorm_prob,
+-            top_p_renorm_prob,
+-            tree_speculative_sampling_target_only,
+-        )
+-
+-        from sglang.srt.speculative.reject_sampling import (
+-            chain_speculative_sampling_triton,
+-        )
+-
+         use_rejection_sampling = (
+             get_global_server_args().speculative_use_rejection_sampling
+         )
+ 
++        if _is_npu:
++            from sgl_kernel_npu.sample import (
++                chain_speculative_sampling_rejection,
++                top_k_top_p_renorm_probs,
++                tree_speculative_sampling_target_only,
++            )
++
++            sampling_fn = (
++                chain_speculative_sampling_rejection
++                if use_rejection_sampling
++                else tree_speculative_sampling_target_only
++            )
++        else:
++            from sgl_kernel import (
++                top_k_renorm_prob,
++                top_p_renorm_prob,
++                tree_speculative_sampling_target_only,
++            )
++
++            from sglang.srt.speculative.reject_sampling import (
++                chain_speculative_sampling_triton,
++            )
++
++            sampling_fn = (
++                chain_speculative_sampling_triton
++                if use_rejection_sampling
++                else tree_speculative_sampling_target_only
++            )
++
+         # Apply temperature and get target probs
+         expanded_temperature = torch.repeat_interleave(
+             sampling_info.temperatures, verify_input.draft_token_num, dim=0
+         )  # (bs * num_draft_tokens, 1)
+ 
++        sampling_logits = next_token_logits.float() if _is_npu else next_token_logits
+         target_probs = F.softmax(
+-            next_token_logits / expanded_temperature, dim=-1
++            sampling_logits / expanded_temperature, dim=-1
+         )  # (bs * num_draft_tokens, vocab_size)
+         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+-        target_probs = top_k_renorm_prob(
+-            target_probs,
+-            torch.repeat_interleave(
+-                sampling_info.top_ks, verify_input.draft_token_num, dim=0
+-            ),
+-        )  # (bs * num_draft_tokens, vocab_size)
+-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+-        target_probs = top_p_renorm_prob(
+-            target_probs,
+-            torch.repeat_interleave(
+-                sampling_info.top_ps, verify_input.draft_token_num, dim=0
+-            ),
+-        )
+-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
++
++        if _is_npu:
++            target_probs = top_k_top_p_renorm_probs(
++                target_probs,
++                torch.repeat_interleave(
++                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
++                ),
++                torch.repeat_interleave(
++                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
++                ),
++                sampling_info.need_top_k_sampling,
++                sampling_info.need_top_p_sampling,
++            )
++            maybe_detect_nan(target_probs, "v2 verify: target_probs after renorm")
++        else:
++            if sampling_info.need_top_k_sampling:
++                target_probs = top_k_renorm_prob(
++                    target_probs,
++                    torch.repeat_interleave(
++                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
++                    ),
++                )  # (bs * num_draft_tokens, vocab_size)
++                maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
++            if sampling_info.need_top_p_sampling:
++                target_probs = top_p_renorm_prob(
++                    target_probs,
++                    torch.repeat_interleave(
++                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
++                    ),
++                )
++                maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+         draft_probs = (
+             verify_input.draft_probs
+@@ -687,16 +724,15 @@ def eagle_sample(
+                 "does not produce one (draft_probs missing or vocab-mismatched)."
+             )
+ 
++        if _is_npu:
++            target_probs = target_probs.contiguous()
++            draft_probs = draft_probs.float().contiguous()
++
+         # coins for rejection sampling
+         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+         # coins for final sampling
+         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+ 
+-        sampling_fn = (
+-            chain_speculative_sampling_triton
+-            if use_rejection_sampling
+-            else tree_speculative_sampling_target_only
+-        )
+         sampling_fn(
+             predicts=predict,  # mutable
+             accept_index=accept_index,  # mutable
+-- 
+2.34.1
+
+
+From 32ffa124368440360bc966cdaca9f44dac5aaf72 Mon Sep 17 00:00:00 2001
+From: wuqiwei <wuqiwei4@huawei.com>
+Date: Thu, 6 Aug 2026 08:10:11 +0000
+Subject: [PATCH 4/5] for tms cuda_gragh
+
+---
+ python/sglang/srt/utils/torch_memory_saver_adapter.py | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+index ad98e59283..a5b2cdfd32 100644
+--- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
++++ b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+@@ -41,7 +41,7 @@ class TorchMemorySaverAdapter(ABC):
+     def region(self, tag: str, enable_cpu_backup: bool = False):
+         raise NotImplementedError
+ 
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
+         raise NotImplementedError
+ 
+     def disable(self):
+@@ -67,7 +67,10 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+     def region(self, tag: str, enable_cpu_backup: bool = False):
+         return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
+ 
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
++        if cuda_graph is not None:
++            kwargs["cuda_graph"] = cuda_graph
++        # kwargs.pop("auto_dispatch_capture", None)  # torch_memory_saver 0.0.8 does not support this arg
+         return _memory_saver.cuda_graph(**kwargs)
+ 
+     def disable(self):
+@@ -94,7 +97,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
+         yield
+ 
+     @contextmanager
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
+         yield
+ 
+     @contextmanager
+-- 
+2.34.1
+
+
+From 8c023fdbdf6d0ccf062f88a26a52cb2545b0683a Mon Sep 17 00:00:00 2001
+From: wuqiwei <wuqiwei4@huawei.com>
+Date: Thu, 6 Aug 2026 08:10:48 +0000
+Subject: [PATCH 5/5] disable tms cuda_gragh
+
+---
+ .../npu/graph_runner/npu_cudagraph_backend.py  | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+index 919f46619a..c8a185388a 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+@@ -37,6 +37,21 @@ if TYPE_CHECKING:
+         BaseCudaGraphRunner,
+     )
+ 
++@contextmanager
++def _disable_tms_during_graph_capture():
++    try:
++        from torch_memory_saver import torch_memory_saver
++        _impl = torch_memory_saver._impl
++    except Exception:
++        _impl = None
++
++    if _impl is not None:
++        _impl._binary_wrapper.cdll.tms_set_interesting_region(False)
++    try:
++        yield
++    finally:
++        if _impl is not None:
++            _impl._binary_wrapper.cdll.tms_set_interesting_region(True)
+ 
+ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+     """One torch.npu.NPUGraph per shape; attention metadata captured
+@@ -117,7 +132,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+             stream=self._capture_stream,
+             auto_dispatch_capture=True,
+         ):
+-            out = forward_fn()
++            with _disable_tms_during_graph_capture():
++                out = forward_fn()
+ 
+         self._graphs[shape_key] = graph
+         self._outputs[shape_key] = out
+-- 
+2.34.1
+

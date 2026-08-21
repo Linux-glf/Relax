@@ -37,6 +37,20 @@ index c624fd0a..cef668af 100644
      return parser
  
  
+diff --git a/mindspeed/core/megatron_basic/arguments_basic.py b/mindspeed/core/megatron_basic/arguments_basic.py
+index 87d71f81..aa6c219b 100644
+--- a/mindspeed/core/megatron_basic/arguments_basic.py
++++ b/mindspeed/core/megatron_basic/arguments_basic.py
+@@ -147,7 +147,7 @@ def transformer_config_init_subclass(cls, **kwargs):
+             if callable(value) and not isinstance(value, type):
+                 value = field(default_factory=value)
+             elif type(value) in mutable_types:
+-                value = field(default_factory=lambda: value)
++                value = field(default_factory=lambda v=value: v)
+             else:
+                 value = value
+             setattr(cls, key, value)
+\ No newline at end of file
 diff --git a/mindspeed/features_manager/functional/profile.py b/mindspeed/features_manager/functional/profile.py
 index 6450b41c..86584015 100644
 --- a/mindspeed/features_manager/functional/profile.py
