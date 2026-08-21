@@ -1,17 +1,39 @@
-From 1732669a033f5fe5aa178c305ea1e4ba379fdca1 Mon Sep 17 00:00:00 2001
-From: wuqiwei <wuqiwei4@huawei.com>
-Date: Wed, 5 Aug 2026 12:32:43 +0000
-Subject: [PATCH 1/3]  torch.npu.empty_cache()
-
----
- .../torch_memory_saver/python/torch_memory_saver/entrypoint.py  | 2 ++
- 1 file changed, 2 insertions(+)
-
 diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
-index b14c561..146c011 100644
+index b14c561..7b0508d 100644
 --- a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
 +++ b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
-@@ -159,6 +159,7 @@ class _TorchMemorySaverImpl:
+@@ -36,6 +36,7 @@ class TorchMemorySaver:
+         capture_error_mode="global",
+         tag: str = _TAG_DEFAULT,
+         enable_cpu_backup: bool = False,
++        **kwargs,
+     ):
+         """Similar to `torch.cuda.graph`, but ensures memory in it to be pauseable."""
+         self._ensure_initialized()
+@@ -46,6 +47,7 @@ class TorchMemorySaver:
+             capture_error_mode=capture_error_mode,
+             tag=tag,
+             enable_cpu_backup=enable_cpu_backup,
++            **kwargs
+         ):
+             yield
+ 
+@@ -115,12 +117,13 @@ class _TorchMemorySaverImpl:
+         capture_error_mode,
+         tag: str,
+         enable_cpu_backup: bool,
++        **kwargs,
+     ):
+         assert (
+             self._hook_mode == "preload"
+         ), "Only hook_mode=preload supports pauseable CUDA Graph currently"
+         with torch.npu.graph(
+-            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode
++            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode, **kwargs
+         ):
+             with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+                 yield
+@@ -159,6 +162,7 @@ class _TorchMemorySaverImpl:
              # only be released after the memory region is resumed and empty_cache() is invoked.
              torch_npu._C._npu_releasePool(torch.npu.current_device(), pool.id)
              del pool
@@ -19,37 +41,215 @@ index b14c561..146c011 100644
          finally:
              self._binary_wrapper.cdll.tms_set_interesting_region(True)
  
-@@ -176,3 +177,4 @@ def _sanity_checks():
+@@ -175,4 +179,4 @@ def _sanity_checks():
+     if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
          raise RuntimeError(
              "TorchMemorySaver is disabled for the current process because expandable_segments is not supported yet."
-         )
-+        
+-        )
++        )
 \ No newline at end of file
--- 
-2.34.1
-
-
-From 2aca54d20695004a4a8c7222d333fadd78d4d589 Mon Sep 17 00:00:00 2001
-From: cl-vv-h <wh-duan@outlook.com>
-Date: Sat, 25 Jul 2026 09:21:13 +0000
-Subject: [PATCH 2/3] feat: add non-greedy MTP sampling kernels
-
----
- .../sgl_kernel_npu/sample/__init__.py         |  13 +
- .../sample/chain_speculative_sampling.py      | 354 +++++++++++
- .../sgl_kernel_npu/sample/probability.py      |  40 ++
- .../tree_speculative_sampling_target_only.py  | 383 +++++++++++
- .../test_chain_speculative_sampling.py        | 138 ++++
- .../test_speculative_probability.py           |  31 +
- ...t_tree_speculative_sampling_target_only.py | 595 ++++++++++++++++++
- 7 files changed, 1554 insertions(+)
- create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/sample/chain_speculative_sampling.py
- create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/sample/probability.py
- create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/sample/tree_speculative_sampling_target_only.py
- create mode 100644 tests/python/sgl_kernel_npu/test_chain_speculative_sampling.py
- create mode 100644 tests/python/sgl_kernel_npu/test_speculative_probability.py
- create mode 100644 tests/python/sgl_kernel_npu/test_tree_speculative_sampling_target_only.py
-
+diff --git a/csrc/cache_location_assign/op_host/cache_loc_assign.cpp b/csrc/cache_location_assign/op_host/cache_loc_assign.cpp
+index 5fbecbe..b42f5bc 100644
+--- a/csrc/cache_location_assign/op_host/cache_loc_assign.cpp
++++ b/csrc/cache_location_assign/op_host/cache_loc_assign.cpp
+@@ -19,8 +19,8 @@
+ namespace sglang {
+ namespace npu_kernel {
+ 
+-at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_t poolSize, uint32_t &blockDim,
+-                     bool isUpddate)
++at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_t poolSize, uint64_t maxStep,
++                     uint32_t &blockDim, bool isUpddate)
+ {
+     auto batchSize = reqPoolIndices.sizes()[0];
+     auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
+@@ -39,6 +39,7 @@ at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_
+     tillingData->rowNumNoTail = batchSize / (tillingData->vcoreNum);
+     tillingData->tailNum = batchSize % (tillingData->vcoreNum);
+     tillingData->rowSize = rowSize;
++    tillingData->maxStep = maxStep;
+ 
+     if (reqPoolIndices.options().dtype() == at::kInt) {
+         tillingData->key = 1;
+@@ -50,13 +51,13 @@ at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_
+         tillingData->reqInxBufferSize = tillingData->reqInxBufferCount * sizeof(int64_t);
+     }
+ 
+-    tillingData->tokenCountAlignInt32 = host_utils::alinInt32Count(MAX_STEP);
++    tillingData->tokenCountAlignInt32 = host_utils::alinInt32Count(maxStep);
+     tillingData->tokenColAlignInt32 = tillingData->tokenCountAlignInt32 * sizeof(int32_t);
+ 
+     tillingData->offsetCountAlignInt64 = host_utils::alinInt64Count(batchSize);
+     tillingData->offsetColAlignInt64 = tillingData->offsetCountAlignInt64 * sizeof(int64_t);
+ 
+-    tillingData->cacheLocSize = batchSize * MAX_STEP;
++    tillingData->cacheLocSize = batchSize * maxStep;
+     tillingData->cacheLocCountAlignInt32 = host_utils::alinInt32Count(tillingData->cacheLocSize);
+     tillingData->cacheLocAlignInt32 = tillingData->cacheLocCountAlignInt32 * sizeof(int32_t);
+ 
+@@ -73,7 +74,7 @@ at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_
+ }
+ 
+ HOST_API void checkParams(const at::Tensor &reqPoolIndices, const at::Tensor &tokenPool, const at::Tensor &startOffset,
+-                          const at::Tensor &endOffset, const at::Tensor &outCacheLoc)
++                          const at::Tensor &endOffset, const at::Tensor &outCacheLoc, int64_t maxStep)
+ {
+     auto reqIdxType = reqPoolIndices.options().dtype();
+     if ((reqIdxType != at::kInt && reqIdxType != at::kLong) || tokenPool.options().dtype() != at::kInt ||
+@@ -83,16 +84,28 @@ HOST_API void checkParams(const at::Tensor &reqPoolIndices, const at::Tensor &to
+             "Only support inputTensor combo1: int64, int32, int64, int64, int32; combo2: "
+             "int32, int32, int64, int64, int32");
+     }
++    if (maxStep < 1 || maxStep > MAX_STEP) {
++        throw std::invalid_argument("max_step must be in [1, " + std::to_string(MAX_STEP) + "], got " +
++                                    std::to_string(maxStep) +
++                                    " (the cache_loc_assign kernel handles at most MAX_STEP tokens per row)");
++    }
++    auto batchSize = reqPoolIndices.sizes()[0];
++    if (outCacheLoc.numel() < batchSize * static_cast<int64_t>(maxStep)) {
++        throw std::invalid_argument("out_cache_loc too small: needs at least batchSize * max_step = " +
++                                    std::to_string(batchSize * maxStep) + " elements, got " +
++                                    std::to_string(outCacheLoc.numel()));
++    }
+ }
+ 
+ HOST_API at::Tensor cache_loc_assign(const at::Tensor &reqPoolIndices, const at::Tensor &tokenPool,
+                                      const at::Tensor &startOffset, const at::Tensor &endOffset,
+-                                     const at::Tensor &outCacheLoc)
++                                     const at::Tensor &outCacheLoc, int64_t maxStep)
+ {
+-    checkParams(reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc);
++    checkParams(reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc, maxStep);
+     uint32_t blockDim;
+     uint32_t cacheAssignMode = 0;
+-    at::Tensor tilingTensor = getTiling(reqPoolIndices, tokenPool.sizes()[1], tokenPool.sizes()[0], blockDim, false);
++    at::Tensor tilingTensor = getTiling(reqPoolIndices, tokenPool.sizes()[1], tokenPool.sizes()[0], maxStep, blockDim,
++                                        false);
+ 
+     EXEC_KERNEL_CMD(cache_loc_assign, blockDim, reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc,
+                     tilingTensor, cacheAssignMode);
+@@ -101,12 +114,13 @@ HOST_API at::Tensor cache_loc_assign(const at::Tensor &reqPoolIndices, const at:
+ 
+ HOST_API at::Tensor cache_loc_update(const at::Tensor &reqPoolIndices, const at::Tensor &tokenPool,
+                                      const at::Tensor &startOffset, const at::Tensor &endOffset,
+-                                     const at::Tensor &outCacheLoc)
++                                     const at::Tensor &outCacheLoc, int64_t maxStep)
+ {
+-    checkParams(reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc);
++    checkParams(reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc, maxStep);
+     uint32_t blockDim;
+     uint32_t cacheAssignMode = 1;
+-    at::Tensor tilingTensor = getTiling(reqPoolIndices, tokenPool.sizes()[1], tokenPool.sizes()[0], blockDim, true);
++    at::Tensor tilingTensor = getTiling(reqPoolIndices, tokenPool.sizes()[1], tokenPool.sizes()[0], maxStep, blockDim,
++                                        true);
+ 
+     EXEC_KERNEL_CMD(cache_loc_assign, blockDim, reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc,
+                     tilingTensor, cacheAssignMode);
+diff --git a/csrc/cache_location_assign/op_host/tiling/cache_loc_assign.h b/csrc/cache_location_assign/op_host/tiling/cache_loc_assign.h
+index 2f8e9bd..2d473ee 100644
+--- a/csrc/cache_location_assign/op_host/tiling/cache_loc_assign.h
++++ b/csrc/cache_location_assign/op_host/tiling/cache_loc_assign.h
+@@ -26,6 +26,7 @@ struct AssignCacheTillingData {
+     uint64_t reqInxBufferCount{0};
+     uint64_t reqInxBufferSize{0};
+ 
++    uint64_t maxStep{0};
+     uint64_t tokenCountAlignInt32{0};
+     uint64_t tokenColAlignInt32{0};
+ 
+@@ -37,6 +38,10 @@ struct AssignCacheTillingData {
+     uint64_t cacheLocAlignInt32{0};
+ };
+ 
++// Upper bound of the per-row token count this kernel handles in one call.
++// The host validates `1 <= max_step <= MAX_STEP` and derives every buffer
++// size (token transfer count, out_cache_loc tiling) from the caller-supplied
++// max_step — never from this constant.
+ constexpr uint32_t MAX_STEP = 16;
+ 
+ #endif  // CACHE_LOC_ASSIGN_TILING_H
+diff --git a/csrc/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp b/csrc/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp
+index 109f604..c78f303 100644
+--- a/csrc/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp
++++ b/csrc/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp
+@@ -21,6 +21,12 @@ constexpr int32_t BUFFER_NUM = 2;
+ constexpr uint32_t ASSIGN_TO_POOL = 0;
+ constexpr uint32_t RETRIEVE_FROM_POOL = 1;
+ 
++// Per-row contract: the caller passes max_step (tokens moved per row) through
++// the tiling data. The host validates `1 <= max_step <= MAX_STEP` and sizes
++// out_cache_loc as `batchSize * max_step`; every transfer below (token pool
++// copy in CopyIn, token pool write-back, cacheLoc GM read/write) is derived
++// from max_step, so no fixed-size over/under-transfer can occur.
++
+ template <typename T>
+ class CacheLocAssignKernel
+ {
+@@ -44,6 +50,7 @@ public:
+         }
+         this->rowSize = tempTilingGM->rowSize;
+         this->reqInxBufferCount = tempTilingGM->reqInxBufferCount;
++        this->maxStep = tempTilingGM->maxStep;
+         this->tokenCountAlignInt32 = tempTilingGM->tokenCountAlignInt32;
+         this->offsetCountAlignInt64 = tempTilingGM->offsetCountAlignInt64;
+         this->cacheLocCountAlignInt32 = tempTilingGM->cacheLocCountAlignInt32;
+@@ -151,7 +158,7 @@ private:
+             tokenPoolLocal.SetValue(j, cache);
+         }
+ 
+-        uint32_t tokenBytes = static_cast<uint32_t>(MAX_STEP * sizeof(int32_t));
++        uint32_t tokenBytes = static_cast<uint32_t>(this->maxStep * sizeof(int32_t));
+         AscendC::DataCopyExtParams copyParams{1, tokenBytes, 0, 0, 0};
+         AscendC::DataCopyPad(tokenPoolGM[reqIdx * this->rowSize + start], tokenPoolLocal, copyParams);
+ 
+@@ -208,6 +215,7 @@ private:
+     uint64_t tailOffset;
+     uint64_t rowOffset;
+     uint64_t rowSize;
++    uint64_t maxStep;
+     uint64_t cacheLocSize;
+ 
+     int64_t cacheIdxStart{0};
+diff --git a/csrc/pytorch_extensions.cpp b/csrc/pytorch_extensions.cpp
+index 1cfccb0..8e4ad91 100644
+--- a/csrc/pytorch_extensions.cpp
++++ b/csrc/pytorch_extensions.cpp
+@@ -32,11 +32,11 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
+ 
+     m.def(
+         "cache_loc_assign(Tensor req_indices, Tensor token_pool, Tensor start_offset, Tensor end_offset, Tensor "
+-        "out_cache_loc) -> Tensor");
++        "out_cache_loc, int max_step) -> Tensor");
+ 
+     m.def(
+         "cache_loc_update(Tensor req_indices, Tensor token_pool, Tensor start_offset, Tensor end_offset, Tensor "
+-        "out_cache_loc) -> Tensor");
++        "out_cache_loc, int max_step) -> Tensor");
+ 
+     m.def(
+         "assign_cache_op(Tensor! out, Tensor src, Tensor dst_start_idx, Tensor dst_end_idx, Tensor src_start_idx, "
+diff --git a/include/sgl_kenel_npu_ops.h b/include/sgl_kenel_npu_ops.h
+index c6a4fba..ad51c12 100644
+--- a/include/sgl_kenel_npu_ops.h
++++ b/include/sgl_kenel_npu_ops.h
+@@ -19,13 +19,15 @@ at::Tensor cache_loc_assign(const at::Tensor &req_indices,
+                             const at::Tensor &token_pool,
+                             const at::Tensor &start_offset,
+                             const at::Tensor &end_offset,
+-                            const at::Tensor &out_cache_loc);
++                            const at::Tensor &out_cache_loc,
++                            int64_t max_step);
+ 
+ at::Tensor cache_loc_update(const at::Tensor &req_indices,
+                             const at::Tensor &token_pool,
+                             const at::Tensor &start_offset,
+                             const at::Tensor &end_offset,
+-                            const at::Tensor &out_cache_loc);
++                            const at::Tensor &out_cache_loc,
++                            int64_t max_step);
+ 
+ bool assign_cache_op(at::Tensor &dst_tensor, const at::Tensor &src_tensor,
+                      const at::Tensor &dst_start_idx,
 diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py b/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py
 index e69de29..6e7bbd6 100644
 --- a/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py
@@ -1645,63 +1845,3 @@ index 0000000..3c12d53
 +        )
 +    else:
 +        raise SystemExit(pytest.main([__file__]))
--- 
-2.34.1
-
-
-From b85bb7a082f3fcf9f8edbbe12b1641f94292245d Mon Sep 17 00:00:00 2001
-From: wuqiwei <wuqiwei4@huawei.com>
-Date: Wed, 5 Aug 2026 13:52:42 +0000
-Subject: [PATCH 3/3] cuda_gragh arg patch
-
----
- .../python/torch_memory_saver/entrypoint.py               | 8 +++++---
- 1 file changed, 5 insertions(+), 3 deletions(-)
-
-diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
-index 146c011..7b0508d 100644
---- a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
-+++ b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
-@@ -36,6 +36,7 @@ class TorchMemorySaver:
-         capture_error_mode="global",
-         tag: str = _TAG_DEFAULT,
-         enable_cpu_backup: bool = False,
-+        **kwargs,
-     ):
-         """Similar to `torch.cuda.graph`, but ensures memory in it to be pauseable."""
-         self._ensure_initialized()
-@@ -46,6 +47,7 @@ class TorchMemorySaver:
-             capture_error_mode=capture_error_mode,
-             tag=tag,
-             enable_cpu_backup=enable_cpu_backup,
-+            **kwargs
-         ):
-             yield
- 
-@@ -115,12 +117,13 @@ class _TorchMemorySaverImpl:
-         capture_error_mode,
-         tag: str,
-         enable_cpu_backup: bool,
-+        **kwargs,
-     ):
-         assert (
-             self._hook_mode == "preload"
-         ), "Only hook_mode=preload supports pauseable CUDA Graph currently"
-         with torch.npu.graph(
--            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode
-+            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode, **kwargs
-         ):
-             with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
-                 yield
-@@ -176,5 +179,4 @@ def _sanity_checks():
-     if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
-         raise RuntimeError(
-             "TorchMemorySaver is disabled for the current process because expandable_segments is not supported yet."
--        )
--        
-\ No newline at end of file
-+        )
-\ No newline at end of file
--- 
-2.34.1
-
