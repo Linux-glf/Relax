@@ -2,7 +2,7 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.5-9B 8xGPU colocate (sync) training script for DAPO math dataset.
+# Qwen3.5-9B 16xNPU colocate (sync) training script for DAPO math dataset.
 #
 
 set -ex
@@ -191,4 +191,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${PERF_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9B-GRPO-npu8-${now}.log
+    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9B-GRPO-npu16-${now}.log
