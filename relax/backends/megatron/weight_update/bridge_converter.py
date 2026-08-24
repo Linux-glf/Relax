@@ -82,10 +82,7 @@ class BridgeConverter:
             if task.param_weight is not None:
                 self._bridge_task_map[task.global_param_name] = task
 
-        model_bridge = bridge._model_bridge
-        if not hasattr(model_bridge, "_hf_config"):
-            model_bridge._hf_config = bridge.hf_pretrained.config
-        self._bridge_mapping_registry = model_bridge.mapping_registry()
+        self._bridge_mapping_registry = bridge._model_bridge.mapping_registry()
         mapping_registry = self._bridge_mapping_registry
         for name, _param in named_params_and_buffers(self._args, self._model):
             global_name = strip_param_name_prefix(name)
