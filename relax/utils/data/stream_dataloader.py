@@ -611,6 +611,26 @@ def _broadcast_multimodal_inputs(spec, send_tensors, is_src, cuda_dev, broadcast
     return out
 
 
+def _tensor_to_python_values(value: torch.Tensor) -> list[Any]:
+    if not value.is_nested:
+        return value.tolist()
+
+    rows = value.unbind(0)
+
+    try:
+        dense = torch.stack(rows)
+    except RuntimeError:
+        # Preserve row boundaries for truly ragged values.
+        return [row.tolist() for row in rows]
+
+    # TransferQueue may reconstruct scalar fields as singleton rows when
+    # the per-sample shape () is reported as (1,).
+    if dense.ndim == 2 and dense.shape[1] == 1:
+        return dense.squeeze(-1).tolist()
+
+    return dense.tolist()
+
+
 def get_data_from_transfer_queue(
     args,
     tq_client,
@@ -885,7 +905,7 @@ def get_data_from_transfer_queue(
         for k, v in rollout_data.items():
             # Convert length/reward-style fields to Python lists.
             if "lengths" in k or "reward" in k:
-                new_rollout_data[k] = v.tolist()
+                new_rollout_data[k] = _tensor_to_python_values(v)
             elif k == "multimodal_train_inputs":
                 # Only reached on the per_rank_fetch path (the broadcast path
                 # extracts and NCCL-streams these before broadcast). Stored as a
