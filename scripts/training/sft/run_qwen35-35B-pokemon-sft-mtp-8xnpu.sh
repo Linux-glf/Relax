@@ -28,9 +28,9 @@ source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/sft/pokemon}"
 EXP_NAME=qwen3.5-35B-A3B-mtp-sft-pokemon-gpu8
-EXP_DIR="${EXP_DIR:-/mnt/tidalfs-hwwh01/dataset/yuanhang/models}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
-DATA_DIR="${DATA_DIR:=/mnt/tidalfs-hwwh01/dataset/yuanhang/datasets}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 TRAIN_FILES=(
     "'${DATA_DIR}/sft/data/pokemon-gpt4o-captions/pokemon_gpt4o_en.parquet'"
     "'${DATA_DIR}/sft/data/pokemon-gpt4o-captions/pokemon_gpt4o_zh.parquet'"

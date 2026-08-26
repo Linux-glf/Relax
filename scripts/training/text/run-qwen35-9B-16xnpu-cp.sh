@@ -33,7 +33,7 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
-EXP_DIR="${EXP_DIR:-/mnt/}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 

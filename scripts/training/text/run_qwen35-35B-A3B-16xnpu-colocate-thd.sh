@@ -36,7 +36,7 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-npu.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
-EXP_DIR="${EXP_DIR:-/mnt/tidalfs-hwwh01/dataset/yuanhang/models}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=3000}"
 
