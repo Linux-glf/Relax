@@ -12,6 +12,14 @@
 | Qwen3.5-9B      | DAPO     | √    | √     | 910C 2卡         | `scripts/training/text/run-qwen35-9B-4xnpu-colocate.sh`       |
 | Qwen3.5-35B-A3B | DAPO     | √    | √     | 910C 8卡         | `scripts/training/text/run-qwen35-35B-A3B-16xnpu-colocate.sh` |
 
+## 特性支持
+
+| 模型            | 训练场景 | 多模态 | MTP | CP  | 训练所需最小卡数 | 参考脚本                                                       |
+| --------------- | -------- | ------ | --- | --- | ---------------- | -------------------------------------------------------------- |
+| Qwen3.5-9B      | DAPO     | -      | -   | √   | 910C 8卡         | `scripts/training/text/run-qwen35-9B-16xnpu-cp.sh`             |
+| Qwen3.5-9B      | DAPO     | -      | √   | -   | 910C 4卡         | `scripts/training/text/run_qwen35_9B_mtp_8xnpu_thd.sh`         |
+| Qwen3.5-35B-A3B | SFT      | √      | √   | -   | 910C 4卡         | `scripts/training/sft/run_qwen35-35B-pokemon-sft-mtp-8xnpu.sh` |
+
 ## 环境准备
 
 ### 前置准备
@@ -120,4 +128,4 @@ bash scripts/training/text/run-qwen3-4B-8xgpu-async-npu.sh
 
 ## 下一步
 
-- [ ] 特性支持：多模态、CP长序列、MTP 等
+- [ ] 性能优化：Qwen3.5-35B-A3B 等
