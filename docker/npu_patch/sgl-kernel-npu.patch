@@ -1,3 +1,30 @@
+From f42eed63a506c5c9e7a4c01891acced10be2c37a Mon Sep 17 00:00:00 2001
+From: temp <temp@example.com>
+Date: Fri, 21 Aug 2026 08:50:23 +0000
+Subject: [PATCH 1/3] sgl-kernel-npu.patch
+
+---
+ .../python/torch_memory_saver/entrypoint.py   |   8 +-
+ .../op_host/cache_loc_assign.cpp              |  36 +-
+ .../op_host/tiling/cache_loc_assign.h         |   5 +
+ .../op_kernel/cache_loc_assign_kernel.cpp     |  10 +-
+ csrc/pytorch_extensions.cpp                   |   4 +-
+ include/sgl_kenel_npu_ops.h                   |   6 +-
+ .../sgl_kernel_npu/sample/__init__.py         |  13 +
+ .../sample/chain_speculative_sampling.py      | 354 +++++++++++
+ .../sgl_kernel_npu/sample/probability.py      |  40 ++
+ .../tree_speculative_sampling_target_only.py  | 383 +++++++++++
+ .../test_chain_speculative_sampling.py        | 138 ++++
+ .../test_speculative_probability.py           |  31 +
+ ...t_tree_speculative_sampling_target_only.py | 595 ++++++++++++++++++
+ 13 files changed, 1605 insertions(+), 18 deletions(-)
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/sample/chain_speculative_sampling.py
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/sample/probability.py
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/sample/tree_speculative_sampling_target_only.py
+ create mode 100644 tests/python/sgl_kernel_npu/test_chain_speculative_sampling.py
+ create mode 100644 tests/python/sgl_kernel_npu/test_speculative_probability.py
+ create mode 100644 tests/python/sgl_kernel_npu/test_tree_speculative_sampling_target_only.py
+
 diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
 index b14c561..7b0508d 100644
 --- a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
@@ -1845,3 +1872,562 @@ index 0000000..3c12d53
 +        )
 +    else:
 +        raise SystemExit(pytest.main([__file__]))
+-- 
+2.34.1
+
+
+From 9b1b9e279c6323f297b6670497fb5ba813492384 Mon Sep 17 00:00:00 2001
+From: wuqiwei <wuqiwei4@huawei.com>
+Date: Sun, 23 Aug 2026 12:42:30 +0000
+Subject: [PATCH 2/3] perf(fla): remove input_guard from
+ fused_sigmoid_gating_delta_rule_update_npu, support non-contiguous q/k/v via
+ row strides
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GDN decode 优化方案B (ported from my/2026.7.2_daikang_0823):
+- drop @input_guard full-contiguous on q/k/v; kernel addresses by per-token
+  row stride so decode can pass non-contiguous views and skip 3 q/k/v copies
+  per layer per step
+- q/k/v only require last-dim stride == 1; contiguous inputs are bit-identical
+  to the old addressing
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ .../fla/fused_sigmoid_gating_recurrent.py     | 36 ++++++++++++++-----
+ 1 file changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
+index 2c6288e..770bd67 100644
+--- a/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
+@@ -5,7 +5,6 @@ import torch
+ import torch.nn.functional as F
+ import triton
+ import triton.language as tl
+-from sgl_kernel_npu.fla.utils import input_guard
+ 
+ 
+ @triton.heuristics(
+@@ -29,6 +28,9 @@ def fused_sigmoid_gating_delta_rule_update_npu_kernel(
+     h0_source,
+     h0_indices,
+     cu_seqlens,
++    q_row_stride,
++    k_row_stride,
++    v_row_stride,
+     scale,
+     T,
+     B: tl.constexpr,
+@@ -70,9 +72,9 @@ def fused_sigmoid_gating_delta_rule_update_npu_kernel(
+     for i_bhv in range(BHV):
+         i_hv = i_nhv * BHV + i_bhv
+         i_h = i_hv // (HV // H)
+-        p_q = q + (bos * H + i_h) * K + o_k  # q + 0 ~ 127
+-        p_k = k + (bos * H + i_h) * K + o_k  # k + 0 ~ 127
+-        p_v = v + (bos * HV + i_hv) * V + o_v  # v + i_nh * 128 + 0 ~ 15 * 8 + 0 ~ 7
++        p_q = q + bos * q_row_stride + i_h * K + o_k  # q + 0 ~ 127
++        p_k = k + bos * k_row_stride + i_h * K + o_k  # k + 0 ~ 127
++        p_v = v + bos * v_row_stride + i_hv * V + o_v  # v + i_nh * 128 + 0 ~ 15 * 8 + 0 ~ 7
+         p_b = b + bos * HV + i_hv
+         p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
+ 
+@@ -88,9 +90,9 @@ def fused_sigmoid_gating_delta_rule_update_npu_kernel(
+ 
+         for i in range(T):
+             # Load inputs
+-            b_q = tl.load(p_q + i * H * K, mask=mask_k).to(tl.float32)  # 128 * float32
+-            b_k = tl.load(p_k + i * H * K, mask=mask_k).to(tl.float32)  # 128 * float32
+-            b_v = tl.load(p_v + i * HV * V, mask=mask_v).to(tl.float32)  # 64 * float32
++            b_q = tl.load(p_q + i * q_row_stride, mask=mask_k).to(tl.float32)  # 128 * float32
++            b_k = tl.load(p_k + i * k_row_stride, mask=mask_k).to(tl.float32)  # 128 * float32
++            b_v = tl.load(p_v + i * v_row_stride, mask=mask_v).to(tl.float32)  # 64 * float32
+             b_b = tl.load(p_b + i * HV).to(tl.float32)
+ 
+             # Compute sigmoid gating
+@@ -166,7 +168,6 @@ def fused_sigmoid_gating_delta_rule_update_npu_kernel(
+             tl.store(p_o + i * HV * V, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+ 
+ 
+-@input_guard
+ def fused_sigmoid_gating_delta_rule_update_npu(
+     A_log: torch.Tensor,
+     a: torch.Tensor,
+@@ -188,7 +189,23 @@ def fused_sigmoid_gating_delta_rule_update_npu(
+     Fused triton implementation of sigmoid gating delta rule update.
+     This function uses a single fused kernel that combines both sigmoid gating computation
+     and the recurrent delta rule update for better performance.
++
++    v1 变更（GDN decode 优化方案B）：去掉 @input_guard 的全量 contiguous——
++    q/k/v 允许非连续视图（仅要求末维 stride==1），kernel 按传入的 token 行 stride
++    寻址，消去 decode 路径每层 3 份 q/k/v 拷贝；连续输入时寻址与原版完全一致
++    （逐 bit 等价，已由 resource/code/gdn_mamba/test_b 验证）。
+     """
++    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
++    assert initial_state_source.is_contiguous()
++    a = a.contiguous()
++    b = b.contiguous()
++    A_log = A_log.contiguous()
++    dt_bias = dt_bias.contiguous()
++    if initial_state_indices is not None:
++        initial_state_indices = initial_state_indices.contiguous()
++    if cu_seqlens is not None:
++        cu_seqlens = cu_seqlens.contiguous()
++
+     B, T, H, K, V = *k.shape, v.shape[-1]
+     HV = v.shape[2]
+     N = B if cu_seqlens is None else len(cu_seqlens) - 1
+@@ -222,6 +239,9 @@ def fused_sigmoid_gating_delta_rule_update_npu(
+         h0_source=initial_state_source,
+         h0_indices=initial_state_indices,
+         cu_seqlens=cu_seqlens,
++        q_row_stride=q.stride(1),
++        k_row_stride=k.stride(1),
++        v_row_stride=v.stride(1),
+         scale=scale,
+         T=T,
+         B=B,
+-- 
+2.34.1
+
+
+From c94d6f86357e4045167b1131586b2916ffb22f30 Mon Sep 17 00:00:00 2001
+From: wuqiwei <wuqiwei4@huawei.com>
+Date: Sun, 23 Aug 2026 14:37:01 +0000
+Subject: [PATCH 3/3] feat(moe): add moe_front_routing v2.2 + persistent GMM2
+ (ported from my/2026.7.2_daikang_0823)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+qwen3.5 MoE 前端路由融合包 (moe_front_fusion/v1)，与 daikang c9ef00d 逐字节一致：
+- moe_front_routing.py: 自写 init_routing（rank_hist + partials_cumsum + gather
+  三 launch），语义与 npu_moe_init_routing_v2(type=1) 逐位一致（0 容差验收），
+  并原生输出 exclusive offsets（int32）供 persistent GMM2 直用
+- persistent_gmm.py: Triton persistent GMM2（EP1 decode skinny 场景），offsets
+  缺省时由内置前置 kernel 推导，或由 v2.2 init 的 excl 直喂
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ .../sgl_kernel_npu/moe/moe_front_routing.py   | 182 +++++++++++++++
+ .../sgl_kernel_npu/moe/persistent_gmm.py      | 218 ++++++++++++++++++
+ 2 files changed, 400 insertions(+)
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/moe/moe_front_routing.py
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/moe/persistent_gmm.py
+
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/moe/moe_front_routing.py b/python/sgl_kernel_npu/sgl_kernel_npu/moe/moe_front_routing.py
+new file mode 100644
+index 0000000..e628291
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/moe/moe_front_routing.py
+@@ -0,0 +1,182 @@
++# -*- coding: utf-8 -*-
++"""MoE 前段 v2.2 自写 init_routing（Triton / triton-ascend，CANN 9.0.0）。
++
++服务器落点：sgl_kernel_npu 包内 ``sgl_kernel_npu/moe/moe_front_routing.py``
++（namespace 子包，无需 __init__.py；集成方以
++``from sgl_kernel_npu.moe.moe_front_routing import moe_init_routing_v22`` 导入）。
++
++语义契约：与 ``torch.ops.npu.npu_moe_init_routing_v2``（expert_tokens_num_type=1）
++**逐位一致**（RL 精度硬约束，0 容差验收）：
++  - expanded_x：x 行按「expert id 稳定计数排序」的置换（同 expert 内保持
++    flat slot 原序，flat slot 为 t-major：f = t*top_k + k）；
++  - eri[f] = flat slot f 对应的 expanded 行号（= stock expanded_row_idx 逐位）；
++  - counts = per-expert 计数（int64，stock type=1 形态，喂 stock GMM
++    ``group_list_type=1``）。
++顺带原生输出两个前缀和（免任何前置 kernel）：
++  - excl（int32）：exclusive 前缀和，直喂 persistent_gmm 的 ``offsets=``
++    （省 _gmm2_offsets_kernel，~4.4µs/层）；
++  - incl（int64）：inclusive 前缀和，stock GMM ``group_list_type=0`` 形态（备用）。
++
++formulation（v2.2，code/moe_front_fusion 六轮单测定案；
++结果 src/moe_front_fusion_result{,_2.._6}.csv，结论见
++docs/practice/npu-moe-forward-region-probe.md）：
++
++  - rank（eri）：(e,slot) 字典序打包单比较，key = e*PM + slot，「j 排在 i 前」
++    ⟺ key_j < key_i；比较矩阵转置 [PM, BM]、归约走 axis=0（本机实证快方向）；
++    每 program 顺带产**部分直方图**（[BM,PE] axis=0 一次归约），跨 program
++    并行取代串行扫描。
++  - counts/excl/incl：第二个 kernel 对 partials [NP,PE] 做 axis=0 二次归约 +
++    1D tl.cumsum（生产验证原语）直出，i64 直写省 cast；无 atomic、无零初始化。
++  - gather（expanded_x）：独立 kernel 行块向量化 [RPP,H]（RPP=8 为 32KB），
++    **不与 rank 合并**——五轮实证融合版 18.2µs 败（归约链后串接大 tile 访存
++    长链），拆分版部件和仅 6.2µs。
++  - 精度验收：九分布（uniform/random/zipf/skew/first/last 含极端）× 多 seed
++    与 stock 逐位一致 + finalize 闭环 0 diff + 双跑确定（两形态各一轮全绿）。
++  - 性能（graph-loop，T=32/topk=8/E=256/H=2048，µs/层）：全程 10.9 vs
++    stock 17.0~18.2；链路口径 chain_renorm_v22 24.0 vs stock 链 37.4
++    （同 run -13.4）。
++
++形态门（wrapper 内自适应；超出形态由集成方回退 stock）：
++  M = T*top_k ≤ 512 且 M % 8 == 0，H 为 2 的幂（gather 行块要求），
++  x 为 bf16。bm/rpp 按 M 整除自适应（32/16/8 与 8/4/2/1）。
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++try:
++    from sgl_kernel_npu.fla.utils import input_guard
++except ImportError:  # 独立调试（未安装 sgl_kernel_npu）时退化为恒等装饰器
++    def input_guard(fn):
++        return fn
++
++
++def _pow2_ceil(n: int) -> int:
++    p = 1
++    while p < n:
++        p <<= 1
++    return p
++
++
++@triton.jit
++def _rank_hist_kernel(
++    ids_ptr, eri_ptr, part_ptr,
++    M: tl.constexpr, PM: tl.constexpr, PE: tl.constexpr, BM: tl.constexpr,
++):
++    """eri + 部分直方图（grid = M//BM）。
++
++    lt[j, i] = key_j < key_i（[PM, BM]，axis=0 归约——本机实证快方向）；
++    part[pid] = 本 program BM 个 slot 的 expert 直方图（[BM, PE] axis=0）。
++    padding slot 的 key=32768*PM+... 大于一切真实 key，不改变真实名次。
++    """
++    pid = tl.program_id(0)
++    rows = pid * BM + tl.arange(0, BM)
++    jj = tl.arange(0, PM)
++    e_all = tl.load(ids_ptr + jj, mask=jj < M, other=32768).to(tl.int32)
++    e_rows = tl.load(ids_ptr + rows, mask=rows < M, other=-1).to(tl.int32)
++    key_all = e_all * PM + jj
++    key_rows = e_rows * PM + rows
++    lt = key_all[:, None] < key_rows[None, :]       # [PM, BM]
++    rank = tl.sum(lt.to(tl.int16), axis=0)          # [BM]
++    tl.store(eri_ptr + rows, rank.to(tl.int32), mask=rows < M)
++    rngE = tl.arange(0, PE)
++    eq = e_rows[:, None] == rngE[None, :]           # [BM, PE]（-1 不命中任何 expert）
++    part = tl.sum(eq.to(tl.int16), axis=0).to(tl.int32)
++    tl.store(part_ptr + pid * PE + rngE, part)
++
++
++@triton.jit
++def _partials_cumsum_kernel(
++    part_ptr, counts_ptr, excl_ptr, incl_ptr,
++    NP: tl.constexpr, NPP: tl.constexpr, PE: tl.constexpr, E: tl.constexpr,
++):
++    """partials [NP, PE] -> counts(i64) / excl(i32) / incl(i64)，单 program。
++
++    全白名单原语：axis=0 二次归约 + 1D tl.cumsum（GDN 生产路径同款）。
++    """
++    np_ = tl.arange(0, NPP)
++    rngE = tl.arange(0, PE)
++    part = tl.load(part_ptr + np_[:, None] * PE + rngE[None, :],
++                   mask=(np_ < NP)[:, None], other=0)
++    counts = tl.sum(part, axis=0)                   # [PE] i32
++    incl = tl.cumsum(counts, axis=0)
++    excl = incl - counts
++    e_valid = rngE < E
++    tl.store(counts_ptr + rngE, counts.to(tl.int64), mask=e_valid)
++    tl.store(excl_ptr + rngE, excl, mask=e_valid)
++    tl.store(incl_ptr + rngE, incl.to(tl.int64), mask=e_valid)
++
++
++@triton.jit
++def _routing_gather_kernel(
++    x_ptr, eri_ptr, out_ptr,
++    TOPK: tl.constexpr, H: tl.constexpr, RPP: tl.constexpr,
++):
++    """行块置换：out[eri[f]] = x[f // TOPK]，每 program 处理 RPP 个 flat slot。
++
++    [RPP, H] 二维 tile 一次装载/写出（RPP=8 为 32KB），行内 4KB 连续。
++    grid = (M // RPP,)（wrapper 保证 M % RPP == 0，故不带 mask）。
++    """
++    pid = tl.program_id(0)
++    fs = pid * RPP + tl.arange(0, RPP)
++    dest = tl.load(eri_ptr + fs)  # [RPP] int32
++    tok = fs // TOPK
++    hh = tl.arange(0, H)
++    rows = tl.load(x_ptr + tok[:, None] * H + hh[None, :])
++    tl.store(out_ptr + dest[:, None] * H + hh[None, :], rows)
++
++
++def _pick_tile(m: int, candidates) -> int:
++    for c in candidates:
++        if m % c == 0:
++            return c
++    return candidates[-1]
++
++
++@input_guard
++def moe_init_routing_v22(
++    x: torch.Tensor,
++    topk_ids: torch.Tensor,
++    num_experts: int,
++    top_k: int,
++):
++    """v2.2 自写 init_routing（rank_hist + partials_cumsum + gather 三 launch）。
++
++    形态门（调用方负责判定，超出门请回退 stock）：M = T*top_k ≤ 512 且
++    M % 8 == 0；H 为 2 的幂；x 为 bf16 contiguous。
++
++    参数：
++      x:         [T, H] bf16，decode 隐藏状态。
++      topk_ids:  [T, top_k] int32 contiguous（来自 gating 算子）。
++      num_experts / top_k：路由配置。
++
++    返回 (expanded_x, eri, counts_i64, excl_i32, incl_i64)：
++      expanded_x [M, H] bf16 / eri [M] int32 —— 与 stock 逐位一致（0 容差）；
++      counts_i64 [E] —— stock type=1 形态（GMM group_list_type=1）；
++      excl_i32   [E] —— persistent_gmm 的 offsets= 直用（省 4.4µs 前置 kernel）；
++      incl_i64   [E] —— stock GMM group_list_type=0 形态（备用）。
++    """
++    T, H = x.shape
++    M = T * top_k
++    ids_flat = topk_ids.reshape(-1).to(torch.int32)  # 同 dtype 时 .to 不拷贝
++    dev = x.device
++    PM = _pow2_ceil(M)
++    PE = _pow2_ceil(num_experts)
++    bm = _pick_tile(M, (32, 16, 8))
++    rpp = _pick_tile(M, (8, 4, 2, 1))
++    npart = M // bm
++    eri = torch.empty(M, dtype=torch.int32, device=dev)
++    partials = torch.empty((npart, PE), dtype=torch.int32, device=dev)
++    expanded = torch.empty((M, H), dtype=x.dtype, device=dev)
++    counts = torch.empty(num_experts, dtype=torch.int64, device=dev)
++    excl = torch.empty(num_experts, dtype=torch.int32, device=dev)
++    incl = torch.empty(num_experts, dtype=torch.int64, device=dev)
++    _rank_hist_kernel[(npart,)](ids_flat, eri, partials,
++                                M=M, PM=PM, PE=PE, BM=bm, num_stages=1)
++    _routing_gather_kernel[(M // rpp,)](x, eri, expanded,
++                                        TOPK=top_k, H=H, RPP=rpp)
++    _partials_cumsum_kernel[(1,)](partials, counts, excl, incl,
++                                  NP=npart, NPP=_pow2_ceil(npart), PE=PE,
++                                  E=num_experts, num_stages=1)
++    return expanded, eri, counts, excl, incl
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/moe/persistent_gmm.py b/python/sgl_kernel_npu/sgl_kernel_npu/moe/persistent_gmm.py
+new file mode 100644
+index 0000000..8e28e82
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/moe/persistent_gmm.py
+@@ -0,0 +1,218 @@
++# -*- coding: utf-8 -*-
++"""Persistent grouped matmul（Triton / triton-ascend），面向 EP1 decode 的 skinny GMM2。
++
++服务器落点：sgl_kernel_npu 包内 ``sgl_kernel_npu/moe/persistent_gmm.py``
++（namespace 子包，无需 __init__.py；集成方以
++``from sgl_kernel_npu.moe.persistent_gmm import persistent_grouped_matmul`` 导入）。
++
++迁移说明（gmm/v1，基线 sglang main@bd3f6a793 + sgl_kernel_npu 3.2.1）：
++  面向 8 卡 16 die / 4 engine（MoE-TP、EP1）decode：E=256, N=2048，
++  K=64(TP8)/128(TP4)，平均 ~1 rows/expert，stock GMM2 实测 ~65us
++  （mac_ratio 6.9%，scalar/fixpipe 接近饱和，AIV 全闲）。瓶颈结构：
++  逐 group 调度与组间流水线排空，而非 FLOPs。
++
++v1.1 修复（2026-08-10，bisect 实证见 src/bisect_result.txt）：
++  v1 的 masked-sum in-kernel offsets（row0 = sum(where(e_rng < e, c_vec, 0))，
++  继承自 old_env v1.2.1，且当年修复后无 rollout 复测记录）在本机工具链
++  （CANN 9.0.0 / triton-ascend，默认 --enable-auto-multi-buffer）下被误编译：
++  persistent 数据依赖控制流中的 scalar-masked reduction 计算出错误的 row0，
++  输出整体错位（stages=3 rel_diff≈1.3；stages=1 直接 1.7e38 垃圾值），
++  rollout 乱码。二分证实：同一 kernel 改用外部 offsets 标量直读后与 stock
++  GMM 逐位一致（max_abs=0.000000，tl.trans / num_stages / base_n 均无辜）。
++  本版 offsets 改为「前置 offsets kernel + 标量直读」：
++    - _gmm2_offsets_kernel：单 program 前缀和；替代 torch.cumsum 链
++      （~58us/层，且其 torch 算子对 graph capture 不友好）。
++    - _persistent_gmm_kernel：row0 = tl.load(offsets_ptr + e) 标量直读，
++      与 bisect 中逐位正确的 ext_off 路径完全一致。
++  若前置 kernel 在本机仍验证不过，回退方案：wrapper 用
++  ``offsets = torch.cumsum(group_list, 0) - group_list``（2 个小算子，
++  见 persistent_grouped_matmul 注释），kernel 无需改动。
++
++v1.2 修复（2026-08-11，rollout 实证：offsets kernel 37us 吞掉全部收益）：
++  v1.1 的两级分组扫描用了 [G,G,G] 三维 tl.where+tl.sum(axis=2)，在本机
++  triton-ascend 上未被向量化、scalarize 成逐元素循环（4096 次标量乘加 ×
++  单 program），实测 ~37us/层，吞掉 persistent kernel 省下的 ~24us/层。
++  （rollout 实测：persistent kernel 本体 41us vs stock 65us 正确且稳定。）
++
++v1.3 修复（2026-08-11）：v1.2 的 Hillis-Steele（全局 scratch 就地
++  store->移位 load）在 ConvertTritonIRToLinalgIR 阶段 PassManager 编译失败。
++  改用 tl.cumsum 一维扫描——该原语在本工具链已被生产验证
++  （sgl_kernel_npu.fla.cumsum 的 chunk_local_cumsum_scalar_kernel，GDN 路径），
++  扫描前先转 int32（int64 reduction 风险的老教训）。目标 <=5-7us/层。
++
++v1.4 调优（2026-08-11，code/moe_whole_process 探针实测）：
++  num_progs 40→24。Ascend910_9382 为 24 AIC/die，静态 round-robin 下
++  p40 有 16 核背 2 个 program 形成慢波、p32 更灾难（8 核双份）；
++  uniform counts（全活跃）单测 64.3→54.1us（1.03→1.24TB/s，达
++  read_only_sum 实测上限 1.33TB/s 的 ~93%，基本贴墙）。
++  同次探针证伪两个假设：
++    - 权重无条件装载（varU，装载移出 if m_i>0）按实际读取字节折算速率
++      与条件装载完全相同（~1.1TB/s）——瓶颈不是 if 阻断跨迭代流水；
++    - num_stages 2/3/4 计时无差异。
++  HBM 可达带宽标定：read 1328 / copy r+w 1275 GB/s（与旧环境
++  1311/1214 一致）；GMM1 生产 profile 61us（implied 2.2TB/s）与该上限
++  矛盾，冷态 floor 应 ~101us，口径待澄清（L2 热或 shape 混入）。
++
++kernel 设计（继承 v1.2.1 结论）：
++
++  - persistent grid：num_progs 个常驻 program，静态 round-robin 领取 (expert, n_tile)
++    任务；任务成本由权重字节主导且各任务均匀（与 M_i 无关），静态调度即够，
++    无需 atomic 队列。
++  - 空 expert（count=0）整任务跳过，死 expert 权重零流量。
++  - 权重 tile 在任务内对所有 m_tile 复用；BASE_M=16 + 内层 m_tile 循环覆盖热点 expert。
++  - fp32 累加（tl.dot 默认），与 torch.ops.npu.npu_grouped_matmul 数值语义一致。
++  - layout="kn" 路径注意：本机工具链 base_n=512 编译期 cbuf overflow，
++    如确需 kn 布局先试 base_n<=256（nk 为生产路径，不受影响）。
++
++输入契约：
++  x:          [total_M, K] bf16，行按 expert 分组连续（npu_moe_init_routing_v2 输出序）
++  w:          [E, N, K] bf16（layout="nk"，生产存储布局）或 [E, K, N] 连续（layout="kn"）。
++              注意：w 必须是 ND 连续存储；集成方在 _gmm2_triton 开启时已跳过
++              w2 的 FRACTAL_NZ cast，NZ 重排存储会让裸指针读取出错。
++  group_list: [E] per-expert counts（count 模式，int32/int64，device）
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++try:
++    from sgl_kernel_npu.fla.utils import input_guard
++except ImportError:  # 独立调试（未安装 sgl_kernel_npu）时退化为恒等装饰器
++    def input_guard(fn):
++        return fn
++
++
++@triton.jit
++def _gmm2_offsets_kernel(
++    counts_ptr, offsets_ptr,
++    E: tl.constexpr, P: tl.constexpr,
++):
++    """exclusive prefix offsets[e] = sum(counts[<e])，int32 [E]，单 program。
++
++    tl.cumsum 一维扫描（P = >=E 的最小 2 的幂）。formulation 选择依据
++    （本机 CANN 9.0.0 / triton-ascend 实证）：
++      - tl.cumsum 在本工具链可用：sgl_kernel_npu.fla.cumsum 的
++        chunk_local_cumsum_scalar_kernel（GDN 生产路径）即用 tl.cumsum；
++      - 先做 int32 转换再扫描：规避 triton-ascend 的 int64 reduction 风险
++        （v1.2.1 起的老教训）；
++      - 禁止 formulation：persistent 动态控制流内 scalar-masked reduction
++        （v1，误编译数值错）；三维 where/sum tile（v1.1，scalarize ~37us）；
++        全局 scratch 就地 store->移位 load 的 Hillis-Steele（v1.2，
++        ConvertTritonIRToLinalgIR PassManager 编译失败）。
++    """
++    rng = tl.arange(0, P)
++    e_mask = rng < E
++    c = tl.load(counts_ptr + rng, mask=e_mask, other=0).to(tl.int32)
++    incl = tl.cumsum(c, axis=0)
++    tl.store(offsets_ptr + rng, incl - c, mask=e_mask)
++
++
++@triton.jit
++def _persistent_gmm_kernel(
++    x_ptr, w_ptr, counts_ptr, offsets_ptr, out_ptr,
++    num_progs,
++    E: tl.constexpr, K: tl.constexpr, N: tl.constexpr,
++    BASE_M: tl.constexpr, BASE_N: tl.constexpr, W_KN: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    N_TILES: tl.constexpr = N // BASE_N
++    TOTAL_TASKS: tl.constexpr = E * N_TILES
++    k_rng = tl.arange(0, K)
++    bm_rng = tl.arange(0, BASE_M)
++    bn_rng = tl.arange(0, BASE_N)
++
++    for t in range(pid, TOTAL_TASKS, num_progs):
++        e = t // N_TILES
++        j = t % N_TILES
++        m_i = tl.load(counts_ptr + e).to(tl.int32)
++        if m_i > 0:
++            # bisect 逐位验证过的形态：外部 offsets + 标量直读。
++            # 严禁改回 kernel 内 masked-sum 推导（本机工具链误编译，rollout 乱码）。
++            row0 = tl.load(offsets_ptr + e)
++            if W_KN:
++                # [E,K,N] 连续：直接读 [K, BASE_N] tile（k 行各 2*BASE_N 字节连续突发）
++                w_t = tl.load(
++                    w_ptr + e.to(tl.int64) * N * K
++                    + k_rng[:, None] * N + (j * BASE_N + bn_rng)[None, :]
++                )
++            else:
++                # [E,N,K] 连续（生产存储布局）：读 [BASE_N, K] 后寄存器转置
++                w_tile = tl.load(
++                    w_ptr + e.to(tl.int64) * N * K
++                    + (j * BASE_N + bn_rng)[:, None] * K + k_rng[None, :]
++                )
++                w_t = tl.trans(w_tile)
++            for m0 in range(0, m_i, BASE_M):
++                rows = row0 + m0 + bm_rng
++                m_mask = (m0 + bm_rng) < m_i
++                x_tile = tl.load(
++                    x_ptr + rows[:, None] * K + k_rng[None, :],
++                    mask=m_mask[:, None], other=0.0,
++                )
++                acc = tl.dot(x_tile, w_t)  # fp32 [BASE_M, BASE_N]
++                tl.store(
++                    out_ptr + rows[:, None] * N + (j * BASE_N + bn_rng)[None, :],
++                    acc.to(tl.bfloat16),
++                    mask=m_mask[:, None],
++                )
++
++
++def _pow2_ceil(n: int) -> int:
++    p = 1
++    while p < n:
++        p <<= 1
++    return p
++
++
++@input_guard
++def persistent_grouped_matmul(
++    x: torch.Tensor,
++    w: torch.Tensor,
++    group_list: torch.Tensor,
++    base_n: int = 512,
++    num_progs: int = 24,
++    num_stages: int = 3,
++    layout: str = "nk",
++    out: torch.Tensor = None,
++    offsets: torch.Tensor = None,
++) -> torch.Tensor:
++    """GMM2 专用 persistent grouped matmul，返回 [total_M, N] bf16。
++
++    base_n:     N 方向 tile（{256,512,1024} 之一，须整除 N）
++    num_progs:  常驻 program 数。默认 24：Ascend910_9382 为 24 AIC/die，
++                静态 round-robin 下与核数相等才负载均衡（v1.4 探针实测：
++                p40 慢 ~19%，p32 最灾难；扫参范围 {20,24,32,40,48}）。
++    num_stages: triton 流水级数（探针实测 2/3/4 无差异，保持默认 3）
++    layout:     "nk" = w 为 [E,N,K]（生产存储布局）；"kn" = w 为 [E,K,N] 连续
++    offsets:    可选外部 exclusive offsets（int32 [E]）；缺省时由本函数内置的
++                offsets 前置 kernel 推导（无 torch 计算，graph capture 友好）。
++                回退形态：offsets = torch.cumsum(group_list, 0) - group_list
++                （to(int32) 后传入），kernel 无需任何改动。
++    """
++    E, N, K = w.shape
++    total_M = x.shape[0]
++    if out is None:
++        out = torch.empty((total_M, N), dtype=torch.bfloat16, device=x.device)
++    if offsets is None:
++        offsets = torch.empty(E, dtype=torch.int32, device=x.device)
++        P = _pow2_ceil(E)
++        _gmm2_offsets_kernel[(1,)](
++            group_list, offsets, E=E, P=P
++        )
++    _persistent_gmm_kernel[(num_progs,)](
++        x_ptr=x,
++        w_ptr=w,
++        counts_ptr=group_list,
++        offsets_ptr=offsets,
++        out_ptr=out,
++        num_progs=num_progs,
++        E=E,
++        K=K,
++        N=N,
++        BASE_M=16,
++        BASE_N=base_n,
++        W_KN=(layout == "kn"),
++        num_stages=num_stages,
++    )
++    return out
+-- 
+2.34.1
+
