@@ -48,7 +48,11 @@ def sglang_engine_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "relax.utils.async_utils", async_utils)
 
     env = ModuleType("relax.utils.env")
-    env.Envs = SimpleNamespace()
+    env.Envs = SimpleNamespace(
+        RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,
+        RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN=120,
+        RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN=512,
+    )
     monkeypatch.setitem(sys.modules, "relax.utils.env", env)
 
     http_utils = ModuleType("relax.utils.http_utils")
