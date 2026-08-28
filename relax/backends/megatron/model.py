@@ -1300,6 +1300,7 @@ def train_one_step(
             )
             for key in keys:
                 loss_reduced[key] = 0.0
+            capture_hooks.end_step_for()
             return loss_reduced, grad_norm
         for key, value in zip(keys, values[1:], strict=False):
             # Per-token and sequence-classification metrics use the all-reduced
