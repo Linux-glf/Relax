@@ -2,6 +2,11 @@
 
 from types import SimpleNamespace
 
+import pytest
+
+
+pytest.importorskip("megatron.training.checkpointing", exc_type=ImportError)
+
 from relax.backends.megatron import checkpoint
 from relax.utils.model_source import ModelSource
 

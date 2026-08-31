@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from argparse import Namespace
 from collections import deque
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -23,7 +24,6 @@ from relax.agentic.pipeline.prepare import PrepareDomain
 from relax.agentic.pipeline.reward import RewardDomain
 from relax.agentic.pipeline.runtime import RuntimeDomain, SGLangBackendAdapter, _build_session_specs
 from relax.agentic.pipeline.transfer import TransferBatch, TransferDomain
-from relax.agentic.rollout import AgenticResidentPipeline, _StepContext
 from relax.agentic.session.admission import (
     AdmissionAction,
     AdmissionReason,
@@ -43,6 +43,22 @@ from relax.agentic.session.service import (
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
 from relax.utils.types import Sample
+
+
+# ``relax.agentic.rollout`` only needs this logging helper at import time. Keep
+# the agentic unit tests collectible in environments without the optional
+# SGLang backend, while avoiding a process-wide stub after this import.
+_rollout_module_name = "relax.distributed.ray.rollout"
+_existing_rollout_module = sys.modules.get(_rollout_module_name)
+if _existing_rollout_module is None:
+    _rollout_module_stub = ModuleType(_rollout_module_name)
+    _rollout_module_stub._log_rollout_data = MagicMock()
+    sys.modules[_rollout_module_name] = _rollout_module_stub
+try:
+    from relax.agentic.rollout import AgenticResidentPipeline, _StepContext  # noqa: E402
+finally:
+    if _existing_rollout_module is None:
+        sys.modules.pop(_rollout_module_name, None)
 
 
 def _runtime_args(**overrides):

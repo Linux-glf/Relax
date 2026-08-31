@@ -18,6 +18,8 @@ import pytest
 def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
     enable_mtp_training, speculative_algorithm, overrides, expected
 ):
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+
     from relax.backends.sglang.sglang_engine import _enable_draft_weights_cpu_backup
 
     args = SimpleNamespace(

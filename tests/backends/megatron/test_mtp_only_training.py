@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 import torch
 
+
+pytest.importorskip("megatron.training.arguments", exc_type=ImportError)
+
 from relax.backends.megatron import model_provider as model_provider_mod
 from relax.backends.megatron.loss import mtp_only_loss_function
 from relax.backends.megatron.model_provider import (

@@ -3,6 +3,9 @@
 import pytest
 import torch
 
+
+pytest.importorskip("megatron.core", exc_type=ImportError)
+
 from relax.backends.megatron import cp_utils
 from relax.utils.sft_utils import align_loss_mask_for_sft
 

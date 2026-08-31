@@ -10,8 +10,6 @@ from unittest.mock import MagicMock
 import pytest
 import transfer_queue
 
-from relax.distributed.checkpoint_service.backends import device_direct
-from relax.distributed.checkpoint_service.coordinator import service as dcs_service
 from relax.distributed.ray import placement_group as placement_group_module
 from relax.utils import health_system
 
@@ -47,6 +45,11 @@ def test_health_status_requests_stable_cpu(monkeypatch, tmp_path):
 
 
 def test_dcs_preserves_base_options_and_stable_cpu(monkeypatch):
+    try:
+        from relax.distributed.checkpoint_service.coordinator import service as dcs_service
+    except ImportError as exc:
+        pytest.skip(f"DCS optional dependencies are unavailable: {exc}")
+
     fake = type("FakeDCS", (_FakeActorClass,), {"bind": classmethod(lambda cls, **kwargs: "deployment")})
     monkeypatch.setattr(dcs_service, "DCSCoordinator", fake)
     monkeypatch.setattr(dcs_service.serve, "run", lambda *args, **kwargs: MagicMock())
@@ -144,6 +147,11 @@ def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
 
 
 def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):
+    try:
+        from relax.distributed.checkpoint_service.backends import device_direct
+    except ImportError as exc:
+        pytest.skip(f"DCS optional dependencies are unavailable: {exc}")
+
     captured = {}
 
     class FakeRolloutEngine(_FakeActorClass):

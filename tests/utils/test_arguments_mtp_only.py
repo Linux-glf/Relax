@@ -5,28 +5,27 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.utils.arguments import (
-    _MTP_DETACH_PATHS,
-    _MTP_ONLY_PARAM_PATTERN,
-    _normalize_mtp_detach_paths,
-    _normalize_mtp_only_training_args,
-    _reject_removed_mtp_detach_flags,
-    get_slime_extra_args_provider,
+from tests.utils.test_arguments_opd_teacher_colocate import (
+    arguments_module as _arguments_module_fixture,
 )
 
 
-def test_mtp_detach_paths_defaults_to_all_paths():
-    parser = argparse.ArgumentParser()
-    get_slime_extra_args_provider()(parser)
+arguments_module = _arguments_module_fixture
 
-    assert parser.parse_args([]).mtp_detach_paths == _MTP_DETACH_PATHS
+
+def test_mtp_detach_paths_defaults_to_all_paths(arguments_module):
+    parser = argparse.ArgumentParser()
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    assert parser.parse_args([]).mtp_detach_paths == arguments_module._MTP_DETACH_PATHS
 
     args = parser.parse_args(["--mtp-detach-paths", "lm-head", "embedding"])
-    _normalize_mtp_detach_paths(args)
+    arguments_module._normalize_mtp_detach_paths(args)
     assert args.mtp_detach_paths == ("embedding", "lm-head")
 
     args = parser.parse_args(["--mtp-detach-paths", "none"])
-    _normalize_mtp_detach_paths(args)
+    arguments_module._normalize_mtp_detach_paths(args)
     assert args.mtp_detach_paths == ()
 
 
@@ -39,26 +38,26 @@ def test_mtp_detach_paths_defaults_to_all_paths():
         (["none"], ()),
     ],
 )
-def test_normalize_mtp_detach_paths(values, expected):
+def test_normalize_mtp_detach_paths(arguments_module, values, expected):
     args = SimpleNamespace(mtp_detach_paths=values)
 
-    _normalize_mtp_detach_paths(args)
+    arguments_module._normalize_mtp_detach_paths(args)
 
     assert args.mtp_detach_paths == expected
 
 
-def test_normalize_mtp_detach_paths_rejects_none_with_another_path():
+def test_normalize_mtp_detach_paths_rejects_none_with_another_path(arguments_module):
     with pytest.raises(ValueError, match="none cannot be combined"):
-        _normalize_mtp_detach_paths(SimpleNamespace(mtp_detach_paths=["none", "embedding"]))
+        arguments_module._normalize_mtp_detach_paths(SimpleNamespace(mtp_detach_paths=["none", "embedding"]))
 
 
 @pytest.mark.parametrize("flag", ["--mtp-detach-main-model", "--no-mtp-detach-main-model"])
-def test_removed_mtp_detach_flags_fail_fast_even_when_unknown_args_are_ignored(flag):
+def test_removed_mtp_detach_flags_fail_fast_even_when_unknown_args_are_ignored(arguments_module, flag):
     with pytest.raises(ValueError, match="has been removed"):
-        _reject_removed_mtp_detach_flags([flag])
+        arguments_module._reject_removed_mtp_detach_flags([flag])
 
 
-def _args(**overrides) -> SimpleNamespace:
+def _args(arguments_module, **overrides) -> SimpleNamespace:
     defaults = {
         "mtp_only_training": True,
         "loss_type": "sft",
@@ -72,21 +71,21 @@ def _args(**overrides) -> SimpleNamespace:
         "mtp_num_layers": None,
         "mtp_loss_scaling_factor": 0.2,
         "enable_mtp_training": False,
-        "mtp_detach_paths": _MTP_DETACH_PATHS,
+        "mtp_detach_paths": arguments_module._MTP_DETACH_PATHS,
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
 
 
-def test_normalize_mtp_only_training_enables_mtp_and_freezes_non_mtp_params():
-    args = _args()
+def test_normalize_mtp_only_training_enables_mtp_and_freezes_non_mtp_params(arguments_module):
+    args = _args(arguments_module)
 
-    _normalize_mtp_only_training_args(args)
+    arguments_module._normalize_mtp_only_training_args(args)
 
     assert args.enable_mtp_training is True
-    assert args.mtp_detach_paths == _MTP_DETACH_PATHS
+    assert args.mtp_detach_paths == arguments_module._MTP_DETACH_PATHS
     assert args.mtp_num_layers == 1
-    assert args.only_train_params_name_list == [_MTP_ONLY_PARAM_PATTERN]
+    assert args.only_train_params_name_list == [arguments_module._MTP_ONLY_PARAM_PATTERN]
 
 
 @pytest.mark.parametrize(
@@ -105,17 +104,17 @@ def test_normalize_mtp_only_training_enables_mtp_and_freezes_non_mtp_params():
         ({"mtp_loss_scaling_factor": 0.0}, "greater than 0"),
     ],
 )
-def test_normalize_mtp_only_training_rejects_unsafe_combinations(override, expected_flag):
+def test_normalize_mtp_only_training_rejects_unsafe_combinations(arguments_module, override, expected_flag):
     with pytest.raises(ValueError, match=expected_flag):
-        _normalize_mtp_only_training_args(_args(**override))
+        arguments_module._normalize_mtp_only_training_args(_args(arguments_module, **override))
 
 
-def test_normalize_mtp_only_training_is_noop_when_disabled():
-    args = _args(mtp_only_training=False)
+def test_normalize_mtp_only_training_is_noop_when_disabled(arguments_module):
+    args = _args(arguments_module, mtp_only_training=False)
 
-    _normalize_mtp_only_training_args(args)
+    arguments_module._normalize_mtp_only_training_args(args)
 
     assert args.enable_mtp_training is False
-    assert args.mtp_detach_paths == _MTP_DETACH_PATHS
+    assert args.mtp_detach_paths == arguments_module._MTP_DETACH_PATHS
     assert args.mtp_num_layers is None
     assert args.only_train_params_name_list is None
