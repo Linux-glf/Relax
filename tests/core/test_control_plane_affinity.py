@@ -12,6 +12,7 @@ import transfer_queue
 
 from relax.distributed.ray import placement_group as placement_group_module
 from relax.utils import health_system
+from tests.core.controller_test_utils import load_controller_with_stubbed_dependencies
 
 
 def _elastic_args(tmp_path, **kwargs):
@@ -65,7 +66,7 @@ def test_rollout_data_source_requests_stable_cpu(monkeypatch, tmp_path):
     if not hasattr(transfer_queue, "StreamingTokenBudgetSampler"):
         pytest.skip("controller requires a TransferQueue build with StreamingTokenBudgetSampler")
 
-    from relax.core.controller import create_data_source_actor
+    controller_module = load_controller_with_stubbed_dependencies("_test_control_plane_affinity_controller")
 
     captured = {}
 
@@ -78,10 +79,10 @@ def test_rollout_data_source_requests_stable_cpu(monkeypatch, tmp_path):
             captured["config"] = config
             return "data-source"
 
-    monkeypatch.setattr("relax.core.controller.ray.remote", lambda **kwargs: lambda cls: FakeRemoteClass())
+    monkeypatch.setattr(controller_module.ray, "remote", lambda **kwargs: lambda cls: FakeRemoteClass())
     args = _elastic_args(tmp_path)
 
-    assert create_data_source_actor(args, object) == "data-source"
+    assert controller_module.create_data_source_actor(args, object) == "data-source"
     assert captured["options"] == {"resources": {"stable_cpu": 1}}
     assert captured["config"] is args
 
