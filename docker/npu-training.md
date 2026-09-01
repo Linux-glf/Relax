@@ -126,6 +126,10 @@ bash scripts/training/text/run-qwen3-4B-8xgpu-async-npu.sh
 
   > MISC_ARGS，显示启用FlashAttention实现 `--use-flash-attn`
 
+### MTP 特性说明
+
+开启 MTP 训练时，`MTP_NUM_LAYERS`（MTP 头层数，脚本透传给训练参数 `--mtp-num-layers`）只能为 `1`：由于 Qwen3.5 原始 checkpoint 中仅包含 1 层 MTP 权重（`mtp_num_hidden_layers=1`），MTP 相关启动脚本（`scripts/training/text/run_qwen35_9B_mtp_8xnpu_thd.sh`、`scripts/training/sft/run_qwen35-35B-pokemon-sft-mtp-8xnpu.sh`）已加入校验，当该参数被设置为非 `1` 的值时脚本会报错退出
+
 ## 下一步
 
 - [ ] 性能优化：Qwen3.5-35B-A3B 等
