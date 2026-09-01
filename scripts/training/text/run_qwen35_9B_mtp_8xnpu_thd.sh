@@ -119,6 +119,11 @@ GRPO_ARGS=(
    --custom-tis-function-path relax.backends.megatron.loss.icepop_function
 )
 
+if [[ "${MTP_NUM_LAYERS:-1}" != "1" ]]; then
+    echo "ERROR: MTP_NUM_LAYERS must be 1 for Qwen3.5 (checkpoint has mtp_num_hidden_layers=1)." >&2
+    exit 1
+fi
+
 MTP_ARGS=(
    --mtp-num-layers ${MTP_NUM_LAYERS:-1}
    --enable-mtp-training

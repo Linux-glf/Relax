@@ -63,10 +63,15 @@ SFT_ARGS=(
    --sft-prefetch-buffer-size 512
 )
 
+if [[ "${MTP_NUM_LAYERS:-1}" != "1" ]]; then
+    echo "ERROR: MTP_NUM_LAYERS must be 1 for Qwen3.5 (checkpoint has mtp_num_hidden_layers=1)." >&2
+    exit 1
+fi
+
 MTP_ARGS=(
-   --mtp-num-layers 1
+   --mtp-num-layers ${MTP_NUM_LAYERS:-1}
    --enable-mtp-training
-   --mtp-loss-scaling-factor 0.2
+   --mtp-loss-scaling-factor ${MTP_LOSS_SCALING_FACTOR:-0.2}
    # --ci-test
 )
 
