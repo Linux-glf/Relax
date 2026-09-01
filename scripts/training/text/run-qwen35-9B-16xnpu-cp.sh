@@ -25,11 +25,6 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-npu.sh"
 fi
 
-# Forward WANDB_API_KEY into Ray workers' runtime_env (local.sh doesn't
-# propagate arbitrary env vars). No-op when the key isn't exported.
-if [ -n "${WANDB_API_KEY:-}" ]; then
-    export RUNTIME_ENV_JSON=$(echo "$RUNTIME_ENV_JSON" | jq --arg k "$WANDB_API_KEY" '.env_vars.WANDB_API_KEY = $k')
-fi
 source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
@@ -148,16 +143,6 @@ SGLANG_ARGS=(
    --sglang-enable-dp-lm-head
    --sglang-attention-backend ascend
 )
-
-# wandb: only enabled when WANDB_API_KEY is exported (see runtime_env injection above).
-# wandb project names cannot contain / \ # ? % : — translate slashes to dashes.
-if [ -n "${WANDB_API_KEY:-}" ]; then
-    WANDB_ARGS+=(
-       --use-wandb
-       --wandb-project ${PROJECT_NAME//\//-}
-       --wandb-group qwen35-9B-8x-${now}
-    )
-fi
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1
