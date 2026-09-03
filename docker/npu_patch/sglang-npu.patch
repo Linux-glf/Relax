@@ -36,21 +36,23 @@ index 7f506e7f1a..204b9382e8 100644
  
  
  class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
-@@ -109,6 +102,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -109,6 +102,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
          self._prepare_mamba_track_metadata(forward_batch)
          self.graph_mode = False
  
 +    def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
 +        w = getattr(layer, "_conv_weights_t", None)
-+        if w is None:
++        version = layer.conv_weights._version
++        if w is None or version != getattr(layer, "_conv_weights_t_version", None):
 +            w = layer.conv_weights.transpose(0, 1).contiguous()
 +            layer._conv_weights_t = w
++            layer._conv_weights_t_version = version
 +        return w
 +
      def forward_decode(
          self,
          layer: RadixLinearAttention,
-@@ -125,16 +125,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -125,16 +127,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
          cache_indices = self.forward_metadata.mamba_cache_indices
  
          assert isinstance(mixed_qkv, torch.Tensor)
@@ -473,13 +475,14 @@ index e83e4157fa..19ed3f244b 100644
  
          # Attach logprobs to logits_output (in-place modification)
          if any(x > 0 for x in top_logprobs_nums):
-@@ -363,6 +547,20 @@ class Sampler(nn.Module):
-                 logits_output.next_token_top_logprobs_val,
-                 logits_output.next_token_top_logprobs_idx,
-             ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+@@ -362,7 +546,17 @@ class Sampler(nn.Module):
+-            (
+-                logits_output.next_token_top_logprobs_val,
+-                logits_output.next_token_top_logprobs_idx,
+-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 +            # Same extraction as get_top_logprobs, but clamp the
 +            # [batch, max_k] topk result in a single kernel before
-+            # slicing per request.
++            # slicing per request. Runs topk exactly once.
 +            max_k = max(top_logprobs_nums)
 +            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
 +            if logprobs_are_probs:
@@ -494,7 +497,7 @@ index e83e4157fa..19ed3f244b 100644
  
          if any(x is not None for x in token_ids_logprobs):
              (
-@@ -372,10 +570,19 @@ class Sampler(nn.Module):
+@@ -372,10 +567,19 @@ class Sampler(nn.Module):
                  logprobs, token_ids_logprobs, no_copy_to_cpu=True
              )
  
@@ -502,7 +505,7 @@ index e83e4157fa..19ed3f244b 100644
 -            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
 -            batch_next_token_ids,
 -        ]
-+            for row in logits_output.token_ids_logprobs_val:
++            for row in logits_output.next_token_token_ids_logprobs_val:
 +                if torch.is_tensor(row):
 +                    if logprobs_are_probs:
 +                        row.log_()
@@ -720,6 +723,22 @@ index d5aac381dc..e710d83b05 100644
  
          if shared_output is not None:
              final_hidden_states.add_(shared_output)
+@@ -991,7 +990,14 @@ class Qwen2MoeForCausalLM(nn.Module):
+         self.pp_group = get_pp_group()
+         self.config = config
+         self.quant_config = quant_config
+-        alt_stream = torch.cuda.Stream() if _is_cuda else None
++        # Mirror qwen3_5.py: on NPU, SGLANG_NPU_USE_MULTI_STREAM also needs a
++        # real stream — _forward_deepep's dual-stream branch dereferences
++        # self.alt_stream unconditionally once enabled.
++        alt_stream = (
++            torch.cuda.Stream()
++            if _is_cuda or (is_npu() and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
++            else None
++        )
+         self.model = Qwen2MoeModel(
+             config,
+             quant_config,
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
 index fed78cf888..7b6505fa10 100644
 --- a/python/sglang/srt/models/qwen3_5.py
@@ -1056,3 +1075,165 @@ index 9ad577b42e..390a3721c5 100755
      def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
          """Helper to create a MambaRadixCache with allocator for testing."""
          server_args = ServerArgs(model_path="dummy", page_size=1)
+diff --git a/test/registered/unit/layers/test_sampler_attach_logprobs.py b/test/registered/unit/layers/test_sampler_attach_logprobs.py
+new file mode 100644
+index 0000000000..9dfc930392 100644
+--- /dev/null
++++ b/test/registered/unit/layers/test_sampler_attach_logprobs.py
+@@ -0,0 +1,156 @@
++"""Unit tests for Sampler._attach_logprobs_to_output.
++
++Regression coverage for two bugs in the decode logprob attach path:
++  - iterating ``logits_output.token_ids_logprobs_val`` (a nonexistent field on
++    LogitsProcessorOutput) instead of ``next_token_token_ids_logprobs_val``
++    raised AttributeError for any request with specific token-ID logprobs;
++  - the top-logprob branch ran a full-vocab topk twice (get_top_logprobs plus
++    an immediate re-topk that overwrote the first result).
++
++The method under test does not touch ``self``, so the Sampler is allocated
++with ``__new__`` to skip the distributed-group init in ``__init__``.
++"""
++
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
++
++maybe_stub_sgl_kernel()
++
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.layers.sampler import Sampler
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++_VOCAB = 1000
++
++
++def _make_sampler() -> Sampler:
++    # _attach_logprobs_to_output never reads instance state; bypass __init__
++    # (which requires an initialized torch distributed group).
++    return Sampler.__new__(Sampler)
++
++
++def _attach(
++    logprobs: torch.Tensor,
++    top_logprobs_nums,
++    token_ids_logprobs,
++    batch_next_token_ids: torch.Tensor,
++    logprobs_are_probs: bool = False,
++) -> LogitsProcessorOutput:
++    logits_output = LogitsProcessorOutput(next_token_logits=None)
++    _make_sampler()._attach_logprobs_to_output(
++        logits_output=logits_output,
++        logprobs=logprobs,
++        top_logprobs_nums=top_logprobs_nums,
++        token_ids_logprobs=token_ids_logprobs,
++        sampling_info=None,
++        batch_next_token_ids=batch_next_token_ids,
++        logprobs_are_probs=logprobs_are_probs,
++    )
++    return logits_output
++
++
++class TestAttachTokenIdsLogprobs(CustomTestCase):
++
++    def test_token_ids_logprobs_no_attribute_error(self):
++        """Specific token-ID logprob requests must not raise AttributeError."""
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[[5, 7], [42]],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        self.assertIsNotNone(out.next_token_token_ids_logprobs_val)
++        self.assertIsNotNone(out.next_token_token_ids_logprobs_idx)
++
++    def test_token_ids_logprobs_values(self):
++        logprobs = torch.log_softmax(torch.randn(3, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        requested = [[5, 7], None, [42]]
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0, 0],
++            token_ids_logprobs=requested,
++            batch_next_token_ids=torch.tensor([3, 4, 9], dtype=torch.int32),
++        )
++        vals = out.next_token_token_ids_logprobs_val
++        idxs = out.next_token_token_ids_logprobs_idx
++        self.assertEqual(len(vals), 3)
++        torch.testing.assert_close(
++            vals[0], reference[0, torch.tensor([5, 7])], rtol=0, atol=0
++        )
++        self.assertEqual(idxs[0], [5, 7])
++        # None request yields empty placeholders.
++        self.assertEqual(vals[1], [])
++        self.assertEqual(idxs[1], [])
++        torch.testing.assert_close(
++            vals[2], reference[2, torch.tensor([42])], rtol=0, atol=0
++        )
++        self.assertEqual(idxs[2], [42])
++
++    def test_token_ids_logprobs_probs_input(self):
++        """logprobs_are_probs=True applies log() before clamping, per row."""
++        probs = torch.softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = probs.clone()
++        out = _attach(
++            logprobs=probs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[[1, 2], [3]],
++            batch_next_token_ids=torch.tensor([0, 1], dtype=torch.int32),
++            logprobs_are_probs=True,
++        )
++        torch.testing.assert_close(
++            out.next_token_token_ids_logprobs_val[0],
++            reference[0, torch.tensor([1, 2])].log(),
++            rtol=1e-6,
++            atol=1e-6,
++        )
++
++
++class TestAttachTopLogprobs(CustomTestCase):
++
++    def test_top_logprobs_values(self):
++        """Per-request k slicing stays correct with the single-topk path."""
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[3, 1],
++            token_ids_logprobs=[None, None],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        ref_vals, ref_idx = reference.topk(3, dim=-1)
++        self.assertEqual(len(out.next_token_top_logprobs_val), 2)
++        torch.testing.assert_close(
++            out.next_token_top_logprobs_val[0], ref_vals[0], rtol=0, atol=0
++        )
++        self.assertTrue(torch.equal(out.next_token_top_logprobs_idx[0], ref_idx[0]))
++        torch.testing.assert_close(
++            out.next_token_top_logprobs_val[1], ref_vals[1][:1], rtol=0, atol=0
++        )
++        self.assertTrue(torch.equal(out.next_token_top_logprobs_idx[1], ref_idx[1][:1]))
++
++    def test_next_token_logprobs_gather(self):
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[None, None],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        torch.testing.assert_close(
++            out.next_token_logprobs,
++            torch.stack([reference[0, 3], reference[1, 4]]),
++            rtol=0,
++            atol=0,
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
