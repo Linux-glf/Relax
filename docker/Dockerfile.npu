@@ -96,6 +96,9 @@ RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
     git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /root/Megatron-Bridge
 
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    source /usr/local/Ascend/nnal/atb/set_env.sh && \
+    source /usr/local/Ascend/cann-9.0.0/share/info/ascendnpu-ir/bin/set_env.sh && \
     cd /root/MindSpeed && git checkout core_r0.16.0 && pip install -r requirements.txt && pip install -e . && git checkout e4772499 && \
     cd /root/Megatron-LM && git checkout core_v0.16.1 && pip install -e . --no-build-isolation && \
     cd /root/Megatron-Bridge && git checkout v0.3.1 && \
