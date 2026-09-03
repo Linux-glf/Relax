@@ -77,9 +77,8 @@ RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org
     git cherry-pick -n f495de675bce38a2fa21edbf067b73d2a5f26733 && \
     bash ci/build.sh --python=3.11 && \
     pip install dist/torch_npu*.whl
-RUN pip_install() { pip install "$@" || pip install --index-url https://triton-ascend.osinfra.cn/pypi/simple "$@"; }; \
-    cd /root && rm -rf /root/pytorch && \
-    pip_install triton-ascend==3.2.1
+RUN pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple && \
+    cd /root && rm -rf /root/pytorch
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
     pip_install tensordict==0.10.0 pyvers==0.1.0 --no-deps
 RUN git clone https://github.com/redai-infra/TransferQueue.git /root/TransferQueue && \
