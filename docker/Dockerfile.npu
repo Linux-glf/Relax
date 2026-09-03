@@ -81,7 +81,7 @@ RUN pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osi
     cd /root && rm -rf /root/pytorch
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
     pip_install tensordict==0.10.0 pyvers==0.1.0 --no-deps
-RUN git clone https://github.com/redai-infra/TransferQueue.git /root/TransferQueue && \
+RUN git clone https://github.com/redai-studio/TransferQueue.git /root/TransferQueue && \
     cd /root/TransferQueue && \
     git checkout 58054a33834aadbcf76aacd6b1e32e25c030f2c9 && \
     pip install /root/TransferQueue --no-deps --no-build-isolation && \
