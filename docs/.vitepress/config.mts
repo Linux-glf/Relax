@@ -1,3 +1,4 @@
+import taskLists from 'markdown-it-task-lists'
 import { defineConfig } from 'vitepress'
 
 // https://vitepress.dev/reference/site-config
@@ -209,9 +210,12 @@ export default defineConfig({
   // Ignore dead links for source code references and placeholder pages
   ignoreDeadLinks: true,
 
-  // Enable LaTeX math rendering
+  // Enable LaTeX math rendering and GitHub-style task lists
   markdown: {
-    math: true
+    math: true,
+    config(md) {
+      md.use(taskLists)
+    }
   },
   
   // 多语言配置
