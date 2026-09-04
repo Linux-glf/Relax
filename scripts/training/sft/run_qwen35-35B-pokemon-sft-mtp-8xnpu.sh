@@ -17,7 +17,6 @@ export ASCEND_COREDUMP_SIGNAL=none
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export HCCL_HOST_SOCKET_PORT_RANGE=63000-63150
 export HCCL_NPU_SOCKET_PORT_RANGE=64000-64150
-export MASTER_ADDR=$(hostname -I | awk '{print $1}')
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
@@ -36,11 +35,11 @@ TRAIN_FILES=(
     "'${DATA_DIR}/sft/data/pokemon-gpt4o-captions/pokemon_gpt4o_zh.parquet'"
 )
 PROMPT_DATA="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
-SAVE_DIR="${SAVE_DIR:=${EXP_DIR}/checkpoint/checkpoints/qwen3.5-35B-A3B-mtp-pokemon-sft-0821}"
+SAVE_DIR="${SAVE_DIR:=${MODEL_DIR}/checkpoint/checkpoints/qwen3.5-35B-A3B-mtp-pokemon-sft-0821}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${EXP_DIR}/Qwen3.5-35B-A3B
-   --ref-load ${EXP_DIR}/Qwen3.5-35B-A3B
+   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-35B-A3B
+   --ref-load ${MODEL_DIR}/Qwen3.5-35B-A3B
    --megatron-to-hf-mode bridge
    --save ${SAVE_DIR}/sft/${EXP_NAME}
    # --load ${SAVE_DIR}/sft/${EXP_NAME}
