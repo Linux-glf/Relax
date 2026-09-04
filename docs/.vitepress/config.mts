@@ -229,7 +229,7 @@ export default defineConfig({
           {
             text: 'Resources',
             items: [
-              { text: 'GitHub', link: 'https://github.com/redai-infra/Relax' },
+              { text: 'GitHub', link: 'https://github.com/redai-studio/Relax' },
               { text: 'Paper', link: 'https://arxiv.org/abs/2604.11554' }
             ]
           }
@@ -341,7 +341,7 @@ export default defineConfig({
           {
             text: '资源',
             items: [
-              { text: 'GitHub', link: 'https://github.com/redai-infra/Relax' },
+              { text: 'GitHub', link: 'https://github.com/redai-studio/Relax' },
               { text: '论文', link: 'https://arxiv.org/abs/2604.11554' }
             ]
           }
@@ -466,7 +466,7 @@ export default defineConfig({
   themeConfig: {
     logo: '/rednote-logo.png',
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/redai-infra/Relax' }
+      { icon: 'github', link: 'https://github.com/redai-studio/Relax' }
     ],
     search: {
       provider: 'local'
