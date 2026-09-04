@@ -1,41 +1,47 @@
-From e3132e83db335df1e8dee20a03cb4f5e0474f5fd Mon Sep 17 00:00:00 2001
+From 28aef8685f471c589d2d85ec954e6c2a786a30c7 Mon Sep 17 00:00:00 2001
 From: liyongwen <1310439159@qq.com>
 Date: Sat, 29 Aug 2026 03:49:49 +0000
 Subject: [PATCH] sglang optimize for qwen3.5 9B&35B
 
 ---
  python/sglang/srt/entrypoints/http_server.py  |   2 +-
- python/sglang/srt/environ.py                  |  41 ++
- .../npu/attention/ascend_gdn_backend.py       | 183 +++++--
- .../ascend_hybrid_linear_attn_backend.py      |  57 ++-
- .../attention/full_attention_fusion_npu.py    | 459 ++++++++++++++++++
+ python/sglang/srt/environ.py                  |  42 ++
+ .../npu/attention/ascend_gdn_backend.py       | 190 +++++--
+ .../ascend_hybrid_linear_attn_backend.py      |  61 +-
+ .../attention/full_attention_fusion_npu.py    | 468 ++++++++++++++++
  .../npu/graph_runner/npu_cudagraph_backend.py |  18 +-
- .../srt/hardware_backend/npu/moe/topk.py      |  51 +-
- .../npu/moe_weight_prefetch.py                | 355 ++++++++++++++
- .../npu/tp_ascendc_fusion_npu.py              | 340 +++++++++++++
+ .../srt/hardware_backend/npu/moe/topk.py      |  53 +-
+ .../npu/moe_weight_prefetch.py                | 363 ++++++++++++
+ .../npu/tp_ascendc_fusion_npu.py              | 347 ++++++++++++
  .../sglang/srt/layers/attention/fla/cumsum.py |   7 +-
- .../attention/linear/kernels/gdn_triton.py    |  23 +-
- .../srt/layers/exp_race_fused_triton.py       | 239 +++++++++
+ .../attention/linear/kernels/gdn_triton.py    |  26 +-
+ .../srt/layers/exp_race_fused_triton.py       | 239 ++++++++
  python/sglang/srt/layers/layernorm.py         |  21 +-
  .../srt/layers/moe/token_dispatcher/deepep.py |   6 +
  .../sglang/srt/layers/quantization/unquant.py | 100 +++-
- python/sglang/srt/layers/sampler.py           | 350 ++++++++++++-
- python/sglang/srt/managers/tp_worker.py       |  30 ++
+ .../srt/layers/radix_linear_attention.py      |  21 +
+ python/sglang/srt/layers/sampler.py           | 354 +++++++++++-
+ python/sglang/srt/managers/scheduler.py       |   2 +-
+ python/sglang/srt/managers/tp_worker.py       |  30 +
  .../sglang/srt/mem_cache/mamba_radix_cache.py |   9 +
  .../srt/model_executor/forward_batch_info.py  |  25 +-
  .../sglang/srt/model_executor/model_runner.py |  26 +
- python/sglang/srt/models/qwen2_moe.py         |  39 +-
- python/sglang/srt/models/qwen3_5.py           | 451 +++++++++++++++--
+ python/sglang/srt/models/qwen2_moe.py         |  48 +-
+ python/sglang/srt/models/qwen3_5.py           | 521 +++++++++++++++---
  .../srt/sampling/sampling_batch_info.py       |  10 +
  python/sglang/srt/speculative/eagle_utils.py  |  98 ++--
  .../srt/speculative/triton_ops/cache_locs.py  |   9 +
  python/sglang/srt/utils/common.py             |   4 +-
  .../srt/utils/torch_memory_saver_adapter.py   |   9 +-
- 27 files changed, 2745 insertions(+), 217 deletions(-)
+ .../layers/test_conv_weight_cache_refresh.py  | 109 ++++
+ .../layers/test_sampler_attach_logprobs.py    | 156 ++++++
+ 31 files changed, 3134 insertions(+), 240 deletions(-)
  create mode 100644 python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
  create mode 100644 python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
  create mode 100644 python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py
  create mode 100644 python/sglang/srt/layers/exp_race_fused_triton.py
+ create mode 100644 test/registered/unit/layers/test_conv_weight_cache_refresh.py
+ create mode 100644 test/registered/unit/layers/test_sampler_attach_logprobs.py
 
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
 index bd9d7eafa1..1740283de2 100644
@@ -51,10 +57,10 @@ index bd9d7eafa1..1740283de2 100644
      # collide and crash the shared DetokenizerManager decode_status).
      rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 790acce902..8cceb5602e 100644
+index 790acce902..b97ee18eeb 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -526,7 +526,48 @@ class Envs:
+@@ -526,7 +526,49 @@ class Envs:
      # NPU
      SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
      SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
@@ -68,27 +74,28 @@ index 790acce902..8cceb5602e 100644
 +    SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB = EnvInt(16)
 +    # Per-tensor capacity cap in MiB; 0 = auto (0.8 * queried L2 size)
 +    SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB = EnvInt(0)
-+    # full_attention decode 融合（A1b split+KV scatter / A2 sigmoid_mul /
-+    # A3a add_gemma_rms_norm，hardware_backend/npu/attention/
-+    # full_attention_fusion_npu.py）总开关，默认开；DEBUG=1 按层打印守卫未命中原因
++    # full_attention decode fusion master switch (A1b split+KV scatter /
++    # A2 sigmoid_mul / A3a add_gemma_rms_norm, hardware_backend/npu/attention/
++    # full_attention_fusion_npu.py); DEBUG=1 logs per-layer guard misses
 +    SGLANG_NPU_FULL_ATTN_FUSION = EnvBool(True)
 +    SGLANG_NPU_FULL_ATTN_FUSION_DEBUG = EnvBool(False)
-+    # TP 线 AscendC 融合总开关（默认关，仅 op1 fused_qkvzba_conv1d 跟随）；
-+    # QKVZBA 为 op1 分开关（未设置随总开关，显式 0 单关）；
-+    # GDN_RECURRENT_ASCENDC 为 op2 recurrent 开关（默认关，import 期判定，
-+    # 须在建图/服务启动前设置）；DEBUG=1 打印守卫未命中原因
++    # TP-line AscendC fusion master switch (only op1 fused_qkvzba_conv1d
++    # follows it); QKVZBA is op1's own switch (unset = follow master, explicit
++    # 0 disables op1 alone); GDN_RECURRENT_ASCENDC is op2 recurrent's switch
++    # (off by default, resolved at import time — set before graph capture /
++    # server start); DEBUG=1 logs guard misses
 +    SGLANG_NPU_TP_ASCENDC_FUSION = EnvBool(False)
 +    SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA = EnvBool(False)
 +    SGLANG_NPU_GDN_RECURRENT_ASCENDC = EnvBool(False)
 +    SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG = EnvBool(False)
-+    # GDN decode recurrent PR#740 优化 Triton 版开关（默认关）
++    # GDN decode recurrent PR#740 Triton variant switch
 +    SGLANG_NPU_GDN_UPDATE_FUSED = EnvBool(False)
-+    # GDN 输入投影 qkvz+ba 权重打包单 GEMM（默认开）；MAX_M 为小 M 门控，
-+    # M 超过阈值回退两次 GEMM
++    # GDN input-projection qkvz+ba weight pack into a single GEMM; MAX_M gates
++    # small M — M above the threshold falls back to two GEMMs
 +    SGLANG_NPU_GDN_QKVZBA_PACK = EnvBool(True)
 +    SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M = EnvInt(256)
-+    # post_sample：异步 exponential-race 采样（910C 限定，默认关）；
-+    # EXP_RACE_TRITON 为其融合 Triton 消费 kernel 开关（默认开）
++    # post_sample: async exponential-race sampling (910C only);
++    # EXP_RACE_TRITON enables its fused Triton consumer kernel
 +    SGLANG_NPU_ASYNC_EXPONENTIAL = EnvBool(False)
 +    SGLANG_NPU_EXP_RACE_TRITON = EnvBool(True)
      SGLANG_NPU_USE_MLAPO = EnvBool(False)
@@ -104,7 +111,7 @@ index 790acce902..8cceb5602e 100644
      SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
      # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
 diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
-index 7f506e7f1a..f6654c8620 100644
+index 7f506e7f1a..dad52ee943 100644
 --- a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
 +++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
 @@ -5,12 +5,16 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
@@ -137,21 +144,24 @@ index 7f506e7f1a..f6654c8620 100644
  
  
  class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
-@@ -100,6 +102,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -100,6 +102,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
      def init_forward_metadata(self, forward_batch: ForwardBatch):
          if forward_batch.forward_mode.is_draft_extend_v2():
              return
-+        # eager（非图）前向的 metadata 由基类现建 int32，recurrent 无 cast 问题——
-+        # 清掉图流程遗留的 int32 影子，避免误用旧 buffer。
++        # In eager (non-graph) forward the base class builds int32 metadata, so
++        # no cast is needed for recurrent — drop any graph-flow int32 shadow to
++        # avoid reusing a stale buffer.
 +        self._decode_recurrent_shadow_i32 = None
          super().init_forward_metadata(forward_batch)
          self.prepare_gdn_inputs(
              forward_batch.batch_size,
-@@ -109,6 +114,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -109,6 +115,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
          self._prepare_mamba_track_metadata(forward_batch)
          self.graph_mode = False
  
 +    def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
++        # The cached copy is refreshed in place by wrap_conv1d_weight_loader
++        # on every (re)load of conv1d.weight; it stays valid until then.
 +        w = getattr(layer, "_conv_weights_t", None)
 +        if w is None:
 +            w = layer.conv_weights.transpose(0, 1).contiguous()
@@ -161,13 +171,14 @@ index 7f506e7f1a..f6654c8620 100644
      def forward_decode(
          self,
          layer: RadixLinearAttention,
-@@ -123,18 +135,90 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -123,18 +138,94 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
          ssm_states = layer_cache.temporal
          query_start_loc = self.forward_metadata.query_start_loc
          cache_indices = self.forward_metadata.mamba_cache_indices
-+        # recurrent 侧改用 int32 影子 buffer（decode 图流程由 _capture/_replay_metadata
-+        # 图外同步，内容与 int64 主 buffer 一致）；影子为 None（eager/verify）时沿用
-+        # 原 metadata。conv 侧仍用 int64 主 buffer。
++        # Recurrent side uses int32 shadow buffers (synced outside the decode
++        # graph by _capture/_replay_metadata, identical in content to the int64
++        # primary buffers); when the shadow is None (eager/verify) the original
++        # metadata is used. The conv side keeps the int64 primary buffers.
 +        recurrent_query_start_loc = query_start_loc
 +        recurrent_cache_indices = cache_indices
 +        if self._decode_recurrent_shadow_i32 is not None:
@@ -186,12 +197,15 @@ index 7f506e7f1a..f6654c8620 100644
 -            conv_state_indices=cache_indices,
 -        )
 -        conv_states[:] = conv_states_tmp.transpose(1, 2)
-+        # qwen3_5.py 侧守卫命中后以 tuple 传入原始投影
-+        # (projected_states_qkvz, projected_states_ba)（未经 split）——split +
-+        # causal_conv1d(run_mode=1) 由 torch.ops.npu.fused_qkvzba_conv1d 单 kernel
-+        # 完成（conv_states 原地更新语义不变），z 随 (core_attn_out, z) 回流给模型侧。
-+        # 运行期判定不通过（算子未注册/张量属性不符）→ 本地跑原 split kernel 再走
-+        # stock conv，同样以 tuple 返回，调用侧无感（静默回退，capture 时分支烘进图）。
++        # When the qwen3_5.py guard hits, the raw projections arrive as a tuple
++        # (projected_states_qkvz, projected_states_ba) before split — split +
++        # causal_conv1d(run_mode=1) are done by the single kernel
++        # torch.ops.npu.fused_qkvzba_conv1d (conv_states in-place semantics
++        # unchanged), and z flows back to the model side as (core_attn_out, z).
++        # If the runtime check fails (op unregistered / tensor attrs mismatch),
++        # fall back to the local split kernel + stock conv, still returning a
++        # tuple so the caller is unaffected (silent fallback; the branch is
++        # baked into the graph at capture time).
 +        fused_z = None
 +        if isinstance(mixed_qkv, tuple):
 +            qkvz, mixed_ba = mixed_qkv
@@ -223,10 +237,10 @@ index 7f506e7f1a..f6654c8620 100644
 +            else:
 +                tp_debug_log(
 +                    ("qkvzba_rt", layer.layer_id),
-+                    f"layer {layer.layer_id}: fused_qkvzba_conv1d 运行期判定未命中"
-+                    f"（enabled={tp_fusion_qkvzba_enabled()} "
-+                    f"op={tp_op_available('fused_qkvzba_conv1d')}），"
-+                    "本地 split+stock conv 回退",
++                    f"layer {layer.layer_id}: fused_qkvzba_conv1d runtime check "
++                    f"missed (enabled={tp_fusion_qkvzba_enabled()} "
++                    f"op={tp_op_available('fused_qkvzba_conv1d')}), "
++                    "falling back to local split + stock conv",
 +                )
 +                mixed_qkv, fused_z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
 +                    qkvz,
@@ -263,7 +277,7 @@ index 7f506e7f1a..f6654c8620 100644
  
          query, key, value = torch.split(
              mixed_qkv,
-@@ -155,13 +239,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -155,13 +246,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
              A_log=layer.A_log,
              dt_bias=layer.dt_bias,
              ssm_states=ssm_states,
@@ -276,14 +290,14 @@ index 7f506e7f1a..f6654c8620 100644
          self._track_mamba_state_decode(
              forward_batch, conv_states, ssm_states, cache_indices
          )
-+        # tuple 输入路径以 (core_attn_out, z) 回流（与 qwen3_5.py 侧解包约定自洽）；
-+        # tensor 路径返回值与 stock 完全一致。
++        # Tuple-input path returns (core_attn_out, z) to match the qwen3_5.py
++        # unpacking convention; the tensor path return matches stock exactly.
 +        if fused_z is not None:
 +            return core_attn_out, fused_z
          return core_attn_out
  
      def forward_extend(
-@@ -219,44 +307,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -219,44 +314,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                  dtype=torch.int32,
                  device=mixed_qkv.device,
              )
@@ -356,16 +370,17 @@ index 7f506e7f1a..f6654c8620 100644
              g, beta = fused_gdn_gating_kernel_without_sigmoid(
                  layer.A_log, a, b, layer.dt_bias
 diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
-index 2a628c286d..33c8d382e0 100644
+index 2a628c286d..cc3a655ad9 100644
 --- a/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
 +++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
-@@ -27,16 +27,27 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+@@ -27,16 +27,30 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
      def __init__(self, model_runner: ModelRunner):
          super().__init__(model_runner)
          self.state_indices_list_gdn = []
-+        # decode 的 int32 影子 buffer：AscendC recurrent host 按 int32_t* 读
-+        # cache_indices/cu_seqlens，decode 图流程每 step 图外同步一次（图内零 cast）；
-+        # eager/verify 路径恒 None。
++        # decode int32 shadow buffers: the AscendC recurrent host reads
++        # cache_indices/cu_seqlens as int32_t*; synced once per step outside
++        # the decode graph (zero cast inside the graph); always None on the
++        # eager/verify paths.
 +        self.decode_state_indices_i32_list = []
 +        self.decode_query_start_loc_i32_list = []
 +        self.cached_cuda_graph_decode_query_start_loc_i32 = None
@@ -376,10 +391,12 @@ index 2a628c286d..33c8d382e0 100644
              max_num_tokens % max_bs == 0
          ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
          draft_token_num = max_num_tokens // max_bs
-+        # state_indices / query_start_loc 主 buffer 用 int64：conv 类 AscendC 算子
-+        # （causal_conv1d / fused_qkvzba_conv1d）host 按 int64_t* 读，直喂可省图内 cast。
-+        # 例外：state_indices_list_gdn 保持 int32（recurrent_gated_delta_rule 按
-+        # int32_t* 读且无校验，改了会静默算错）。
++        # state_indices / query_start_loc primary buffers use int64: the conv
++        # AscendC ops (causal_conv1d / fused_qkvzba_conv1d) read them as
++        # int64_t* on host, so feeding directly avoids an in-graph cast.
++        # Exception: state_indices_list_gdn stays int32 (recurrent_gated_delta_rule
++        # reads it as int32_t* without validation — changing it silently
++        # corrupts results).
          for i in range(max_bs):
              self.state_indices_list.append(
                  torch.full(
@@ -388,7 +405,7 @@ index 2a628c286d..33c8d382e0 100644
                  )
              )
              self.state_indices_list_gdn.append(
-@@ -48,7 +59,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+@@ -48,7 +62,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                  )
              )
              self.query_start_loc_list.append(
@@ -397,12 +414,12 @@ index 2a628c286d..33c8d382e0 100644
              )
              self.retrieve_next_token_list.append(
                  torch.zeros(
-@@ -65,17 +76,53 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+@@ -65,17 +79,54 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                      (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                  )
              )
-+            # decode 影子 buffer（recurrent 侧），每 step 由
-+            # _capture/_replay_metadata 图外同步；不在 verify 使用。
++            # decode shadow buffers (recurrent side), synced outside the graph
++            # by _capture/_replay_metadata each step; not used in verify.
 +            self.decode_state_indices_i32_list.append(
 +                torch.full(
 +                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
@@ -414,8 +431,8 @@ index 2a628c286d..33c8d382e0 100644
          self.cached_cuda_graph_decode_query_start_loc = torch.arange(
 +            0, max_bs + 1, dtype=torch.int64, device=self.device
 +        )
-+        # decode query_start_loc 是静态 arange——int32 版 init 期预建，影子同步
-+        # 只做同 dtype copy。
++        # decode query_start_loc is a static arange — the int32 copy is built
++        # once at init, so shadow sync is just a same-dtype copy.
 +        self.cached_cuda_graph_decode_query_start_loc_i32 = torch.arange(
              0, max_bs + 1, dtype=torch.int32, device=self.device
          )
@@ -431,11 +448,12 @@ index 2a628c286d..33c8d382e0 100644
 +    def _update_decode_recurrent_shadow_i32(
 +        self, bs: int, mamba_indices: torch.Tensor, num_padding: int = 0
 +    ):
-+        """同步 decode 的 int32 影子 buffer（图外 eager，每 step 一次）。
++        """Sync the decode int32 shadow buffers (outside the graph, once per step).
 +
-+        内容与 int64 主 buffer 完全一致，供 AscendC recurrent（host 按 int32_t*
-+        读 cache_indices/cu_seqlens）直读。仅 decode/idle 调用；verify/eager
-+        路径由调用方把 _decode_recurrent_shadow_i32 置 None。
++        Content is identical to the int64 primary buffers, for direct reads by
++        the AscendC recurrent (host reads cache_indices/cu_seqlens as int32_t*).
++        Called only for decode/idle; on the verify/eager paths the caller sets
++        _decode_recurrent_shadow_i32 to None.
 +        """
 +        idx_i32 = self.decode_state_indices_i32_list[bs - 1]
 +        qsl_i32 = self.decode_query_start_loc_i32_list[bs - 1]
@@ -452,7 +470,7 @@ index 2a628c286d..33c8d382e0 100644
      def _capture_metadata(
          self,
          bs: int,
-@@ -89,7 +136,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+@@ -89,7 +140,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
              self.query_start_loc_list[bs - 1].copy_(
                  self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
              )
@@ -462,7 +480,7 @@ index 2a628c286d..33c8d382e0 100644
              self.query_start_loc_list[bs - 1].copy_(
                  self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
              )
-@@ -163,7 +212,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+@@ -163,7 +216,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                  self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                      bs - num_padding
                  )
@@ -474,19 +492,21 @@ index 2a628c286d..33c8d382e0 100644
                  dtype=torch.int32,
 diff --git a/python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py b/python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
 new file mode 100644
-index 0000000000..4196e0fa5a
+index 0000000000..4751217a5e
 --- /dev/null
 +++ b/python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
-@@ -0,0 +1,459 @@
+@@ -0,0 +1,468 @@
 +# Qwen3.5-35B-A3B NPU decode 全注意力段融合 kernel（full_attention 优化点 A1b/A2/A3a）。
 +#
 +#   A1b split_qkvgate_v4_scatter：split q/gate/k/v + q/k gemma rmsnorm + rope
-+#       单 kernel，且 k/v 按 loc 直接 scatter 进 KV cache；返回的 k/v 为 None
-+#       （cache 已写，调用方须跳过 set_kv_buffer）。
++#       single kernel, and k/v are scattered by loc directly into the KV
++#       cache; returned k/v are None (cache already written — the caller must
++#       skip set_kv_buffer).
 +#   A2  fa_sigmoid_mul：sigmoid(gate)*attn 融合单 kernel（替代 sigmoid+mul_ 两
-+#       kernel）；先舍 bf16 再乘，与 stock 双 op 舍入路径逐位一致。
-+#   A3a fa_add_gemma_rms_norm_v2：grid=(batch,) 行并行；数学与 stock
-+#       add_gemma_rms_norm 完全一致。
++#       kernel）；round to bf16 before the multiply, bitwise-identical to
++#       stock's two-op rounding path.
++#   A3a fa_add_gemma_rms_norm_v2：grid=(batch,) row-parallel; math identical
++#       to stock add_gemma_rms_norm.
 +#
 +# 数值约定与 sgl_kernel_npu stock 逐字一致：fp32 中间精度、gemma (w+1)、
 +# neox rotate_half rope（cat=[-x2,x1]; out=cat*sin+rot*cos）。
@@ -496,10 +516,11 @@ index 0000000000..4196e0fa5a
 +# 判定在 capture 时烘进图，需在建图前设置）。
 +#
 +# 定位日志：SGLANG_NPU_FULL_ATTN_FUSION_DEBUG=1 时，A1b 守卫按层一次性打印
-+# 「未命中原因」或「已激活」确认。
++# "guard miss reason" or "activated" confirmation.
 +#
-+# ⚠️ triton-ascend 约束：不要按 program_id 做运行时段选择、不要用标量条件
-+# mask store、不要 2D masked store（会误编译）。本文件全部 kernel 只用：
++# ⚠️ triton-ascend constraints: no runtime dispatch on program_id, no
++# scalar-conditional mask store, no 2D masked store (miscompiles). All kernels
++# in this file use only:
 +# 纯线性索引 + 每 program 固定职责 + 1D 无掩码 store + constexpr if。
 +
 +import logging
@@ -560,8 +581,8 @@ index 0000000000..4196e0fa5a
 +
 +
 +def fa_add_gemma_rms_norm_v2_supported(x, residual) -> bool:
-+    """A3a 形状守卫：2D、bf16、连续、hidden 为 2 的幂
-+    （hidden 非 2 的幂时 tl.arange 不合法）。"""
++    """A3a shape guard: 2D, bf16, contiguous, hidden a power of 2
++    (tl.arange is invalid for non-power-of-2 hidden)."""
 +    if not fa_fusion_enabled():
 +        return False
 +    if residual is None or x.dim() != 2:
@@ -606,7 +627,7 @@ index 0000000000..4196e0fa5a
 +    s = tl.sigmoid(g)
 +    if BITWISE:
 +        # 模拟 stock 两个 op 之间的 bf16 中间舍入：sigmoid 先舍到 bf16 再乘，
-+        # 与 attn.mul_(torch.sigmoid(gate)) 目标逐位一致。
++        # bitwise-identical to the attn.mul_(torch.sigmoid(gate)) target.
 +        s = s.to(tl.bfloat16).to(tl.float32)
 +    out = (a * s).to(tl.bfloat16)
 +    tl.store(out_ptr + offs, out, mask=mask)
@@ -636,14 +657,16 @@ index 0000000000..4196e0fa5a
 +
 +
 +# ---------------------------------------------------------------------------
-+# A1b（行并行直线版）：split q/kv/gate + q/k gemma rmsnorm + rope，
++# A1b (row-parallel straight-line version): split q/kv/gate + q/k gemma
++# rmsnorm + rope,
 +# 且 k/v 按 loc 直接 scatter 进 KV cache（免中间张量与两次 scatter_nd_update）。
 +# grid=(batch,)：一 program 一行，q+gate / k / v 三段在一条直线里顺序做完。
-+# 设计约束（triton-ascend）：pid 只做线性索引（不取整除/取模）、段间无运行时
++# Design constraints (triton-ascend): pid is used only for linear indexing
++# (no div/mod), no inter-segment runtime
 +# 选择、store 不带标量条件 mask；SCATTER_KV 为 constexpr 分支，本文件生产
 +# wrapper 恒 =1，k/v 中间张量写出整段编译期消除。
-+# TP4/TP8/TP16 shape 特化：NUM_Q_HEADS∈{1,2,4}（TP16=1、TP8=2、9B-TP4=4，按
-+# runtime shape 传入）, NUM_KV_HEADS=1。
++# TP4/TP8/TP16 shape specialization: NUM_Q_HEADS ∈ {1,2,4} (TP16=1, TP8=2,
++# 9B-TP4=4, passed per runtime shape), NUM_KV_HEADS=1.
 +# ---------------------------------------------------------------------------
 +@triton.jit
 +def split_qkvgate_v4_kernel(
@@ -691,7 +714,8 @@ index 0000000000..4196e0fa5a
 +    qvar = tl.sum(q * q, axis=1) / HEAD_DIM
 +    qn = q * tl.rsqrt(qvar + eps)[:, None] * qw[None, :]
 +
-+    # rope（neox rotate_half，仅前 ROPE_DIM 维；运算顺序与 stock 逐字一致）
++    # rope (neox rotate_half, first ROPE_DIM dims only; op order matches stock
++    # exactly)
 +    sc = row * ROPE_DIM + tl.arange(0, ROPE_DIM)
 +    sin = tl.load(sin_ptr + sc).to(tl.float32).reshape(1, ROPE_DIM)
 +    cos = tl.load(cos_ptr + sc).to(tl.float32).reshape(1, ROPE_DIM)
@@ -716,8 +740,8 @@ index 0000000000..4196e0fa5a
 +        qn, roped, offsets=(0, 0), sizes=(NUM_Q_HEADS, ROPE_DIM), strides=(1, 1)
 +    )
 +
-+    # q/gate 写出：1D 无掩码 store（stock reshape(Q_BLOCK) 同款；避开 2D
-+    # masked store，见文件头 triton-ascend 约束）
++    # q/gate store: 1D unmasked store (same as stock reshape(Q_BLOCK); avoids
++    # 2D masked store — see the triton-ascend constraints at the top)
 +    qg_out = row * q_hidden_size + tl.arange(0, NUM_Q_HEADS * HEAD_DIM)
 +    tl.store(
 +        q_ptr + qg_out,
@@ -753,8 +777,9 @@ index 0000000000..4196e0fa5a
 +    # ---- v：bf16 原样拷贝（stock v 段不过 fp32）
 +    vt = tl.load(base + 2 * q_hidden_size + kv_hidden_size + d)
 +
-+    # constexpr 分支：SCATTER_KV=1 时 k/v 中间张量写出整段编译期消除，
-+    # k_ptr/v_ptr 占位指针不会被解引用
++    # constexpr branch: with SCATTER_KV=1 the k/v intermediate-tensor stores
++    # are eliminated at compile time, and the k_ptr/v_ptr placeholder pointers
++    # are never dereferenced
 +    if SCATTER_KV:
 +        slot = tl.load(loc_ptr + row).to(tl.int64)
 +        tl.store(
@@ -773,11 +798,11 @@ index 0000000000..4196e0fa5a
 +def fa_split_qkvgate_scatter_supported(
 +    num_heads, num_kv_heads, head_dim, rope_dim, attn_output_gate
 +) -> bool:
-+    """A1b 形状守卫（TP 布局特化）：每 rank q∈{1,2,4} 头
-+    （TP16=1/TP8=2/9B-TP4=4）、kv=1 头、head_dim=256、rope=64、带 attn_output_gate。
-+    其余 TP/模型配置回退 stock。
-+    注：q=4（9B TP4 形态）放行后须先在服务器跑 bench_fa_graph.py --num-q 4
-+    图内 UT 验证后才可投产。"""
++    """A1b shape guard (TP layout specialization): per-rank q ∈ {1,2,4} heads
++    (TP16=1/TP8=2/9B-TP4=4), kv=1 head, head_dim=256, rope=64, with
++    attn_output_gate. All other TP/model configs fall back to stock.
++    Note: after enabling q=4 (9B TP4 form), run the in-graph UT
++    bench_fa_graph.py --num-q 4 on the server before production use."""
 +    ok = (
 +        fa_fusion_enabled()
 +        and num_heads in (1, 2, 4)
@@ -790,7 +815,7 @@ index 0000000000..4196e0fa5a
 +        _fa_debug_log(
 +            ("shape_guard",),
 +            "A1b 形状守卫未命中（回退 stock）："
-+            f"num_heads={num_heads}(需1/2/4) num_kv_heads={num_kv_heads}(需1) "
++            f"num_heads={num_heads}(need 1/2/4) num_kv_heads={num_kv_heads}(need 1) "
 +            f"head_dim={head_dim}(需256) rope_dim={rope_dim}(需64) "
 +            f"gate={attn_output_gate}(需True) "
 +            f"{_FA_FUSION_ENV}={os.environ.get(_FA_FUSION_ENV, '1')!r}",
@@ -903,12 +928,14 @@ index 0000000000..4196e0fa5a
 +    k/v 不写中间张量、按 loc 直接 scatter 进 KV cache。
 +    返回 (q, None, None, gate)：k/v 为 None 表示 cache 已写，
 +    调用方须以 save_kv_cache=False 走 attention backend。
-+    仅支持 q∈{1,2,4} 头、kv=1 头（TP16=1、TP8=2、9B-TP4=4 头特化），调用前须过
++    Only q ∈ {1,2,4} heads and kv=1 head are supported (TP16=1, TP8=2,
++    9B-TP4=4 head specialization); the fa_v4_scatter_context guard must pass
++    before calling.
 +    fa_v4_scatter_context 守卫。"""
 +    batch = input.shape[0]
 +    num_q = q_hidden_size // head_dim
 +    num_kv = kv_hidden_size // head_dim
-+    assert num_q in (1, 2, 4) and num_kv == 1, "TP4/TP8/TP16 shape 特化（q∈{1,2,4} 头, kv=1 头）"
++    assert num_q in (1, 2, 4) and num_kv == 1, "TP4/TP8/TP16 shape specialization (q ∈ {1,2,4} heads, kv=1 head)"
 +    assert kbuf.dtype == input.dtype and vbuf.dtype == input.dtype
 +    q_out = torch.empty(batch, q_hidden_size, device=input.device, dtype=input.dtype)
 +    gate_out = torch.empty(batch, q_hidden_size, device=input.device, dtype=input.dtype)
@@ -974,7 +1001,7 @@ index 919f46619a..c8a185388a 100644
          self._graphs[shape_key] = graph
          self._outputs[shape_key] = out
 diff --git a/python/sglang/srt/hardware_backend/npu/moe/topk.py b/python/sglang/srt/hardware_backend/npu/moe/topk.py
-index 5a51ef4e96..b19fbbe363 100644
+index 5a51ef4e96..7fbe869fad 100644
 --- a/python/sglang/srt/hardware_backend/npu/moe/topk.py
 +++ b/python/sglang/srt/hardware_backend/npu/moe/topk.py
 @@ -5,6 +5,7 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
@@ -997,7 +1024,7 @@ index 5a51ef4e96..b19fbbe363 100644
  
  def fused_topk_npu(
      hidden_states: torch.Tensor,
-@@ -31,18 +37,41 @@ def fused_topk_npu(
+@@ -31,18 +37,43 @@ def fused_topk_npu(
  
      # Fast path: simple top-k without grouped routing and bias
      if not use_grouped_topk and correction_bias is None:
@@ -1016,11 +1043,13 @@ index 5a51ef4e96..b19fbbe363 100644
 +            and renormalize
 +            and topk_config.num_fused_shared_experts == 0
 +        ):
-+            # renorm=1 单算子 = gating_top_k_softmax + l1_norm。
-+            # bf16 直喂：aclnnMoeGatingTopK 契约支持 BF16 输入，kernel 内精确扩张后
-+            # softmax 全程 fp32 计算，ids 逐位不变；出口不再 fp32 化（bf16 输出下
-+            # 该 .to(fp32) 会变成真 cast）。deepep 线 topk_weights 的 fp32 契约由
-+            # deepep.py 两处 dispatch_a 前的防御性 .to(fp32) 恢复。
++            # renorm=1 single op = gating_top_k_softmax + l1_norm.
++            # Feed bf16 directly: aclnnMoeGatingTopK supports BF16 input and
++            # computes softmax in fp32 after exact widening, so ids are
++            # bitwise unchanged; no .to(fp32) on the output (with bf16 output
++            # that would be a real cast). The deepep path's fp32 contract for
++            # topk_weights is restored by the defensive .to(fp32) before the
++            # two dispatch_a call sites in deepep.py.
 +            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
 +                router_logits,
 +                k=topk_config.top_k,
@@ -1052,30 +1081,35 @@ index 5a51ef4e96..b19fbbe363 100644
      # a torch path. top-k over (scores + bias); weights from un-biased scores.
 diff --git a/python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py b/python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
 new file mode 100644
-index 0000000000..471b56de70
+index 0000000000..5c05bffbaa
 --- /dev/null
 +++ b/python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,363 @@
 +"""MoE expert weight L2 prefetch for NPU decode (aclgraph replay).
 +
-+形态：
-+- **自目标单发射点 = 本层 prepare_attn 完成后、attention 开始前**：
-+  在该点发射**本层**的权重预取。EP 线的层间通信（reduceScatter + allGather）
-+  在下一层 prepare_attn 内完成、TP 线的层尾 all_reduce 在上一层
-+  postprocess_layer 内完成——该点在两条线下都位于**全部层间通信之后**，
-+  不与通信争带宽；自目标使 layer 0 也获得 attention 窗口。
-+- GMM1(w13) 全量预取：发射 w13(j)，仅 GDN 层；默认开。
-+- GMM2(w2) 全量预取：**并入同一发射点**，w2(j) 块序列接在 w13(j) 之后
-+  （消费序：w2 的消费截止于 GMM2(j)，比 w13 晚一个 GMM1+SwiGLU）；默认关。
-+  合并发射门控：w13+w2 ≤ 0.8×L2。
-+- best-effort：GMM 前主流不 wait CMO 流（cache 预热无 RAW 冒险），step 末
-+  drain（防跨 step 积压 + 侧流经 event 返回主流的 capture 合法性要求）。
-+- 仅 graph capture 期发射（eager / prefill 不激活）；CMO 是 SDMA 任务，
-+  不占 AIV/AIC 核。
-+- 仅注册过目标模型的层对象会触发发射（`_moe_prefetch_emit` 标记），
-+  MTP draft 模型的层即使在同名文件内复用本 forward 也不会误发射。
++Design:
++- Self-targeted single launch point: after this layer's prepare_attn, before
++  attention starts; the layer's own weight prefetch is launched there. EP
++  inter-layer communication (reduceScatter + allGather) completes inside the next
++  layer's prepare_attn, and TP's layer-end all_reduce inside the previous layer's
++  postprocess_layer — so this point sits after all inter-layer communication on
++  both paths and does not contend with it for bandwidth; self-targeting also gives
++  layer 0 an attention window.
++- GMM1 (w13) full prefetch: launches w13(j), GDN layers only; on by default.
++- GMM2 (w2) full prefetch: merged into the same launch point, w2(j) chunks appended
++  after w13(j) (consumption order: w2 is consumed by GMM2(j), one GMM1+SwiGLU later
++  than w13); off by default. Merged-launch gate: w13+w2 <= 0.8*L2.
++- Best-effort: the main stream does not wait for the CMO stream before GMM (cache
++  warm-up has no RAW hazard); drained at step end (prevents cross-step backlog, and
++  capture legality requires the side stream to return to the main stream via event).
++- Launched only during graph capture (eager / prefill never activate); CMO is an
++  SDMA task and occupies no AIV/AIC cores.
++- Only layer objects registered for the target model trigger launches
++  (`_moe_prefetch_emit` marker); layers of the MTP draft model never launch even if
++  they reuse this forward from the same file.
 +
-+注意：torch_npu 一律在函数内惰性 import，保证本模块在 CUDA 等其他平台可安全 import。
++Note: torch_npu is always lazily imported inside functions, so this module is safe
++to import on CUDA and other platforms.
 +"""
 +
 +from __future__ import annotations
@@ -1100,7 +1134,7 @@ index 0000000000..471b56de70
 +
 +
 +# ---------------------------------------------------------------------------
-+# L2 容量查询（ctypes，免编译）
++# L2 capacity query (ctypes, no compilation needed)
 +# ---------------------------------------------------------------------------
 +def _dlopen_first(candidates):
 +    for path in candidates:
@@ -1128,7 +1162,7 @@ index 0000000000..471b56de70
 +
 +
 +def _query_l2_size_bytes() -> Optional[int]:
-+    """返回 L2 cache 字节数；查询失败返回 None（调用方据此关闭预取）。"""
++    """Return the L2 cache size in bytes; None on query failure (caller disables prefetch)."""
 +    home = os.environ.get("ASCEND_TOOLKIT_HOME") or os.environ.get("ASCEND_HOME_PATH")
 +    acl_paths = ["libascendcl.so", "libascendcl.so.1"]
 +    rt_paths = ["libruntime.so"]
@@ -1157,7 +1191,7 @@ index 0000000000..471b56de70
 +
 +
 +def _is_capture_mode() -> bool:
-+    """惰性 import，避免模块级依赖 model_executor 链路。"""
++    """Lazy import to avoid a module-level dependency on the model_executor chain."""
 +    from sglang.srt.model_executor.runner_utils.capture_mode import (
 +        get_is_capture_mode,
 +    )
@@ -1166,7 +1200,7 @@ index 0000000000..471b56de70
 +
 +
 +# ---------------------------------------------------------------------------
-+# 管理器（进程级单例）
++# Manager (process-level singleton)
 +# ---------------------------------------------------------------------------
 +class _MoeWeightPrefetchManager:
 +    def __init__(self):
@@ -1184,14 +1218,14 @@ index 0000000000..471b56de70
 +        self._capacity_checked = False
 +        self._emitted_in_pass = False
 +
-+    # ---- 配置（首次注册时解析一次） ----
++    # ---- Configuration (parsed once at first registration) ----
 +    def configure(self):
 +        if self.configured:
 +            return
 +        self.configured = True
 +
 +        if not envs.SGLANG_NPU_MOE_PREFETCH.get():
-+            return  # enabled 保持 False，后续全部 no-op
++            return  # enabled stays False; everything below is a no-op
 +
 +        ops_raw = str(envs.SGLANG_NPU_MOE_PREFETCH_OPS.get()).lower()
 +        ops = [t.strip() for t in ops_raw.split(",") if t.strip()]
@@ -1210,16 +1244,17 @@ index 0000000000..471b56de70
 +            )
 +            mode = "auto"
 +        if mode == "active":
-+            # 图内 npu_prefetch 的 offset/max_size 是捕获期常量、节点无条件执行，
-+            # 运行期激活索引喂不进烘死的 CMO 参数；active 需 copy-kernel +
-+            # write-allocate 路线，本实现回退 full。
++            # In-graph npu_prefetch offset/max_size are capture-time constants and
++            # nodes execute unconditionally, so runtime active indices cannot be fed
++            # into the baked CMO params; 'active' would need a copy-kernel +
++            # write-allocate design. Fall back to 'full'.
 +            logger.warning(
 +                "[MOE_PREFETCH] mode='active' is not supported "
 +                "(in-graph CMO params are capture-time constants); "
 +                "falling back to 'full'"
 +            )
 +            mode = "full"
-+        self.mode = "full" if mode == "auto" else mode  # auto ≡ full
++        self.mode = "full" if mode == "auto" else mode  # auto == full
 +
 +        chunk_mib = int(envs.SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB.get())
 +        if chunk_mib <= 0:
@@ -1250,7 +1285,7 @@ index 0000000000..471b56de70
 +            f"l2={self.l2_size >> 20}MiB budget={self.budget_bytes >> 20}MiB"
 +        )
 +
-+    # ---- 容量判据（首个 MoE 层注册时检查一次；各层同构） ----
++    # ---- Capacity check (checked once at first MoE layer registration; layers are homogeneous) ----
 +    def _check_capacity(self, w13_bytes: int, w2_bytes: int):
 +        if self._capacity_checked:
 +            return
@@ -1265,8 +1300,8 @@ index 0000000000..471b56de70
 +            )
 +            self.prefetch_gmm1 = False
 +        if self.prefetch_gmm2:
-+            # 合并发射门控：w13（若 gmm1 开）+ w2 同驻一个跨层窗口，
-+            # 合计 ≤ budget 才放行 gmm2。
++            # Merged-launch gate: w13 (if gmm1 is on) + w2 stay resident in the same
++            # cross-layer window; gmm2 is allowed only if the total fits the budget.
 +            resident = (w13_bytes if self.prefetch_gmm1 else 0) + w2_bytes
 +            if resident > self.budget_bytes:
 +                logger.warning(
@@ -1285,7 +1320,7 @@ index 0000000000..471b56de70
 +                f"(gmm2={self.prefetch_gmm2})"
 +            )
 +
-+    # ---- 模型注册（模型 init 期调用，capture 外） ----
++    # ---- Model registration (called during model init, outside capture) ----
 +    def register_model(self, model):
 +        self.configure()
 +        if not self.enabled:
@@ -1294,7 +1329,7 @@ index 0000000000..471b56de70
 +        if self.stream is None:
 +            import torch_npu  # noqa: F401
 +
-+            # 专用 CMO 流：capture 外创建（驱动调用），单例复用。
++            # Dedicated CMO stream: created outside capture (driver call), reused as a singleton.
 +            self.stream = torch.npu.Stream()
 +
 +        block_types = None
@@ -1316,14 +1351,14 @@ index 0000000000..471b56de70
 +            w2 = getattr(experts, "w2_weight", None)
 +            layer_id = getattr(layer, "layer_id", None)
 +            if w13 is None or w2 is None or layer_id is None:
-+                continue  # 稠密 MLP / PPMissingLayer / 非 MoE 层
++                continue  # dense MLP / PPMissingLayer / non-MoE layer
 +
 +            self._check_capacity(
 +                w13.numel() * w13.element_size(),
 +                w2.numel() * w2.element_size(),
 +            )
-+            # 目标层判定：仅当 j 为 GDN 层时以其为预取目标
-+            # （FA 层 FIA KV 流自逐出 + 抢带宽）；w13 与 w2 共用目标层集合。
++            # Prefetch target: GDN layers only (an FA layer's FIA KV stream
++            # self-evicts and steals bandwidth); w13 and w2 share the target set.
 +            is_gdn = (
 +                block_types is not None
 +                and 0 <= layer_id < len(block_types)
@@ -1334,8 +1369,9 @@ index 0000000000..471b56de70
 +                "w2": w2,
 +                "prefetch_target": bool(is_gdn),
 +            }
-+            # 发射门禁按层对象标记：未注册的层（如 MTP draft 模型的层，
-+            # 其 layer_id 可能与注册表碰撞）一律不发射。
++            # The launch gate is marked per layer object: unregistered layers (e.g.
++            # MTP draft model layers, whose layer_id may collide with the registry)
++            # never launch.
 +            layer._moe_prefetch_emit = True
 +            n_reg += 1
 +
@@ -1346,12 +1382,12 @@ index 0000000000..471b56de70
 +                f"{n_target} GDN prefetch targets"
 +            )
 +
-+    # ---- 发射（仅 capture 期；best-effort，不 wait） ----
++    # ---- Launch (capture only; best-effort, no wait) ----
 +    def _emit_chunked(self, weights, anchor: torch.Tensor):
 +        import torch_npu
 +
 +        cur = torch.npu.current_stream()
-+        self.stream.wait_stream(cur)  # fork 边：罚金由预取流支付
++        self.stream.wait_stream(cur)  # fork edge: the penalty is paid by the prefetch stream
 +        with torch.npu.stream(self.stream):
 +            for weight in weights:
 +                nbytes = weight.numel() * weight.element_size()
@@ -1363,18 +1399,19 @@ index 0000000000..471b56de70
 +        self._emitted_in_pass = True
 +
 +    def emit(self, layer, anchor: torch.Tensor):
-+        """本层 attention 开始前（层间通信全部完成后）发射本层 w13(+w2) 预取。
++        """Launch this layer's w13(+w2) prefetch before its attention starts (after all inter-layer communication).
 +
-+        发射点 = decoder layer forward 的 prepare_attn 之后。
-+        EP 的层间通信（reduceScatter + allGather）在下一层 prepare_attn 内完成、
-+        TP 的层尾 AR 在上一层 postprocess_layer 内完成，该点在两条线下都位于
-+        全部层间通信之后。块序：w13 在前（消费截止 GMM1），w2 在后
-+        （截止 GMM2，多一个 GMM1+SwiGLU 余量）。
++        Launch point = after prepare_attn in decoder layer forward. EP inter-layer
++        communication (reduceScatter + allGather) completes inside the next layer's
++        prepare_attn and TP's layer-end AR inside the previous layer's
++        postprocess_layer, so this point is after all inter-layer communication on
++        both paths. Chunk order: w13 first (consumed by GMM1), w2 after (consumed by
++        GMM2, with one extra GMM1+SwiGLU of slack).
 +        """
 +        if not self.enabled or not _is_capture_mode():
 +            return
 +        if not getattr(layer, "_moe_prefetch_emit", False):
-+            return  # 未注册的层（MTP draft 等）不发射
++            return  # unregistered layers (MTP draft etc.) never launch
 +        target = self.layers.get(layer.layer_id)
 +        if target is None or not target["prefetch_target"]:
 +            return
@@ -1387,7 +1424,7 @@ index 0000000000..471b56de70
 +            return
 +        self._emit_chunked(weights, anchor)
 +
-+    # ---- step 末 drain（模型 forward 的 layer 循环后调用） ----
++    # ---- Step-end drain (called after the model forward layer loop) ----
 +    def drain(self):
 +        if not self.enabled or not self._emitted_in_pass or not _is_capture_mode():
 +            return
@@ -1399,7 +1436,7 @@ index 0000000000..471b56de70
 +
 +
 +# ---------------------------------------------------------------------------
-+# 对外接口（供 qwen3_5.py 调用）
++# Public interface (called by qwen3_5.py)
 +# ---------------------------------------------------------------------------
 +def moe_prefetch_register_model(model):
 +    _MANAGER.register_model(model)
@@ -1413,30 +1450,30 @@ index 0000000000..471b56de70
 +    _MANAGER.drain()
 diff --git a/python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py b/python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py
 new file mode 100644
-index 0000000000..408eec3040
+index 0000000000..ea67cd2293
 --- /dev/null
 +++ b/python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py
-@@ -0,0 +1,340 @@
-+# Qwen3.5 NPU decode TP 主流线 AscendC 融合的开关/守卫模块。
+@@ -0,0 +1,347 @@
++# Switch/guard module for Qwen3.5 NPU decode TP-path AscendC fusion.
 +#
-+# 两个算子（sgl-kernel-npu 主 csrc 注册为 torch.ops.npu.*）：
-+#   op1 fused_qkvzba_conv1d           GDN decode：qkvzba split + causal_conv1d(UPDATE)
-+#                                     单 kernel，返回 (y, z, b, a)，conv_states 原地更新。
-+#   op2 fused_sigmoid_gating_recurrent GDN decode：sigmoid gating + delta rule update
-+#                                     单 kernel（AIV_ONLY），生产 Triton kernel 的
-+#                                     drop-in 替代，ssm pool 原地更新。
++# Two ops (registered by sgl-kernel-npu csrc as torch.ops.npu.*):
++#   op1 fused_qkvzba_conv1d            GDN decode: qkvzba split + causal_conv1d(UPDATE),
++#                                      single kernel, returns (y, z, b, a); conv_states updated in place.
++#   op2 fused_sigmoid_gating_recurrent GDN decode: sigmoid gating + delta rule update,
++#                                      single AIV_ONLY kernel; drop-in replacement for the
++#                                      production Triton kernel; ssm pool updated in place.
 +#
-+# fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm 不随本版构建（已止损下线），
-+# 为兼容可能存在的旧版 qwen3_5.py（其 import 本模块的 5 个守卫函数），这两个算子
-+# 的守卫函数以「恒停用」桩形式保留（返回 False/None，永不激活）。
++# fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm are not built in this version
++# (dropped); their guard functions are kept as always-disabled stubs so that an old
++# qwen3_5.py importing them still works.
 +#
-+# 开关：
-+#   SGLANG_NPU_TP_ASCENDC_FUSION          总开关（默认 "0"），仅 op1 跟随
-+#   SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA   op1 分开关：未设置随总开关，显式 "0" 单关
-+#   SGLANG_NPU_GDN_RECURRENT_ASCENDC      op2 开关（默认 "0"）；在 gdn_triton.py import
-+#                                         期判定，须在建图/服务启动前设置
-+#   SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1  守卫未命中按 key 一次性打印
-+# 图 capture 时守卫判定随 Python 分支烘进图，capture 后改 env 无效。
++# Switches:
++#   SGLANG_NPU_TP_ASCENDC_FUSION          master switch (default "0"), op1 only
++#   SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA   op1 switch: follows master when unset, explicit "0" disables op1 alone
++#   SGLANG_NPU_GDN_RECURRENT_ASCENDC      op2 switch (default "0"); evaluated at gdn_triton.py
++#                                         import time, must be set before graph capture / server start
++#   SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1  log guard misses once per key
++# Guard decisions are baked into the graph at capture time; changing env afterwards has no effect.
 +
 +import logging
 +import os
@@ -1451,35 +1488,34 @@ index 0000000000..408eec3040
 +_TP_DEBUG_ENV = "SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG"
 +_tp_debug_logged = set()
 +
-+# op host 侧硬约束（与 csrc host TORCH_CHECK 逐条对应，见各 REGISTRATION.md）：
-+_TP_C0_ALIGN = 16  # bf16 C0 对齐（op1 行宽须 16 倍数）
-+_RECURRENT_HEAD_DIM = 128  # fused_sigmoid_gating_recurrent kernel 特化 K/V
-+_RECURRENT_MAX_HV = 8  # 同上 gating [8] pad 上限
-+_RECURRENT_MAX_N = 256  # 同上 cu/idx UB 驻留上限
++# Host-side hard constraints of the ops (mirror the csrc host TORCH_CHECKs; see each REGISTRATION.md):
++_TP_C0_ALIGN = 16  # bf16 C0 alignment (op1 row width must be a multiple of 16)
++_RECURRENT_HEAD_DIM = 128  # fused_sigmoid_gating_recurrent kernel specializes K/V to 128
++_RECURRENT_MAX_HV = 8  # gating [8] pad limit of the same kernel
++_RECURRENT_MAX_N = 256  # cu/idx UB residency limit of the same kernel
 +
 +_TP_OP_CACHE = {}
 +
 +
 +def tp_fusion_enabled() -> bool:
-+    """TP 线 AscendC 融合总开关（默认关；="1" 启用，仅 op1 跟随）。"""
++    """Master switch for TP-path AscendC fusion (default off; "1" enables, op1 only)."""
 +    return os.environ.get(_TP_FUSION_ENV, "0") == "1"
 +
 +
 +def tp_fusion_qkvzba_enabled() -> bool:
-+    """op1（fused_qkvzba_conv1d）开关：分开关未设置时随总开关，显式 "0" 单独关。"""
++    """op1 (fused_qkvzba_conv1d) switch: follows the master switch when unset; explicit "0" disables op1 alone."""
 +    return os.environ.get(
 +        _TP_FUSION_QKVZBA_ENV, os.environ.get(_TP_FUSION_ENV, "0")
 +    ) == "1"
 +
 +
 +def gdn_recurrent_ascendc_enabled() -> bool:
-+    """op2（fused_sigmoid_gating_recurrent，AscendC recurrent）开关：默认 "0"，
-+    显式 "1" 才开。"""
++    """op2 (fused_sigmoid_gating_recurrent, AscendC recurrent) switch: default "0", enabled only by explicit "1"."""
 +    return os.environ.get(_GDN_RECURRENT_ASCENDC_ENV, "0") == "1"
 +
 +
 +def tp_debug_log(key, msg):
-+    """debug 开关打开时按 key 一次性打日志（定位守卫未命中环节用）。"""
++    """When the debug switch is on, log once per key (for locating guard misses)."""
 +    if os.environ.get(_TP_DEBUG_ENV, "0") != "1":
 +        return
 +    if key in _tp_debug_logged:
@@ -1489,9 +1525,10 @@ index 0000000000..408eec3040
 +
 +
 +def tp_op_available(name: str) -> bool:
-+    """torch.ops.npu 上算子是否已注册（即 sgl-kernel-npu 是否已带本包算子构建）。
++    """Whether the op is registered on torch.ops.npu (i.e. sgl-kernel-npu was built with these ops).
 +
-+    注册发生在 sgl_kernel_npu 扩展加载时（进程启动期），结果进程内静态，故缓存。
++    Registration happens when the sgl_kernel_npu extension loads (process start), so
++    the result is process-static and cached.
 +    """
 +    got = _TP_OP_CACHE.get(name)
 +    if got is None:
@@ -1501,17 +1538,18 @@ index 0000000000..408eec3040
 +
 +
 +# ---------------------------------------------------------------------------
-+# op1（GDN decode）：fused_qkvzba_conv1d
++# op1 (GDN decode): fused_qkvzba_conv1d
 +#   = fused_qkvzba_split_reshape_cat_contiguous + causal_conv1d(run_mode=1)
 +# ---------------------------------------------------------------------------
 +def tp_fused_qkvzba_conv1d_shape_supported(
 +    num_k_heads_tp, num_v_heads_tp, head_k_dim, head_v_dim, conv_kernel_size
 +) -> bool:
-+    """init 期烘定的形状守卫（Qwen3_5GatedDeltaNet 级；头数为 TP 切分后 per-rank 值）。
++    """Shape guard baked at init (Qwen3_5GatedDeltaNet level; head counts are per-rank after TP split).
 +
-+    镜像算子 host TORCH_CHECK：num_v%num_k==0 且比值 ∈ {1,2,4}（与被替代的
-+    qwen3_5.py split 分支条件一致）、conv width ∈ [2,4]、qkvWidth 与 qkvz 行宽
-+    16 对齐（z 拷贝 32B DataCopy 对齐）、z 行字节 ≤ 65535（单块 DataCopy 上限）。
++    Mirrors the op host TORCH_CHECKs: num_v % num_k == 0 with ratio in {1,2,4} (same
++    as the replaced qwen3_5.py split-branch condition), conv width in [2,4], qkvWidth
++    and qkvz row width 16-aligned (32B DataCopy alignment of the z copy), z row
++    bytes <= 65535 (single-block DataCopy limit).
 +    """
 +    ok = (
 +        tp_fusion_qkvzba_enabled()
@@ -1535,11 +1573,11 @@ index 0000000000..408eec3040
 +    if not ok:
 +        tp_debug_log(
 +            ("qkvzba_shape",),
-+            "fused_qkvzba_conv1d init 形状守卫未命中（回退 stock split+causal_conv1d）："
++            "fused_qkvzba_conv1d init shape guard missed (falling back to stock split+causal_conv1d): "
 +            f"nk_tp={num_k_heads_tp} nv_tp={num_v_heads_tp} dk={head_k_dim} "
 +            f"dv={head_v_dim} width={conv_kernel_size} "
 +            f"op_registered={tp_op_available('fused_qkvzba_conv1d')} "
-+            f"{_TP_FUSION_QKVZBA_ENV}={os.environ.get(_TP_FUSION_QKVZBA_ENV, '<随总开关>')!r} "
++            f"{_TP_FUSION_QKVZBA_ENV}={os.environ.get(_TP_FUSION_QKVZBA_ENV, '<follows master>')!r} "
 +            f"{_TP_FUSION_ENV}={os.environ.get(_TP_FUSION_ENV, '0')!r}",
 +        )
 +    return ok
@@ -1548,12 +1586,14 @@ index 0000000000..408eec3040
 +def tp_fused_qkvzba_conv1d_inputs_ok(
 +    qkvz, mixed_ba, num_k_heads_tp, num_v_heads_tp, head_k_dim, head_v_dim
 +) -> bool:
-+    """backend 侧运行期轻量判定（tuple 输入的张量属性；形状主集合已在 init 烘定）。
++    """Lightweight runtime check on the backend side (tuple-input tensor attributes; the main shape set is baked at init).
 +
-+    连续性契约为「行距视图」：列内连续（stride(1)==1）、行距 >= 逻辑宽度且
-+    qkvz 行距 16 倍数（镜像 host 对 z 拷贝 32B 对齐的 TORCH_CHECK）。连续输入
-+    天然满足；行距视图（pack 打包 GEMM 输出切片）直读，免两次 .contiguous()。
-+    注意：本判定须与 csrc host 同版本部署（旧 host 仍 TORCH_CHECK is_contiguous）。
++    Contiguity contract is a "row-stride view": column-contiguous (stride(1)==1), row
++    stride >= logical width, and qkvz row stride a multiple of 16 (mirrors the host
++    TORCH_CHECK for 32B alignment of the z copy). Contiguous inputs satisfy this
++    naturally; row-stride views (slices of the packed GEMM output) are read directly,
++    avoiding two .contiguous() calls. Must be deployed together with the matching
++    csrc host version (older hosts still TORCH_CHECK is_contiguous).
 +    """
 +    qkv_width = 2 * num_k_heads_tp * head_k_dim + num_v_heads_tp * head_v_dim
 +    return (
@@ -1575,20 +1615,22 @@ index 0000000000..408eec3040
 +
 +
 +# ---------------------------------------------------------------------------
-+# op2（GDN decode）：fused_sigmoid_gating_recurrent（AscendC recurrent）
++# op2 (GDN decode): fused_sigmoid_gating_recurrent (AscendC recurrent)
 +#
-+# 与生产 Triton kernel 不承诺逐 bit 等价（K 维归约加法顺序 + Exp/Ln/Div 指令级
-+# 差异），验收走有界误差 + 长程漂移 + e2e A/B 路径（见算子包 README「精度闸门」节）。
++# Not bit-exact with the production Triton kernel (K-dim reduction order +
++# instruction-level Exp/Ln/Div differences); acceptance follows bounded error +
++# long-run drift + e2e A/B (see the op package README "precision gate" section).
 +# ---------------------------------------------------------------------------
 +def _ascendc_recurrent_supported(
 +    q, k, v, a, b, initial_state_source, initial_state_indices, cu_seqlens,
 +    A_log, dt_bias,
 +) -> bool:
-+    """运行期守卫（镜像 host TORCH_CHECK；未命中 → wrapper 回退 stock Triton）。
++    """Runtime guard (mirrors host TORCH_CHECKs; on miss the wrapper falls back to stock Triton).
 +
-+    只读张量属性（shape/stride/dtype/连续性），不读 device 数据，graph capture 安全。
-+    A_log/dt_bias 的 fp32 dtype 不在此卡——wrapper 侧做无损加宽转换（见调用处），
-+    此处只校验 numel 防 host TORCH_CHECK 崩出。
++    Reads tensor attributes only (shape/stride/dtype/contiguity), never device data,
++    so it is graph-capture safe. fp32 dtype of A_log/dt_bias is not enforced here —
++    the wrapper widens losslessly (see call site); only numel is checked to avoid a
++    host TORCH_CHECK failure.
 +    """
 +    ok = (
 +        tp_op_available("fused_sigmoid_gating_recurrent")
@@ -1597,7 +1639,7 @@ index 0000000000..408eec3040
 +        and q.size(0) == 1
 +        and cu_seqlens is not None
 +        and torch.is_tensor(cu_seqlens)
-+        and q.size(1) == cu_seqlens.numel() - 1  # T == N：每序列 1 token
++        and q.size(1) == cu_seqlens.numel() - 1  # T == N: 1 token per sequence
 +        and 1 <= q.size(1) <= _RECURRENT_MAX_N
 +        and q.size(3) == _RECURRENT_HEAD_DIM
 +        and v.size(3) == _RECURRENT_HEAD_DIM
@@ -1632,7 +1674,7 @@ index 0000000000..408eec3040
 +    if not ok:
 +        tp_debug_log(
 +            ("recurrent_shape",),
-+            "fused_sigmoid_gating_recurrent 运行期守卫未命中（回退 stock Triton）："
++            "fused_sigmoid_gating_recurrent runtime guard missed (falling back to stock Triton): "
 +            f"q={tuple(q.shape)}/{q.dtype} v={tuple(v.shape)}/{v.dtype} "
 +            f"pool={tuple(initial_state_source.shape)}/{initial_state_source.dtype} "
 +            f"T_vs_N={q.size(1)}/{cu_seqlens.numel() - 1 if torch.is_tensor(cu_seqlens) else None} "
@@ -1657,11 +1699,12 @@ index 0000000000..408eec3040
 +    use_qk_l2norm_in_kernel=False,
 +    cu_seqlens=None,
 +):
-+    """生产 Triton wrapper（fused_sigmoid_gating_delta_rule_update_npu）
-+    同签名同语义的 AscendC 版 drop-in，仅 decode（T==N）。
++    """AscendC drop-in replacement for the production Triton wrapper
++    (fused_sigmoid_gating_delta_rule_update_npu), same signature and semantics;
++    decode only (T==N).
 +
-+    守卫未命中 → 回退 stock Triton wrapper（静默回退；
-+    SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1 时打一次原因）。
++    On guard miss, falls back to the stock Triton wrapper (silent; with
++    SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1 the reason is logged once).
 +    """
 +    if not _ascendc_recurrent_supported(
 +        q, k, v, a, b, initial_state_source, initial_state_indices, cu_seqlens,
@@ -1687,14 +1730,14 @@ index 0000000000..408eec3040
 +            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
 +            cu_seqlens=cu_seqlens,
 +        )
-+    # scale 默认值与 Triton wrapper 逐字一致（python 侧 K**-0.5，同 double→float 路径）
++    # scale default matches the Triton wrapper (python-side K**-0.5, same double->float path)
 +    if scale is None:
 +        scale = k.shape[-1] ** -0.5
 +    else:
 +        assert scale > 0, "scale must be positive"
-+    # A_log/dt_bias：host 仅收 fp32，但 checkpoint 载入后可能为 bf16。
-+    # wrapper 侧做无损加宽（与 Triton 核内 .to(tl.float32) 逐 bit 等价），并镜像
-+    # Triton wrapper 的 .contiguous()。
++    # A_log/dt_bias: the host only accepts fp32, but they may be bf16 after checkpoint
++    # load. Widen losslessly here (bit-exact with the in-kernel .to(tl.float32) of the
++    # Triton kernel), mirroring the Triton wrapper's .contiguous().
 +    if A_log.dtype != torch.float32:
 +        A_log = A_log.float()
 +    if dt_bias.dtype != torch.float32:
@@ -1723,39 +1766,40 @@ index 0000000000..408eec3040
 +
 +
 +# ---------------------------------------------------------------------------
-+# 遗留桩（恒停用）：fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm
-+# 这两个算子已止损下线、不随本版构建。旧版 qwen3_5.py 若 import 下列 5 个函数，
-+# 桩保证其可正常运行且永不激活（调用方回退原链路）。
++# Legacy stubs (always disabled): fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm
++# These two ops were dropped and are not built in this version. If an old qwen3_5.py
++# imports the 5 functions below, the stubs keep it working and never activate
++# (callers fall back to the original path).
 +# ---------------------------------------------------------------------------
 +def tp_fusion_nqps_enabled() -> bool:
-+    """fused_norm_qkv_proj_scatter 开关桩：恒 False（算子不构建，恒停用）。"""
++    """fused_norm_qkv_proj_scatter switch stub: always False (op not built)."""
 +    return False
 +
 +
 +def tp_fusion_sigmm_enabled() -> bool:
-+    """fused_sigmoid_mul_mm 开关桩：恒 False（算子不构建，恒停用）。"""
++    """fused_sigmoid_mul_mm switch stub: always False (op not built)."""
 +    return False
 +
 +
 +def tp_norm_qkv_scatter_shape_supported(layer) -> bool:
-+    """fused_norm_qkv_proj_scatter init 守卫桩：恒 False。"""
++    """fused_norm_qkv_proj_scatter init guard stub: always False."""
 +    return False
 +
 +
 +def tp_norm_qkv_scatter_context(
 +    layer, hidden_states, residual, forward_batch, captured_last_layer_outputs
 +):
-+    """fused_norm_qkv_proj_scatter 运行期守卫桩：恒 None（调用方回退原链路）。"""
++    """fused_norm_qkv_proj_scatter runtime guard stub: always None (caller falls back to the original path)."""
 +    return None
 +
 +
 +def tp_sigmoid_mul_mm_shape_supported(o_proj) -> bool:
-+    """fused_sigmoid_mul_mm init 守卫桩：恒 False。"""
++    """fused_sigmoid_mul_mm init guard stub: always False."""
 +    return False
 +
 +
 +def tp_sigmoid_mul_mm_runtime_ok(attn_output, gate) -> bool:
-+    """fused_sigmoid_mul_mm 运行期守卫桩：恒 False。"""
++    """fused_sigmoid_mul_mm runtime guard stub: always False."""
 +    return False
 diff --git a/python/sglang/srt/layers/attention/fla/cumsum.py b/python/sglang/srt/layers/attention/fla/cumsum.py
 index 911b78e004..ff78179f56 100644
@@ -1776,7 +1820,7 @@ index 911b78e004..ff78179f56 100644
  @triton.jit(do_not_specialize=["T"])
  def chunk_local_cumsum_vector_kernel(
 diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
-index abdfa5e376..093a7c2414 100644
+index abdfa5e376..26b9d0a4fd 100644
 --- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 +++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 @@ -1,3 +1,5 @@
@@ -1785,17 +1829,19 @@ index abdfa5e376..093a7c2414 100644
  import torch
  
  from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
-@@ -25,6 +27,23 @@ if is_npu():
+@@ -25,6 +27,25 @@ if is_npu():
  
      chunk_gated_delta_rule = chunk_gated_delta_rule_npu
      fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
 +
-+    # NPU decode 的 recurrent kernel 三选一（import 期判定，须在服务启动前设置
-+    # env；capture 后改无效）：
-+    #   SGLANG_NPU_GDN_RECURRENT_ASCENDC=1 → AscendC 版（守卫未命中时内部回退 stock）
-+    #   SGLANG_NPU_GDN_UPDATE_FUSED=1      → decode 优化 Triton 版
-+    #   均未设置                           → stock
-+    # 两个 env 同开时 ASCENDC 优先。
++    # Three-way choice of the NPU decode recurrent kernel (resolved at import
++    # time — set the env before server start; changing it after capture has no
++    # effect):
++    #   SGLANG_NPU_GDN_RECURRENT_ASCENDC=1 → AscendC version (falls back to
++    #                                        stock internally on guard miss)
++    #   SGLANG_NPU_GDN_UPDATE_FUSED=1      → decode-optimized Triton version
++    #   neither set                        → stock
++    # If both envs are set, ASCENDC wins.
 +    if os.environ.get("SGLANG_NPU_GDN_RECURRENT_ASCENDC", "0") == "1":
 +        from sglang.srt.hardware_backend.npu.tp_ascendc_fusion_npu import (
 +            fused_sigmoid_gating_delta_rule_update_ascendc as _gdn_decode_update,
@@ -1809,13 +1855,14 @@ index abdfa5e376..093a7c2414 100644
  elif is_cpu():
      from sgl_kernel.mamba import chunk_gated_delta_rule_cpu
  
-@@ -150,7 +169,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
+@@ -150,7 +171,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
          query_start_loc: torch.Tensor,
          **kwargs,
      ) -> torch.Tensor:
 -        return fused_sigmoid_gating_delta_rule_update(
-+        # _gdn_decode_update 在 import 期按 env 绑定（三选一）；kwargs 签名三方
-+        # 全对齐。target_verify 传扩展参数、不经过本方法，不受影响。
++        # _gdn_decode_update is bound by env at import time (three-way); the
++        # kwargs signatures are aligned across all three. target_verify passes
++        # extended args and bypasses this method, so it is unaffected.
 +        return _gdn_decode_update(
              A_log=A_log,
              dt_bias=dt_bias,
@@ -2105,15 +2152,15 @@ index 23c46113a1..492931c979 100644
  
          x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
 diff --git a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
-index 33a51a89da..bb5c69721e 100644
+index 33a51a89da..9f0bc41b78 100644
 --- a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
 +++ b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
 @@ -487,6 +487,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
          topk_output: TopKOutput,
      ):
          topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-+        # front_fusion bf16 直出时恢复 deepep 线 topk_weights 的 fp32 契约
-+        # （fp32 出口下此行为 no-op）。
++        # Restore the deepep path's fp32 contract for topk_weights when
++        # front_fusion emits bf16 directly (no-op when the output is fp32).
 +        topk_weights = topk_weights.to(torch.float32)
          topk_ids = topk_ids.to(torch.int64)
          if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
@@ -2122,8 +2169,8 @@ index 33a51a89da..bb5c69721e 100644
      ):
          buffer = self._get_buffer()
          topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-+        # front_fusion bf16 直出时恢复 deepep 线 topk_weights 的 fp32 契约
-+        # （fp32 出口下此行为 no-op）。
++        # Restore the deepep path's fp32 contract for topk_weights when
++        # front_fusion emits bf16 directly (no-op when the output is fp32).
 +        topk_weights = topk_weights.to(torch.float32)
          topk_ids = topk_ids.to(torch.int64)
          expected_m = (
@@ -2261,8 +2308,40 @@ index 82a3d77f05..f42e166ce7 100644
  
          final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
              hidden_states,
+diff --git a/python/sglang/srt/layers/radix_linear_attention.py b/python/sglang/srt/layers/radix_linear_attention.py
+index 6696945d2c..7854f7a5f3 100644
+--- a/python/sglang/srt/layers/radix_linear_attention.py
++++ b/python/sglang/srt/layers/radix_linear_attention.py
+@@ -35,6 +35,27 @@ if TYPE_CHECKING:
+     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ 
++def wrap_conv1d_weight_loader(attn: RadixLinearAttention, base_loader):
++    """Wrap conv1d.weight's loader so every (re)load also refreshes the
++    transposed copy cached on the RadixLinearAttention wrapper.
++
++    mamba_v2_sharded_weight_loader writes through ``param.data[...] = ...``;
++    ``Tensor.data`` carries a version counter independent of the Parameter's,
++    so ``_version``-based invalidation cannot observe online weight updates
++    (e.g. RL Actor->SGLang sync via ``update_weights_from_tensor``). The
++    refresh is explicit and in place so captured graphs keep referencing the
++    same storage.
++    """
++
++    def loader(param, loaded_weight):
++        base_loader(param, loaded_weight)
++        cached = getattr(attn, "_conv_weights_t", None)
++        if cached is not None:
++            cached.copy_(attn.conv_weights.transpose(0, 1))
++
++    return loader
++
++
+ class RadixLinearAttention(nn.Module):
+     """
+     The Linear Attention Layer Implementation.
 diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
-index e83e4157fa..92d0bb3462 100644
+index e83e4157fa..1a9f98f12c 100644
 --- a/python/sglang/srt/layers/sampler.py
 +++ b/python/sglang/srt/layers/sampler.py
 @@ -58,6 +58,25 @@ _disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAM
@@ -2632,7 +2711,7 @@ index e83e4157fa..92d0bb3462 100644
              return batch_next_token_ids.to(torch.int32)
          else:
              assert (
-@@ -353,9 +639,14 @@ class Sampler(nn.Module):
+@@ -353,16 +639,31 @@ class Sampler(nn.Module):
          token_ids_logprobs: List[List[int]],
          sampling_info: SamplingBatchInfo,
          batch_next_token_ids: torch.Tensor,
@@ -2649,13 +2728,13 @@ index e83e4157fa..92d0bb3462 100644
  
          # Attach logprobs to logits_output (in-place modification)
          if any(x > 0 for x in top_logprobs_nums):
-@@ -363,6 +654,20 @@ class Sampler(nn.Module):
-                 logits_output.next_token_top_logprobs_val,
-                 logits_output.next_token_top_logprobs_idx,
-             ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+-            (
+-                logits_output.next_token_top_logprobs_val,
+-                logits_output.next_token_top_logprobs_idx,
+-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 +            # Same extraction as get_top_logprobs, but clamp the
 +            # [batch, max_k] topk result in a single kernel before
-+            # slicing per request.
++            # slicing per request. Runs topk exactly once.
 +            max_k = max(top_logprobs_nums)
 +            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
 +            if logprobs_are_probs:
@@ -2670,7 +2749,7 @@ index e83e4157fa..92d0bb3462 100644
  
          if any(x is not None for x in token_ids_logprobs):
              (
-@@ -372,10 +677,19 @@ class Sampler(nn.Module):
+@@ -372,10 +673,19 @@ class Sampler(nn.Module):
                  logprobs, token_ids_logprobs, no_copy_to_cpu=True
              )
  
@@ -2678,7 +2757,7 @@ index e83e4157fa..92d0bb3462 100644
 -            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
 -            batch_next_token_ids,
 -        ]
-+            for row in logits_output.token_ids_logprobs_val:
++            for row in logits_output.next_token_token_ids_logprobs_val:
 +                if torch.is_tensor(row):
 +                    if logprobs_are_probs:
 +                        row.log_()
@@ -2694,6 +2773,19 @@ index e83e4157fa..92d0bb3462 100644
  
      def _sync_token_ids_across_tp(
          self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index bfdd72bd54..5f3840e359 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3740,7 +3740,7 @@ class Scheduler(
+                 self.draft_worker.clear_cache_pool()
+ 
+             if empty_cache:
+-                current_platform.empty_cache()
++                torch.npu.empty_cache()
+             # Per-DP-group leader logs once: ranks within a DP group are
+             # state-synchronous, but DP groups may diverge.
+             if self.metrics_reporter.is_stats_logging_rank:
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
 index 3db49daf82..fdc5f40d81 100644
 --- a/python/sglang/srt/managers/tp_worker.py
@@ -2875,7 +2967,7 @@ index ea17a25587..22586658da 100644
  
      def _maybe_execute_deferred_mamba_cow_and_clear(
 diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
-index d5aac381dc..77ad82b3b8 100644
+index d5aac381dc..c1b2966e84 100644
 --- a/python/sglang/srt/models/qwen2_moe.py
 +++ b/python/sglang/srt/models/qwen2_moe.py
 @@ -37,6 +37,7 @@ from sglang.srt.distributed import (
@@ -2966,8 +3058,24 @@ index d5aac381dc..77ad82b3b8 100644
          current_stream.wait_stream(self.alt_stream)
  
          if staged and unstage_shared_expert_add() is None:
+@@ -991,7 +996,14 @@ class Qwen2MoeForCausalLM(nn.Module):
+         self.pp_group = get_pp_group()
+         self.config = config
+         self.quant_config = quant_config
+-        alt_stream = torch.cuda.Stream() if _is_cuda else None
++        # Mirror qwen3_5.py: on NPU, SGLANG_NPU_USE_MULTI_STREAM also needs a
++        # real stream — _forward_deepep's dual-stream branch dereferences
++        # self.alt_stream unconditionally once enabled.
++        alt_stream = (
++            torch.cuda.Stream()
++            if _is_cuda or (is_npu() and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
++            else None
++        )
+         self.model = Qwen2MoeModel(
+             config,
+             quant_config,
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index fed78cf888..dd77e8ac9e 100644
+index fed78cf888..806eec9ffb 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -15,6 +15,7 @@
@@ -2984,8 +3092,8 @@ index fed78cf888..dd77e8ac9e 100644
  from sglang.srt.distributed import get_pp_group
 +from sglang.srt.environ import envs
 +
-+# MoE 权重 L2 预取（SGLANG_NPU_MOE_PREFETCH）：注册、本层 prepare_attn 后发射、
-+# step 末 drain；模块顶层不 import torch_npu，未启用时为 no-op。
++# MoE weight L2 prefetch (SGLANG_NPU_MOE_PREFETCH): launched after each layer's
++# prepare_attn, drained at step end; no torch_npu import at module top level, no-op when disabled.
 +from sglang.srt.hardware_backend.npu.moe_weight_prefetch import (
 +    moe_prefetch_emit,
 +    moe_prefetch_register_model,
@@ -2994,23 +3102,36 @@ index fed78cf888..dd77e8ac9e 100644
  from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
  from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
  
-@@ -127,6 +137,15 @@ _qknorm_use_alt_stream = _is_cuda or (
+@@ -64,7 +74,10 @@ from sglang.srt.layers.parameter import (
+ )
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.radix_attention import RadixAttention
+-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
++from sglang.srt.layers.radix_linear_attention import (
++    RadixLinearAttention,
++    wrap_conv1d_weight_loader,
++)
+ from sglang.srt.layers.rotary_embedding import get_rope
+ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+@@ -127,6 +140,16 @@ _qknorm_use_alt_stream = _is_cuda or (
  )
  _is_amx_available = cpu_has_amx_support()
  
-+# GDN_QKVZBA_PACK：NPU 上把 GDN 层 in_proj_qkvz / in_proj_ba 的权重沿 N 拼成
-+# 单块 [N_pack, K]（N_pack 补零行到 16 倍数，满足下游融合算子行距视图的对齐
-+# 契约），一次 stock linear 取代两次 GEMM；数学逐列等价（pad 列输出无人消费）。
-+# 默认开；=0 回退。仅 NPU + 非量化 bf16/fp16 生效，其余形态由运行期守卫回退。
++# GDN_QKVZBA_PACK: pack the in_proj_qkvz / in_proj_ba weights of GDN layers along N
++# into a single [N_pack, K] block (N_pack zero-padded up to a multiple of 16 for the
++# row-stride alignment contract of downstream fused ops), replacing two GEMMs with one
++# stock linear; column-wise equivalent (pad output columns are never consumed).
++# On by default; =0 reverts. NPU + unquantized bf16/fp16 only, guarded at runtime.
 +_gdn_qkvzba_pack_env = get_bool_env_var("SGLANG_NPU_GDN_QKVZBA_PACK", "true")
-+# 仅小 M 打包：大 M 下宽 N（非 256 tile 整数倍）的 ragged tiling 惩罚会超过
-+# 省下的 ba GEMM。
++# Pack only for small M: at large M the ragged-tiling penalty of the wide N
++# (not a multiple of the 256 tile) outweighs the saved ba GEMM.
 +_gdn_qkvzba_pack_max_m = int(os.getenv("SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M", "256"))
 +
  cached_get_processor = lru_cache(get_processor)
  
  
-@@ -153,6 +172,87 @@ if _is_npu:
+@@ -153,6 +176,91 @@ if _is_npu:
          split_qkvgate_gemma_rmsnorm_rope,
      )
  
@@ -3031,8 +3152,9 @@ index fed78cf888..dd77e8ac9e 100644
 +        fa_v4_scatter_context,
 +    )
 +
-+    # TP 线 AscendC 融合算子接线（总开关 SGLANG_NPU_TP_ASCENDC_FUSION 默认关；
-+    # 候选2/3 已下线，对应接口为恒停用桩，仅保 import 兼容）
++    # TP AscendC fusion wiring (master switch SGLANG_NPU_TP_ASCENDC_FUSION, default
++    # off; candidates 2/3 are retired, their interfaces are permanently disabled
++    # stubs kept only for import compatibility)
 +    from sglang.srt.hardware_backend.npu.tp_ascendc_fusion_npu import (
 +        tp_fused_qkvzba_conv1d_shape_supported,
 +        tp_norm_qkv_scatter_context,
@@ -3043,10 +3165,11 @@ index fed78cf888..dd77e8ac9e 100644
 +
 +
 +def _gdn_qkvzba_packable(proj_qkvz, proj_ba) -> bool:
-+    """GDN_QKVZBA_PACK 运行期守卫（任一不满足 → 回退两次 GEMM 原链路）。
++    """Runtime guard for GDN_QKVZBA_PACK (any failure -> fall back to two GEMMs).
 +
-+    只允许最普通的非量化 2D 权重：FP8 等量化形态的 scale 布局与 packed GEMM
-+    的加性不兼容，直接排除（量化形态由 quant_method 类名判定）。
++    Only plain unquantized 2D weights are allowed: quantized formats such as FP8
++    have scale layouts incompatible with the packed GEMM and are excluded
++    (detected via the quant_method class name).
 +    """
 +    wq = proj_qkvz.weight
 +    wb = proj_ba.weight
@@ -3064,16 +3187,18 @@ index fed78cf888..dd77e8ac9e 100644
 +
 +
 +def _gdn_qkvzba_pack_materialize(proj_qkvz, proj_ba) -> torch.Tensor:
-+    """物化 [N_pack, K] 打包权重，并把两模块 weight.data 重绑为其行切片。
++    """Materialize the packed [N_pack, K] weight and rebind both modules'
++    weight.data to row slices of it.
 +
-+    N_pack = (N_qkvz+N_ba) 向上补零行到 16 倍数：打包 GEMM 输出的物理行距
-+    保持 16 倍数，满足下游融合算子行距视图输入的对齐契约；pad 行权重为零、
-+    pad 列输出无任何消费者（ba 段切片不含 pad 尾行）。
++    N_pack = (N_qkvz+N_ba) rounded up to a multiple of 16, so the packed GEMM
++    output keeps a 16-aligned physical row stride as required by downstream fused
++    ops consuming row-stride views; pad rows are zero and pad output columns have
++    no consumer (the ba slice excludes the pad tail rows).
 +
-+    重绑后权重 loader / RL 权重同步的 in-place narrow+copy_ 写入直接落在打包
-+    缓冲上、天然同步；若某路径整体替换 weight.data（指针漂移），调用方以
-+    data_ptr 校验在下一次 forward 自动重新物化。
-+    返回打包缓冲（调用方缓存，并以 weight.data_ptr() == packed.data_ptr() 校验）。
++    After rebinding, in-place narrow+copy_ writes from weight loaders / RL weight
++    sync land directly on the packed buffer; if some path replaces weight.data
++    wholesale (pointer drift), the caller's data_ptr check re-materializes on the
++    next forward.
 +    """
 +    wq = proj_qkvz.weight
 +    wb = proj_ba.weight
@@ -3098,39 +3223,80 @@ index fed78cf888..dd77e8ac9e 100644
  
  class Qwen3_5GatedDeltaNet(nn.Module):
      def __init__(
-@@ -229,6 +329,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -229,26 +337,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
          self._bind_packed_weight_loaders(self.in_proj_qkvz)
          self._bind_packed_weight_loaders(self.in_proj_ba)
  
-+        # GDN_QKVZBA_PACK：打包开关与惰性物化缓存。打包在权重就绪后的首次
-+        # forward 物化，只改计算组织——两模块的参数、名称、loader、checkpoint
-+        # 映射全部不变，9B dense 与 35B MoE 同享本开关。
+-        # Conv1d weight loader setup
+-        query_key_settings = (self.key_dim, 0, False)
+-        value_settings = (self.value_dim, 0, False)
+-
+-        self._override_weight_loader(
+-            self.conv1d.weight,
+-            mamba_v2_sharded_weight_loader(
+-                [
+-                    query_key_settings,
+-                    query_key_settings,
+-                    value_settings,
+-                ],
+-                self.attn_tp_size,
+-                self.attn_tp_rank,
+-            ),
+-        )
++        # GDN_QKVZBA_PACK: enable flag and lazily materialized pack cache. Packing
++        # only reorganizes compute — parameters, names, loaders and checkpoint
++        # mappings of the two modules are unchanged.
 +        self._qkvzba_pack_enabled = _is_npu and _gdn_qkvzba_pack_env
 +        self._packed_qkvzba_weight: Optional[torch.Tensor] = None
-+
-         # Conv1d weight loader setup
-         query_key_settings = (self.key_dim, 0, False)
-         value_settings = (self.value_dim, 0, False)
-@@ -247,8 +353,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
-         )
  
          # State parameters
-+        # dt_bias 与 A_log 一样按 fp32 物化：gating/recurrent 核内本就无损加宽到
-+        # fp32，下游 AscendC recurrent host 硬要 fp32；源头 fp32 后 wrapper 的
-+        # .float() 变 no-op。加载与 RL 权重同步均 copy_ 系（隐式转换），与 A_log 相同。
++        # dt_bias is materialized in fp32 like A_log: gating/recurrent kernels widen
++        # to fp32 losslessly anyway and the AscendC recurrent host requires fp32, so
++        # with fp32 at the source the wrapper's .float() becomes a no-op. Loading and
++        # RL weight sync are copy_-based (implicit cast), same as A_log.
          self.dt_bias = nn.Parameter(
 -            torch.ones(self.num_v_heads // self.attn_tp_size),
 +            torch.ones(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
          )
          self.A_log = nn.Parameter(
              torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
-@@ -301,6 +410,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -275,6 +376,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             dt_bias=self.dt_bias,
+         )
+ 
++        # Conv1d weight loader setup. The wrapper refreshes the transposed
++        # copy cached on self.attn by the attention backend after every
++        # (re)load, so it must be bound after self.attn exists.
++        query_key_settings = (self.key_dim, 0, False)
++        value_settings = (self.value_dim, 0, False)
++
++        self._override_weight_loader(
++            self.conv1d.weight,
++            wrap_conv1d_weight_loader(
++                self.attn,
++                mamba_v2_sharded_weight_loader(
++                    [
++                        query_key_settings,
++                        query_key_settings,
++                        value_settings,
++                    ],
++                    self.attn_tp_size,
++                    self.attn_tp_rank,
++                ),
++            ),
++        )
++
+         self.norm = RMSNormGated(
+             self.head_v_dim,
+             eps=self.layer_norm_epsilon,
+@@ -301,6 +424,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
              prefix=add_prefix("out_proj", prefix),
          )
  
-+        # TP_FUSION 候选1：fused_qkvzba_conv1d（split+causal_conv1d 单 kernel）的
-+        # init 期形状守卫烘定（头数传 TP 切分后 per-rank 值）；未命中/总开关关闭
-+        # 时 forward 走原 split+causal_conv1d 链路
++        # TP_FUSION candidate 1: bake the init-time shape guard for
++        # fused_qkvzba_conv1d (split+causal_conv1d in one kernel); head counts are
++        # per-rank (post-TP) values. On guard miss or master switch off, forward
++        # uses the original split+causal_conv1d path.
 +        self._tp_fused_qkvzba_ok = _is_npu and tp_fused_qkvzba_conv1d_shape_supported(
 +            triton.cdiv(self.num_k_heads, self.attn_tp_size),
 +            triton.cdiv(self.num_v_heads, self.attn_tp_size),
@@ -3142,7 +3308,7 @@ index fed78cf888..dd77e8ac9e 100644
      @staticmethod
      def _override_weight_loader(param, loader):
          """Robustly override loader for:
-@@ -493,10 +613,45 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -493,10 +628,49 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                  projected_states_ba, _ = self.in_proj_ba(hidden_states)
              current_stream.wait_stream(self.alt_stream)
          else:
@@ -3153,11 +3319,14 @@ index fed78cf888..dd77e8ac9e 100644
 +                and seq_len <= _gdn_qkvzba_pack_max_m
 +                and _gdn_qkvzba_packable(self.in_proj_qkvz, self.in_proj_ba)
 +            ):
-+                # GDN_QKVZBA_PACK：单次打包 GEMM，输出 [M, N_pack] 按行切片成两段
-+                # 行距视图（列内连续）；下游 split kernel 按 stride(0) 取行距、op1
-+                # 融合算子原生收行距视图、fix_query_key_value_ordering 回退本就
-+                # 拷贝，三条消费路径均零额外拷贝。ba 段切片须显式排除 pad 尾列
-+                # （N_pack 可能 > N_qkvz+N_ba）。graph capture 按固定 bs 烘定本分支。
++                # GDN_QKVZBA_PACK: one packed GEMM whose [M, N_pack] output is
++                # sliced into two row-stride views (contiguous within each row);
++                # all consumers take them with zero extra copies — the split kernel
++                # reads the row stride via stride(0), the op1 fused op accepts
++                # row-stride views natively, and the fix_query_key_value_ordering
++                # fallback copies anyway. The ba slice must explicitly exclude the
++                # pad tail columns (N_pack may exceed N_qkvz+N_ba). Graph capture
++                # bakes this branch per fixed batch size.
 +                projected_states_qkvzba = nn.functional.linear(
 +                    hidden_states, self._get_packed_qkvzba_weight()
 +                )
@@ -3171,11 +3340,12 @@ index fed78cf888..dd77e8ac9e 100644
          return projected_states_qkvz, projected_states_ba
  
 +    def _get_packed_qkvzba_weight(self) -> torch.Tensor:
-+        """GDN_QKVZBA_PACK：返回打包权重 [N_qkvz+N_ba, K]。
++        """GDN_QKVZBA_PACK: return the packed [N_qkvz+N_ba, K] weight.
 +
-+        惰性物化（权重加载完成后首次 forward 触发）；此后每次 forward 以
-+        data_ptr 校验——in-place 写入（loader / RL 权重同步）下指针不变、
-+        缓冲天然同步，整体替换 .data 时指针漂移、自动重新物化。
++        Materialized lazily on the first forward after weights are loaded; every
++        later forward revalidates via data_ptr — in-place writes (loader / RL weight
++        sync) keep the pointer so the buffer stays in sync, while wholesale .data
++        replacement moves the pointer and triggers re-materialization.
 +        """
 +        packed = self._packed_qkvzba_weight
 +        if (
@@ -3190,7 +3360,7 @@ index fed78cf888..dd77e8ac9e 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -512,48 +667,64 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -512,48 +686,67 @@ class Qwen3_5GatedDeltaNet(nn.Module):
              hidden_states
          )
  
@@ -3206,11 +3376,13 @@ index fed78cf888..dd77e8ac9e 100644
 -                triton.cdiv(self.num_v_heads, self.attn_tp_size),
 -                self.head_k_dim,
 -                self.head_v_dim,
-+        # TP_FUSION 候选1：decode 且 init 守卫命中时，qkvz/ba 投影以 tuple 直送
-+        # GDN backend——split+causal_conv1d 在 torch.ops.npu.fused_qkvzba_conv1d
-+        # 单 kernel 内完成，返回 (core_attn_out, z)；运行期守卫不通过时 backend
-+        # 内部回退本地 split+stock conv，仍以 tuple 返回。打包路径的行距视图可
-+        # 直送（host 契约：列内连续 + 行距 16 倍数，打包 N 已补齐）。
++        # TP_FUSION candidate 1: on decode with the init guard hit, pass the qkvz/ba
++        # projections to the GDN backend as a tuple — split+causal_conv1d run inside
++        # the single torch.ops.npu.fused_qkvzba_conv1d kernel, returning
++        # (core_attn_out, z); on runtime guard miss the backend falls back to local
++        # split+stock conv, still returning a tuple. Row-stride views from the
++        # packed path can be passed directly (host contract: contiguous within a row
++        # + 16-aligned row stride; the packed N is already padded).
 +        core_attn_out = None
 +        z = None
 +        if self._tp_fused_qkvzba_ok and forward_batch.forward_mode.is_decode():
@@ -3225,7 +3397,8 @@ index fed78cf888..dd77e8ac9e 100644
 -                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
 +
 +        if core_attn_out is None:
-+            # NPU 也走融合 split kernel（上方 import 已按平台重绑定为 sgl_kernel_npu 版）
++            # NPU uses the fused split kernel too (the import above is rebound per
++            # platform to the sgl_kernel_npu version)
 +            if (
 +                self.num_v_heads // self.num_k_heads in [1, 2, 4]
 +                and not _is_cpu
@@ -3289,7 +3462,7 @@ index fed78cf888..dd77e8ac9e 100644
  
          z_shape_og = z.shape
          # reshape input data into 2D tensor
-@@ -608,7 +779,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -608,7 +801,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                  quant_config=quant_config,
                  alt_stream=(
                      alt_stream
@@ -3302,19 +3475,20 @@ index fed78cf888..dd77e8ac9e 100644
                      else None
                  ),
                  prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-@@ -671,6 +846,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -671,6 +868,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
              )
          )
  
-+        # MoE 权重 L2 预取：自目标发射——本层 prepare_attn 之后、attention 之前，
-+        # 此点在 TP/EP 两线下都位于全部层间通信之后。仅 GDN 层；主流不 wait，
-+        # step 末统一 drain。
++        # MoE weight L2 prefetch: launched from the target itself — after this
++        # layer's prepare_attn and before attention, a point after all inter-layer
++        # communication on both TP and EP paths. GDN layers only; the main stream
++        # does not wait, everything is drained at step end.
 +        moe_prefetch_emit(self, hidden_states)
 +
          if not forward_batch.forward_mode.is_idle():
              hidden_states = self.linear_attn(
                  hidden_states,
-@@ -824,7 +1004,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -824,7 +1027,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                  quant_config=quant_config,
                  alt_stream=(
                      alt_stream
@@ -3327,12 +3501,12 @@ index fed78cf888..dd77e8ac9e 100644
                      else None
                  ),
                  prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-@@ -863,6 +1047,26 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -863,6 +1070,26 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
  
          self.alt_stream = alt_stream
  
 +        # full_attention A1b：TP 布局形状守卫在 init 时一次算定
-+        # （q∈{1,2,4} 头 / kv=1 头 / head_dim=256 / rope=64 / 带 gate 才走自研融合 kernel）
++        # (per-rank q heads in {1,2,4} / 1 kv head / head_dim=256 / rope=64 / gated)
 +        self._fa_v4_shape_ok = _is_npu and fa_split_qkvgate_scatter_supported(
 +            self.num_heads,
 +            self.num_kv_heads,
@@ -3341,9 +3515,9 @@ index fed78cf888..dd77e8ac9e 100644
 +            self.attn_output_gate,
 +        )
 +
-+        # TP_FUSION 候选2/候选3：norm+qkv_proj+KV scatter 三合一与
-+        # sigmoid_mul+o_proj 融合的 init 期形状守卫烘定（未命中/总开关关闭 →
-+        # 运行时走原链路）
++        # TP_FUSION candidates 2/3: bake init-time shape guards for the
++        # norm+qkv_proj+KV scatter triple fusion and the sigmoid_mul+o_proj fusion
++        # (guard miss or master switch off -> original path at runtime)
 +        self._tp_fa_norm_qkv_scatter_ok = _is_npu and tp_norm_qkv_scatter_shape_supported(
 +            self
 +        )
@@ -3354,7 +3528,7 @@ index fed78cf888..dd77e8ac9e 100644
      def _apply_qk_norm(
          self, q: torch.Tensor, k: torch.Tensor
      ) -> Tuple[torch.Tensor, torch.Tensor]:
-@@ -979,6 +1183,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -979,6 +1206,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          if self.attn.layer_id == (self.config.full_attention_interval - 1):
              self.rotary_emb.get_cos_sin_with_position(positions)
  
@@ -3385,7 +3559,7 @@ index fed78cf888..dd77e8ac9e 100644
          q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
              qkv,
              self.rotary_emb.position_sin,
-@@ -1026,18 +1254,101 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -1026,18 +1277,108 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                  forward_batch=forward_batch,
              )
  
@@ -3401,9 +3575,11 @@ index fed78cf888..dd77e8ac9e 100644
              else:
                  gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
 -                attn_output.mul_(torch.sigmoid(gate_val))
-+                # TP_FUSION 候选3：sigmoid_mul + o_proj GEMM 单 kernel（输出
-+                # partial sum，无 bias 无 all-reduce，与 o_proj(reduce_results=False)
-+                # 返回语义一致，直接作为本层输出返回）；守卫未命中回退 A2/stock 链
++                # TP_FUSION candidate 3: sigmoid_mul + o_proj GEMM in one kernel
++                # (outputs a partial sum, no bias no all-reduce, same return
++                # semantics as o_proj(reduce_results=False), so it is returned
++                # directly as this layer's output); guard miss falls back to the
++                # A2/stock path
 +                if self._tp_sigmoid_mul_mm_ok and tp_sigmoid_mul_mm_runtime_ok(
 +                    attn_output, gate_val
 +                ):
@@ -3428,19 +3604,22 @@ index fed78cf888..dd77e8ac9e 100644
 +        forward_batch: ForwardBatch,
 +        tp_ctx,
 +    ) -> Tuple[torch.Tensor, torch.Tensor]:
-+        """TP_FUSION 候选2 的 FA decode 主干（prepare 的 input_layernorm 并入 kernel）。
++        """FA decode body of TP_FUSION candidate 2 (prepare's input_layernorm is
++        folded into the kernel).
 +
-+        hidden_states/residual 为 prepare 前的原始张量（未做 add+norm）；返回
-+        (o_proj partial 输出, kernel 产出的新 residual add_out)，供 forward 直接进
-+        prepare_mlp。调用前须过 tp_norm_qkv_scatter_context（tp_ctx 非 None）。
++        hidden_states/residual are the raw pre-prepare tensors (no add+norm
++        applied); returns (o_proj partial output, add_out — the new residual
++        produced by the kernel) so forward can go straight to prepare_mlp. Caller
++        must have passed tp_norm_qkv_scatter_context (tp_ctx is not None).
 +        """
-+        # 与 forward_prepare_npu 相同：首个全注意力层先刷新 sin/cos 缓存
++        # Same as forward_prepare_npu: the first full-attention layer refreshes the
++        # sin/cos cache first
 +        if self.attn.layer_id == (self.config.full_attention_interval - 1):
 +            self.rotary_emb.get_cos_sin_with_position(positions)
 +
 +        rope_dim = int(self.head_dim * self.partial_rotary_factor)
-+        # kernel 要求 [M,64] fp32 连续；NPU 默认 rope cache 为 bf16 → widening
-+        # cast 到 fp32（bf16→fp32 精确）
++        # The kernel requires contiguous [M,64] fp32; the NPU rope cache defaults to
++        # bf16, so widen-cast to fp32 (bf16 -> fp32 is exact)
 +        sin = self.rotary_emb.position_sin.view(-1, rope_dim)
 +        cos = self.rotary_emb.position_cos.view(-1, rope_dim)
 +        if sin.dtype != torch.float32:
@@ -3467,11 +3646,13 @@ index fed78cf888..dd77e8ac9e 100644
 +            self.input_layernorm.variance_epsilon,
 +            self.q_norm.variance_epsilon,
 +        )
-+        # k/v 已由 kernel 按 out_cache_loc 直写 cache（同 A1b 约定：save_kv_cache=False）
++        # k/v were already written into the cache by the kernel at out_cache_loc
++        # (same contract as A1b: save_kv_cache=False)
 +        attn_output = self.attn(q, None, None, forward_batch, save_kv_cache=False)
 +
-+        # 候选3（与 self_attention 尾部同一套守卫）：命中则 A2+o_proj 一并融合；
-+        # 未命中回退 A2/stock 尾部（gate 为 kernel 直出的 2D 连续张量）
++        # Candidate 3 (same guards as the self_attention tail): on hit, A2+o_proj
++        # are fused together; on miss, fall back to the A2/stock tail (gate is a
++        # contiguous 2D tensor straight from the kernel)
 +        if self._tp_sigmoid_mul_mm_ok and tp_sigmoid_mul_mm_runtime_ok(
 +            attn_output, gate
 +        ):
@@ -3489,18 +3670,20 @@ index fed78cf888..dd77e8ac9e 100644
      def forward(
          self,
          positions: torch.Tensor,
-@@ -1047,21 +1358,48 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -1047,21 +1388,52 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
          **kwargs,
      ):
 -        hidden_states, residual = (
 -            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-+        # TP_FUSION 候选2：decode 且运行期守卫全命中时，跳过 prepare 内的
-+        # input_layernorm——add+norm 已由 fused_norm_qkv_proj_scatter 并入 kernel，
-+        # 原始 hidden_states/residual 直进 kernel，add_out 作为新 residual 进
-+        # prepare_mlp。本配置（TP、无 dp-attention、非首层、无 AR fusion pending）
-+        # 下 prepare_attn 除 norm 外恒为空操作，故跳过无遗漏；任一前提破坏 →
-+        # tp_ctx=None，走下方原链路。
++        # TP_FUSION candidate 2: on decode with all runtime guards hit, skip the
++        # input_layernorm inside prepare — add+norm is folded into
++        # fused_norm_qkv_proj_scatter, the raw hidden_states/residual go straight
++        # into the kernel, and add_out becomes the new residual for prepare_mlp.
++        # In this configuration (TP, no dp-attention, not the first layer, no
++        # pending AR fusion) prepare_attn is a no-op apart from the norm, so
++        # skipping it loses nothing; if any premise breaks, tp_ctx is None and the
++        # original path below runs.
 +        tp_ctx = (
 +            tp_norm_qkv_scatter_context(
 +                self,
@@ -3528,8 +3711,10 @@ index fed78cf888..dd77e8ac9e 100644
 -                positions=positions,
 -                hidden_states=hidden_states,
 -                forward_batch=forward_batch,
-+        # MoE 权重 L2 预取：保持在本层全部层间通信之后、attention 之前。
-+        # TP 候选2命中时 prepare_attn 被同语义融合路径替代，层间 AR 已由上一层完成。
++        # MoE weight L2 prefetch: keep this after all inter-layer communication of
++        # the layer and before attention. When TP candidate 2 hits, prepare_attn is
++        # replaced by the equivalent fused path and the inter-layer AR was already
++        # done by the previous layer.
 +        moe_prefetch_emit(self, hidden_states)
 +
 +        if tp_ctx is not None:
@@ -3546,7 +3731,7 @@ index fed78cf888..dd77e8ac9e 100644
  
          # Fully Connected
          hidden_states, residual = self.layer_communicator.prepare_mlp(
-@@ -1207,6 +1545,11 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1207,6 +1579,11 @@ class Qwen3_5ForCausalLM(nn.Module):
              self._maybe_autodisable_shared_experts_fusion(config, quant_config)
  
          alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
@@ -3558,25 +3743,27 @@ index fed78cf888..dd77e8ac9e 100644
  
          # Embedding layer
          if self.pp_group.is_first_rank:
-@@ -1252,6 +1595,12 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1252,6 +1629,13 @@ class Qwen3_5ForCausalLM(nn.Module):
  
          self.layers_to_capture = []
  
-+        # MoE 权重 L2 预取：注册本模型各层 MoE 权重（layer_id → w13/w2 及 GDN
-+        # 目标层标记），并在 capture 外创建专用预取流；is_nextn 的 MTP draft
-+        # 模型不注册（其层无发射标记，draft capture 内不会误发射）。
++        # MoE weight L2 prefetch: register each layer's MoE weights (layer_id ->
++        # w13/w2 plus the GDN target-layer flag) and create a dedicated prefetch
++        # stream outside capture; the is_nextn MTP draft model is not registered
++        # (its layers carry no launch flag, so draft capture never launches prefetch).
 +        if not is_nextn:
 +            moe_prefetch_register_model(self)
 +
      def get_input_embeddings(self):
          return self.embed_tokens
  
-@@ -1320,6 +1669,10 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1320,6 +1704,11 @@ class Qwen3_5ForCausalLM(nn.Module):
                      input_deepstack_embeds[:, sep : sep + self.hidden_size]
                  )
  
-+        # MoE 权重 L2 预取：step 末 drain——主流 join 预取流（capture 合法性 +
-+        # 防跨 step 积压）；未启用/本 pass 未发射时为 no-op。
++        # MoE weight L2 prefetch: drain at step end — the main stream joins the
++        # prefetch stream (capture legality + no cross-step backlog); no-op when
++        # disabled or when this pass launched nothing.
 +        moe_prefetch_step_drain()
 +
          # Return intermediate tensors for pipeline parallelism
@@ -3840,6 +4027,283 @@ index ad98e59283..a5b2cdfd32 100644
          yield
  
      @contextmanager
+diff --git a/test/registered/unit/layers/test_conv_weight_cache_refresh.py b/test/registered/unit/layers/test_conv_weight_cache_refresh.py
+new file mode 100644
+index 0000000000..ed2574df66
+--- /dev/null
++++ b/test/registered/unit/layers/test_conv_weight_cache_refresh.py
+@@ -0,0 +1,109 @@
++"""Regression tests for the GDN conv1d weight cache refresh.
++
++The Ascend GDN backend caches a transposed copy of conv1d.weight on the
++RadixLinearAttention wrapper (AscendGDNAttnBackend._get_conv_weights_t).
++mamba_v2_sharded_weight_loader writes through ``param.data[...] = ...``;
++because ``Tensor.data`` carries a version counter independent of the
++Parameter's, online weight updates (e.g. RL Actor->SGLang sync via
++``update_weights_from_tensor``) are invisible to ``_version``-based
++invalidation. conv1d.weight's loader is therefore wrapped with
++``wrap_conv1d_weight_loader`` to refresh the cached copy explicitly, in
++place, so captured graphs keep referencing the same storage.
++"""
++
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
++
++maybe_stub_sgl_kernel()
++
++from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
++from sglang.srt.layers.radix_linear_attention import wrap_conv1d_weight_loader
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++_CHANNELS = 16  # q(4) + k(4) + v(8) on a single TP rank
++_KERNEL = 4
++
++
++def _make_conv_param() -> torch.nn.Parameter:
++    # conv1d.weight layout: [channels, 1, kernel]
++    return torch.nn.Parameter(
++        torch.randn(_CHANNELS, 1, _KERNEL), requires_grad=False
++    )
++
++
++def _make_base_loader():
++    # Same shard layout as Qwen3_5: q/k shards then the v shard, TP size 1.
++    return mamba_v2_sharded_weight_loader(
++        [(4, 0, False), (4, 0, False), (8, 0, False)], 1, 0
++    )
++
++
++class _FakeAttn:
++    """Stands in for RadixLinearAttention: holds conv_weights and the cache."""
++
++    def __init__(self, conv_param: torch.nn.Parameter):
++        self.conv_weights = conv_param.view(_CHANNELS, _KERNEL)
++        self._conv_weights_t = self.conv_weights.transpose(0, 1).contiguous()
++
++
++class TestConvWeightCacheRefresh(CustomTestCase):
++
++    def test_mamba_loader_write_bypasses_param_version(self):
++        """Root-cause guard: the real loader must not bump ``_version``.
++
++        If a future PyTorch/SGLang change makes param.data writes bump the
++        shared version counter, this test fails and the explicit wrapper may
++        be revisited.
++        """
++        param = _make_conv_param()
++        view = param.view(_CHANNELS, _KERNEL)
++        param_version = param._version
++        view_version = view._version
++
++        _make_base_loader()(param, torch.randn_like(param))
++
++        self.assertEqual(param._version, param_version)
++        self.assertEqual(view._version, view_version)
++
++    def test_wrapped_loader_refreshes_cache_in_place(self):
++        """An online reload must refresh the cached transpose in place."""
++        param = _make_conv_param()
++        attn = _FakeAttn(param)
++        cached = attn._conv_weights_t
++        cached_ptr = cached.data_ptr()
++
++        new_weight = torch.randn_like(param)
++        wrapped = wrap_conv1d_weight_loader(attn, _make_base_loader())
++        wrapped(param, new_weight)
++
++        # The loader actually wrote the new weights.
++        torch.testing.assert_close(param.detach(), new_weight, rtol=0, atol=0)
++        # The cache is refreshed in place: same tensor object, same storage
++        # (captured graphs keep referencing it), content matches the
++        # transpose of the new weights.
++        self.assertIs(attn._conv_weights_t, cached)
++        self.assertEqual(attn._conv_weights_t.data_ptr(), cached_ptr)
++        reference = param.view(_CHANNELS, _KERNEL).transpose(0, 1)
++        torch.testing.assert_close(attn._conv_weights_t, reference, rtol=0, atol=0)
++
++    def test_wrapped_loader_without_cache_is_noop(self):
++        """Initial load (before the first forward) must not create a cache."""
++        param = _make_conv_param()
++        attn = _FakeAttn(param)
++        del attn._conv_weights_t
++
++        new_weight = torch.randn_like(param)
++        wrapped = wrap_conv1d_weight_loader(attn, _make_base_loader())
++        wrapped(param, new_weight)
++
++        self.assertFalse(hasattr(attn, "_conv_weights_t"))
++        torch.testing.assert_close(param.detach(), new_weight, rtol=0, atol=0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/layers/test_sampler_attach_logprobs.py b/test/registered/unit/layers/test_sampler_attach_logprobs.py
+new file mode 100644
+index 0000000000..9dfc930392
+--- /dev/null
++++ b/test/registered/unit/layers/test_sampler_attach_logprobs.py
+@@ -0,0 +1,156 @@
++"""Unit tests for Sampler._attach_logprobs_to_output.
++
++Regression coverage for two bugs in the decode logprob attach path:
++  - iterating ``logits_output.token_ids_logprobs_val`` (a nonexistent field on
++    LogitsProcessorOutput) instead of ``next_token_token_ids_logprobs_val``
++    raised AttributeError for any request with specific token-ID logprobs;
++  - the top-logprob branch ran a full-vocab topk twice (get_top_logprobs plus
++    an immediate re-topk that overwrote the first result).
++
++The method under test does not touch ``self``, so the Sampler is allocated
++with ``__new__`` to skip the distributed-group init in ``__init__``.
++"""
++
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
++
++maybe_stub_sgl_kernel()
++
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.layers.sampler import Sampler
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++_VOCAB = 1000
++
++
++def _make_sampler() -> Sampler:
++    # _attach_logprobs_to_output never reads instance state; bypass __init__
++    # (which requires an initialized torch distributed group).
++    return Sampler.__new__(Sampler)
++
++
++def _attach(
++    logprobs: torch.Tensor,
++    top_logprobs_nums,
++    token_ids_logprobs,
++    batch_next_token_ids: torch.Tensor,
++    logprobs_are_probs: bool = False,
++) -> LogitsProcessorOutput:
++    logits_output = LogitsProcessorOutput(next_token_logits=None)
++    _make_sampler()._attach_logprobs_to_output(
++        logits_output=logits_output,
++        logprobs=logprobs,
++        top_logprobs_nums=top_logprobs_nums,
++        token_ids_logprobs=token_ids_logprobs,
++        sampling_info=None,
++        batch_next_token_ids=batch_next_token_ids,
++        logprobs_are_probs=logprobs_are_probs,
++    )
++    return logits_output
++
++
++class TestAttachTokenIdsLogprobs(CustomTestCase):
++
++    def test_token_ids_logprobs_no_attribute_error(self):
++        """Specific token-ID logprob requests must not raise AttributeError."""
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[[5, 7], [42]],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        self.assertIsNotNone(out.next_token_token_ids_logprobs_val)
++        self.assertIsNotNone(out.next_token_token_ids_logprobs_idx)
++
++    def test_token_ids_logprobs_values(self):
++        logprobs = torch.log_softmax(torch.randn(3, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        requested = [[5, 7], None, [42]]
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0, 0],
++            token_ids_logprobs=requested,
++            batch_next_token_ids=torch.tensor([3, 4, 9], dtype=torch.int32),
++        )
++        vals = out.next_token_token_ids_logprobs_val
++        idxs = out.next_token_token_ids_logprobs_idx
++        self.assertEqual(len(vals), 3)
++        torch.testing.assert_close(
++            vals[0], reference[0, torch.tensor([5, 7])], rtol=0, atol=0
++        )
++        self.assertEqual(idxs[0], [5, 7])
++        # None request yields empty placeholders.
++        self.assertEqual(vals[1], [])
++        self.assertEqual(idxs[1], [])
++        torch.testing.assert_close(
++            vals[2], reference[2, torch.tensor([42])], rtol=0, atol=0
++        )
++        self.assertEqual(idxs[2], [42])
++
++    def test_token_ids_logprobs_probs_input(self):
++        """logprobs_are_probs=True applies log() before clamping, per row."""
++        probs = torch.softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = probs.clone()
++        out = _attach(
++            logprobs=probs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[[1, 2], [3]],
++            batch_next_token_ids=torch.tensor([0, 1], dtype=torch.int32),
++            logprobs_are_probs=True,
++        )
++        torch.testing.assert_close(
++            out.next_token_token_ids_logprobs_val[0],
++            reference[0, torch.tensor([1, 2])].log(),
++            rtol=1e-6,
++            atol=1e-6,
++        )
++
++
++class TestAttachTopLogprobs(CustomTestCase):
++
++    def test_top_logprobs_values(self):
++        """Per-request k slicing stays correct with the single-topk path."""
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[3, 1],
++            token_ids_logprobs=[None, None],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        ref_vals, ref_idx = reference.topk(3, dim=-1)
++        self.assertEqual(len(out.next_token_top_logprobs_val), 2)
++        torch.testing.assert_close(
++            out.next_token_top_logprobs_val[0], ref_vals[0], rtol=0, atol=0
++        )
++        self.assertTrue(torch.equal(out.next_token_top_logprobs_idx[0], ref_idx[0]))
++        torch.testing.assert_close(
++            out.next_token_top_logprobs_val[1], ref_vals[1][:1], rtol=0, atol=0
++        )
++        self.assertTrue(torch.equal(out.next_token_top_logprobs_idx[1], ref_idx[1][:1]))
++
++    def test_next_token_logprobs_gather(self):
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[None, None],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        torch.testing.assert_close(
++            out.next_token_logprobs,
++            torch.stack([reference[0, 3], reference[1, 4]]),
++            rtol=0,
++            atol=0,
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
 -- 
-2.34.1
+2.54.0.windows.1
 

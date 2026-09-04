@@ -12,7 +12,7 @@ set -o pipefail
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 ulimit -n 65535
-
+export MINDSPEED_BRIDGE_GDN_USE_TORCH_CONV=1
 export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-enp23s0f3}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-enp23s0f3}"
 export TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-enp23s0f3}"
