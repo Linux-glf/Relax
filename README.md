@@ -16,13 +16,13 @@
   <a href="https://arxiv.org/abs/2604.11554">
     <img src="https://img.shields.io/static/v1?label=arXiv&message=Paper&color=red" alt="arXiv">
   </a>
-  <a href="https://redai-infra.github.io/Relax">
+  <a href="https://redai-studio.github.io/Relax">
     <img src="https://img.shields.io/badge/docs-latest-brightgreen.svg" alt="Documentation">
   </a>
-  <a href="https://github.com/redai-infra/Relax/discussions/48" target="_blank">
+  <a href="https://github.com/redai-studio/Relax/discussions/48" target="_blank">
     <img src="https://img.shields.io/badge/WeChat-green?logo=wechat" alt="WeChat QR">
   </a>
-  <a href="https://github.com/redai-infra/Relax/discussions/30" target="_blank">
+  <a href="https://github.com/redai-studio/Relax/discussions/30" target="_blank">
     <img src="https://img.shields.io/badge/Docker-Image-blue?logo=docker" alt="Docker Image">
   </a>
 </p>
@@ -34,7 +34,7 @@
 
 ______________________________________________________________________
 
-**Relax** (**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality) is a high-performance reinforcement learning post-training framework open-sourced by the Xiaohongshu AI Infra Team for multimodal large language models. Built on Ray Serve with a service-oriented architecture, Relax uses Megatron-LM as the training backend and SGLang as the inference engine. Through the [TransferQueue](https://github.com/redai-infra/TransferQueue) data transfer system, it achieves complete decoupling of training and inference, supporting end-to-end multimodal RL training from text to images, videos, and audio.
+**Relax** (**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality) is a high-performance reinforcement learning post-training framework open-sourced by the Xiaohongshu AI Infra Team for multimodal large language models. Built on Ray Serve with a service-oriented architecture, Relax uses Megatron-LM as the training backend and SGLang as the inference engine. Through the [TransferQueue](https://github.com/redai-studio/TransferQueue) data transfer system, it achieves complete decoupling of training and inference, supporting end-to-end multimodal RL training from text to images, videos, and audio.
 
 ______________________________________________________________________
 
@@ -129,15 +129,15 @@ The recommended way to run Relax is via the official Docker image, which ships w
 
 ```bash
 # Pull the official image
-docker pull ghcr.io/redai-infra/relaxrl:latest
+docker pull ghcr.io/redai-studio/relaxrl:latest
 
 # Launch a container with GPUs, shared memory, and your workspace mounted
 docker run -it --gpus all --ipc=host --network=host \
   -v /path/to/your/workspace:/root \
-  ghcr.io/redai-infra/relaxrl:latest bash
+  ghcr.io/redai-studio/relaxrl:latest bash
 
 # Inside the container
-git clone https://github.com/redai-infra/Relax.git /root/Relax
+git clone https://github.com/redai-studio/Relax.git /root/Relax
 cd /root/Relax && pip install -e .
 ```
 
@@ -246,7 +246,7 @@ ______________________________________________________________________
 
 ## 📚 Documentation
 
-Full bilingual documentation is available at **[redai-infra.github.io/Relax](https://redai-infra.github.io/Relax)**.
+Full bilingual documentation is available at **[redai-studio.github.io/Relax](https://redai-studio.github.io/Relax)**.
 
 ______________________________________________________________________
 
