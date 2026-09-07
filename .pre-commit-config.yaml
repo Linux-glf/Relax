@@ -26,10 +26,8 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.9
     hooks:
-      - id: ruff
-        # exclude: 'relax/xxx'
-        args: [ --fix ]
-
+      - id: ruff-check
+        args: [--fix]
       - id: ruff-format
   - repo: https://github.com/executablebooks/mdformat
     rev: 0.7.9
