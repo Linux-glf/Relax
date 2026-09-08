@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
-    branches: [main, develop]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -21,12 +21,12 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.10"
 
-      - name: Run pre-commit
-        uses: pre-commit/action@v3.0.1
+      - name: Run prek
+        uses: j178/prek-action@v3.0.0
 
   # ── Unit tests (matrix: Python 3.10 / 3.11 / 3.12) ────────────────────────
   test:
@@ -41,12 +41,12 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements.txt') }}
