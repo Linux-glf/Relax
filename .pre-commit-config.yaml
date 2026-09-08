@@ -57,7 +57,8 @@ repos:
       - id: check-conflict-markers
         name: check-conflict-markers
         entry: python .pre-commit-hooks/check_conflict_markers.py
-        language: system
+        language: python
+        language_version: python3
         types: [text]
         exclude: |
             (?x)^(
@@ -66,7 +67,8 @@ repos:
       - id: format-ascii-boxes
         name: format-ascii-boxes
         entry: python .pre-commit-hooks/format_ascii_boxes.py
-        language: system
+        language: python
+        language_version: python3
         files: \.md$
 
   # Gitleaks - Secret detection
