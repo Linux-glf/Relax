@@ -13,6 +13,7 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 ulimit -n 65535
 export MINDSPEED_BRIDGE_GDN_USE_TORCH_CONV=1
+export MINDSPEED_BRIDGE_GDN_BACKEND=ascendc
 export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-enp23s0f3}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-enp23s0f3}"
 export TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-enp23s0f3}"
@@ -61,10 +62,13 @@ export SGLANG_NPU_MOE_PREFETCH=0
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "${SCRIPT_DIR}/../../entrypoint/local-npu.sh"
+    source "${SCRIPT_DIR}/../../entrypoint/local-npu-multinode.sh"
 fi
+if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
 source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=3000}"
 
@@ -159,7 +163,7 @@ SGLANG_ARGS=(
   --sglang-cuda-graph-bs 4 8 16 24 32 40 48 64 128
   --sglang-device npu
   # --sglang-disable-radix-cache
-  --mamba-scheduler-strategy extra_buffer
+  # --sglang-mamba-scheduler-strategy extra_buffer
   --sglang-chunked-prefill-size 8192
   --sglang-max-prefill-tokens 8192
   --sglang-enable-dp-attention
@@ -206,3 +210,6 @@ mkdir -p log
   "${EVAL_ARGS[@]}" \
   "${SGLANG_ARGS[@]}" \
   "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-35B-MATH-gpu16-sync-${now}.log
+else
+   echo "worker node"
+fi
