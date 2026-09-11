@@ -67,6 +67,8 @@ fi
 
 source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 EXP_DIR="${EXP_DIR:-/root/exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=3000}"
 
