@@ -1,0 +1,294 @@
+From a16195041f14a5eca7e57acea4d8a3ddcc5a280b Mon Sep 17 00:00:00 2001
+From: wuqiwei <wuqiwei4@huawei.com>
+Date: Thu, 10 Sep 2026 17:16:24 +0800
+Subject: [PATCH 1/2] lazypig base line
+
+fix
+---
+ .../features_manager/functional/profile.py    | 32 ++++++++--------
+ .../megatron/megatron_basic.py                | 25 ++++++++++++
+ .../patches/megatron/gdn_packed_seq.py        | 38 +++++++++++++++++--
+ 3 files changed, 75 insertions(+), 20 deletions(-)
+
+diff --git a/megatron_adaptor/features_manager/functional/profile.py b/megatron_adaptor/features_manager/functional/profile.py
+index be998f4..4153c22 100644
+--- a/megatron_adaptor/features_manager/functional/profile.py
++++ b/megatron_adaptor/features_manager/functional/profile.py
+@@ -10,22 +10,22 @@ class ProfileFeature(MindSpeedFeature):
+ 
+     def register_args(self, parser: ArgumentParser):
+         group = parser.add_argument_group(title=self.feature_name)
+-        group.add_argument(
+-            "--profile-level",
+-            type=str,
+-            default='level0',
+-            choices=['level0', 'level1', 'level2'],
+-            help="Profile level default level0.",
+-        )
+-        group.add_argument("--profile-with-cpu", action='store_true', default=False, help="Profile with cpu info.")
+-        group.add_argument("--profile-with-stack", action='store_true', default=False, help="Profile with stack info.")
+-        group.add_argument(
+-            "--profile-with-memory", action='store_true', default=False, help="Profile with memory info."
+-        )
+-        group.add_argument(
+-            "--profile-record-shapes", action='store_true', default=False, help="Profile record shape info."
+-        )
+-        group.add_argument("--profile-save-path", type=str, default='./profile_dir', help="Profile save path.")
++        # group.add_argument(
++        #     "--profile-level",
++        #     type=str,
++        #     default='level0',
++        #     choices=['level0', 'level1', 'level2'],
++        #     help="Profile level default level0.",
++        # )
++        # group.add_argument("--profile-with-cpu", action='store_true', default=False, help="Profile with cpu info.")
++        # group.add_argument("--profile-with-stack", action='store_true', default=False, help="Profile with stack info.")
++        # group.add_argument(
++        #     "--profile-with-memory", action='store_true', default=False, help="Profile with memory info."
++        # )
++        # group.add_argument(
++        #     "--profile-record-shapes", action='store_true', default=False, help="Profile record shape info."
++        # )
++        # group.add_argument("--profile-save-path", type=str, default='./profile_dir', help="Profile save path.")
+ 
+     def register_patches(self, patch_manager, args):
+         from megatron_adaptor.patches.patch_utils import is_megatron_training_available
+diff --git a/megatron_adaptor/features_manager/megatron/megatron_basic.py b/megatron_adaptor/features_manager/megatron/megatron_basic.py
+index 08792f3..8ae97da 100755
+--- a/megatron_adaptor/features_manager/megatron/megatron_basic.py
++++ b/megatron_adaptor/features_manager/megatron/megatron_basic.py
+@@ -27,6 +27,31 @@ class MegatronBasicFeature(MindSpeedFeature):
+         self.register_mcore_basic_patches(patch_manager, args)
+         if not HAVE_FLA:
+             self.register_fla_patches(patch_manager, args)
++        else:
++            # FLA is installed, but its Triton-Ascend causal_conv1d is ~19x
++            # slower than F.conv1d at S=4096 and overflows the Ascend Triton
++            # grid for TP=1 local widths. Megatron 0.18's GatedDeltaNet.forward
++            # calls the module-level name imported from fla.modules.convolution,
++            # so override it even when a real FLA install is present.
++            from megatron_adaptor.patches.megatron.gdn_packed_seq import (
++                _npu_causal_conv1d,
++                _npu_l2norm,
++            )
++
++            patch_manager.register_patch(
++                'fla.modules.convolution.causal_conv1d',
++                _npu_causal_conv1d,
++                create_dummy=True,
++            )
++            # Same override for l2norm: fla's Triton-Ascend kernel (0.19ms) is
++            # ~3x slower than F.normalize (0.072ms) at S=4096; GatedDeltaNet's
++            # _prepare_qkv_for_gated_delta_rule calls the module-level name
++            # imported from fla.modules.l2norm.
++            patch_manager.register_patch(
++                'fla.modules.l2norm.l2norm',
++                _npu_l2norm,
++                create_dummy=True,
++            )
+         if is_megatron_training_available():
+             self.register_non_mcore_basic_patches(patch_manager, args)
+ 
+diff --git a/megatron_adaptor/patches/megatron/gdn_packed_seq.py b/megatron_adaptor/patches/megatron/gdn_packed_seq.py
+index 6573d9c..c0a8d01 100644
+--- a/megatron_adaptor/patches/megatron/gdn_packed_seq.py
++++ b/megatron_adaptor/patches/megatron/gdn_packed_seq.py
+@@ -21,6 +21,16 @@ and never reads the FLA paths.
+ import torch
+ import torch.nn.functional as F
+ 
++# Snapshot of the real FLA causal_conv1d dispatcher, taken at import time —
++# BEFORE the patch manager applies this module's own patch.  The manager's
++# apply_patch walks every loaded module and replaces any attribute whose
++# object identity matches the target, so a late `from fla.modules... import`
++# would resolve to the patched function again and recurse infinitely.
++try:
++    from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d
++except ImportError:  # no real FLA install → nothing to delegate to
++    _fla_causal_conv1d = None
++
+ 
+ def _unpack_sequence_per_seq(x, cu_seqlens, dim):
+     """Split a packed tensor into per-sequence chunks along *dim*."""
+@@ -55,11 +65,17 @@ def _conv1d_impl(x, weight_3d, bias):
+ 
+ 
+ def _npu_causal_conv1d(
+-    x, weight, bias=None, activation=None, initial_state=None, output_final_state=False, cu_seqlens=None
++    x, weight, bias=None, activation=None, initial_state=None, output_final_state=False,
++    cu_seqlens=None, cp_context=None, **kwargs
+ ):
+     """Torch-native ``causal_conv1d`` with FLA-compatible signature.
+ 
+     Dispatch:
++    * ``cp_context is not None`` (chunkwise context parallelism) → delegate
++      to the real FLA implementation: the cross-rank conv-state exchange at
++      chunk boundaries cannot be expressed with plain ``F.conv1d`` and
++      requires the FLA CP-aware kernels.  The fast ``F.conv1d`` path below is
++      left untouched for the non-CP / headwise-CP cases.
+     * ``cu_seqlens is None`` → single ``F.conv1d``
+     * ``cu_seqlens is not None`` → per-sequence unpack → F.conv1d → repack
+ 
+@@ -71,11 +87,25 @@ def _npu_causal_conv1d(
+         initial_state: ignored (no Triton kernel to consume it).
+         output_final_state: always returns ``None``.
+         cu_seqlens: ``[num_seqs + 1]`` cumulative lengths, or ``None``.
++        cp_context: FLA CP context (chunkwise CP), or ``None``.
+ 
+     Returns:
+         ``(y, final_state)`` where *y* is ``[b, s, d]`` and *final_state*
+         is always ``None``.
+     """
++    if cp_context is not None:
++        assert _fla_causal_conv1d is not None, "chunkwise CP requires a real FLA installation"
++        return _fla_causal_conv1d(
++            x,
++            weight,
++            bias=bias,
++            activation=activation,
++            initial_state=initial_state,
++            output_final_state=output_final_state,
++            cu_seqlens=cu_seqlens,
++            cp_context=cp_context,
++        )
++
+     weight_3d = weight.unsqueeze(1)  # [d, w] → [d, 1, w]
+ 
+     if cu_seqlens is None:
+@@ -97,11 +127,11 @@ def _npu_causal_conv1d(
+ 
+ 
+ def _npu_l2norm(x, dim=-1, eps=1e-6):
+-    """Torch-native L2 normalization.
++    """Original torch-native L2 normalization, no fp32 promotion.
+ 
+-    Computes in float32 and casts back to the original dtype.
++    Plain elementwise op on the input dtype: x / sqrt(sum(x^2) + eps).
+     """
+-    return F.normalize(x.float(), p=2, dim=dim, eps=eps).to(x.dtype)
++    return x / torch.sqrt(torch.sum(x * x, dim=dim, keepdim=True) + eps)
+ 
+ 
+ def _npu_chunk_gated_delta_rule(
+-- 
+2.34.1
+
+
+From abc2917df68255e524c98ef95d73c1739e66db8d Mon Sep 17 00:00:00 2001
+From: temp <temp@example.com>
+Date: Thu, 24 Sep 2026 06:27:53 +0000
+Subject: [PATCH 2/2] [feat] fused swiglu and swiglugrad
+
+---
+ megatron_adaptor/features_manager/__init__.py |  2 +
+ .../features_manager/megatron/fused_swiglu.py | 29 +++++++++++++
+ .../patches/megatron/fused_bias_swiglu.py     | 43 +++++++++++++++++++
+ 3 files changed, 74 insertions(+)
+ create mode 100644 megatron_adaptor/features_manager/megatron/fused_swiglu.py
+ create mode 100644 megatron_adaptor/patches/megatron/fused_bias_swiglu.py
+
+diff --git a/megatron_adaptor/features_manager/__init__.py b/megatron_adaptor/features_manager/__init__.py
+index ba22d28..6757b41 100644
+--- a/megatron_adaptor/features_manager/__init__.py
++++ b/megatron_adaptor/features_manager/__init__.py
+@@ -1,4 +1,5 @@
+ from megatron_adaptor.features_manager.features_manager import FeaturesManager
++from megatron_adaptor.features_manager.megatron.fused_swiglu import FusedSwigluFeature
+ from megatron_adaptor.features_manager.megatron.megatron_basic import MegatronBasicFeature
+ from megatron_adaptor.features_manager.requirements.requirements import RequirementsBasicFeature
+ from megatron_adaptor.features_manager.transformer_engine.transformer_engine import TransformerEngineBasicFeature
+@@ -14,6 +15,7 @@ def create_features_list() -> list:
+     return [
+         RequirementsBasicFeature(),
+         MegatronBasicFeature(),
++        FusedSwigluFeature(),
+         TransformerEngineBasicFeature(),
+         NPUDeterministicFeature(),
+         ProfilerDefaultFeature(),
+diff --git a/megatron_adaptor/features_manager/megatron/fused_swiglu.py b/megatron_adaptor/features_manager/megatron/fused_swiglu.py
+new file mode 100644
+index 0000000..be3f52c
+--- /dev/null
++++ b/megatron_adaptor/features_manager/megatron/fused_swiglu.py
+@@ -0,0 +1,29 @@
++# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
++
++from megatron_adaptor.features_manager.mindspeed_feature import MindSpeedFeature
++
++
++class FusedSwigluFeature(MindSpeedFeature):
++    """Route Megatron's SwiGLU activation through the NPU fused kernel.
++
++    Mirrors MindSpeed's ``FusedSwigluFeature``: the feature name and the
++    ``optimization_level=0`` default keep it always-on, so no CLI flag is
++    needed. ``--no-bias-swiglu-fusion`` still falls back to Megatron's
++    unfused activation branch.
++    """
++
++    def __init__(self):
++        super().__init__('use-swiglu', optimization_level=0)
++
++    def register_patches(self, patch_manager, args):
++        from megatron_adaptor.patches.megatron.fused_bias_swiglu import (
++            BiasSwiGLUFunction,
++            SwiGLUFunction,
++        )
++
++        patch_manager.register_patch(
++            'megatron.core.fusions.fused_bias_swiglu.SwiGLUFunction', SwiGLUFunction
++        )
++        patch_manager.register_patch(
++            'megatron.core.fusions.fused_bias_swiglu.BiasSwiGLUFunction', BiasSwiGLUFunction
++        )
+diff --git a/megatron_adaptor/patches/megatron/fused_bias_swiglu.py b/megatron_adaptor/patches/megatron/fused_bias_swiglu.py
+new file mode 100644
+index 0000000..b38f1dd
+--- /dev/null
++++ b/megatron_adaptor/patches/megatron/fused_bias_swiglu.py
+@@ -0,0 +1,43 @@
++# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
++"""NPU kernels replacing Megatron's SwiGLU autograd functions.
++
++Ported from MindSpeed (``mindspeed/core/fusions/fused_bias_swiglu.py``).
++Megatron's reference implementation splits the input with ``torch.chunk`` and
++applies ``F.silu`` in eager mode (``jit_fuser``/``torch.compile`` is disabled
++on NPU), so the two drop-ins below route the same computation through
++``torch_npu.npu_swiglu`` instead.
++
++``FusedSwigluFeature`` registers them on
++``megatron.core.fusions.fused_bias_swiglu.SwiGLUFunction`` and
++``BiasSwiGLUFunction``, which ``bias_swiglu_impl`` resolves from module globals
++at call time, covering the ``--swiglu --bias-activation-fusion`` MLP path.
++
++Both ``apply`` signatures accept Megatron's trailing
++``fp8_input_store``/``cpu_offload_input`` arguments but ignore them: FP8
++activation storage and activation CPU offloading are not applied on this path,
++and backward runs through ``npu_swiglu``'s own autograd rather than the saved
++forward state. ``weighted_bias_swiglu_impl`` (per-token scaling, used by MoE)
++keeps the native implementation.
++"""
++
++import torch_npu
++
++
++def fused_swiglu(x):
++    return torch_npu.npu_swiglu(x, dim=-1)
++
++
++class SwiGLUFunction:
++    """Drop-in for ``megatron.core.fusions.fused_bias_swiglu.SwiGLUFunction``."""
++
++    @staticmethod
++    def apply(x, *args):
++        return fused_swiglu(x)
++
++
++class BiasSwiGLUFunction:
++    """Drop-in for ``megatron.core.fusions.fused_bias_swiglu.BiasSwiGLUFunction``."""
++
++    @staticmethod
++    def apply(x, bias, *args):
++        return fused_swiglu(x + bias)
+-- 
+2.34.1
+

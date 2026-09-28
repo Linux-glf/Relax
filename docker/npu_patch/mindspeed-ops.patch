@@ -1,13 +1,36 @@
+From 952afccfb97074ba4ed1807f46020f0b0e2dfd85 Mon Sep 17 00:00:00 2001
+From: wuqiwei <wuqiwei4@huawei.com>
+Date: Thu, 10 Sep 2026 17:28:17 +0800
+Subject: [PATCH] lazypig baseline
+
+---
+ .../arch32/triton/gdn/chunk_gated_delta_rule_bwd_dhu.py     | 6 +-----
+ 1 file changed, 1 insertion(+), 5 deletions(-)
+
 diff --git a/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_bwd_dhu.py b/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_bwd_dhu.py
-index bf62b0b..1925eca 100644
+index bf62b0b..fed5504 100644
 --- a/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_bwd_dhu.py
 +++ b/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_bwd_dhu.py
-@@ -21,7 +21,7 @@ from mindspeed_ops.api.triton.utils import prepare_chunk_indices, prepare_chunk_
+@@ -7,7 +7,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from mindspeed_ops.api.triton.utils import prepare_chunk_indices, prepare_chunk_offsets, get_autotune_config
++from mindspeed_ops.api.triton.utils import prepare_chunk_indices, prepare_chunk_offsets
+ 
+ 
+ @triton.heuristics(
+@@ -19,10 +19,6 @@ from mindspeed_ops.api.triton.utils import prepare_chunk_indices, prepare_chunk_
+         'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+     }
  )
- @triton.autotune(
-     configs=get_autotune_config(multibuffer_list=(True, False)),
+-@triton.autotune(
+-    configs=get_autotune_config(multibuffer_list=(True, False)),
 -    key=['H', 'K', 'V', 'BT', 'BV', 'USE_G', 'IS_VARLEN'],
-+    key=['H', 'K', 'V', 'BT', 'BV'],
- )
+-)
  @triton.jit(do_not_specialize=['T'])
  def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
+     q,
+-- 
+2.34.1
+

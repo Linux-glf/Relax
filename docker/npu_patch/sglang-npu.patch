@@ -1,3 +1,31 @@
+From 503f90889091d9b96146b7fb1c4c9961fadeefd1 Mon Sep 17 00:00:00 2001
+From: temp <temp@example.com>
+Date: Sat, 12 Sep 2026 07:19:24 +0000
+Subject: [PATCH 1/2] sglang-npu.patch
+
+---
+ python/sglang/srt/entrypoints/http_server.py  |   2 +-
+ .../npu/attention/ascend_gdn_backend.py       |  88 ++++---
+ .../npu/graph_runner/npu_cudagraph_backend.py |  18 +-
+ .../sglang/srt/layers/quantization/unquant.py |   8 +-
+ .../srt/layers/radix_linear_attention.py      |  21 ++
+ python/sglang/srt/layers/sampler.py           | 243 ++++++++++++++++--
+ python/sglang/srt/managers/tp_worker.py       |  30 +++
+ .../sglang/srt/mem_cache/mamba_radix_cache.py |   9 +
+ .../srt/model_executor/forward_batch_info.py  |  25 +-
+ python/sglang/srt/models/qwen2_moe.py         |  36 +--
+ python/sglang/srt/models/qwen3_5.py           |  62 +++--
+ python/sglang/srt/speculative/eagle_utils.py  |  98 ++++---
+ .../srt/speculative/triton_ops/cache_locs.py  |   9 +
+ python/sglang/srt/utils/common.py             |   4 +-
+ .../srt/utils/torch_memory_saver_adapter.py   |   9 +-
+ .../layers/test_conv_weight_cache_refresh.py  | 109 ++++++++
+ .../layers/test_sampler_attach_logprobs.py    | 156 +++++++++++
+ .../unit/mem_cache/test_mamba_unittest.py     |  52 ++++
+ 18 files changed, 836 insertions(+), 143 deletions(-)
+ create mode 100644 test/registered/unit/layers/test_conv_weight_cache_refresh.py
+ create mode 100644 test/registered/unit/layers/test_sampler_attach_logprobs.py
+
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
 index bd9d7eafa1..1740283de2 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
@@ -204,7 +232,7 @@ index 82a3d77f05..25d4c21406 100644
          return
  
 diff --git a/python/sglang/srt/layers/radix_linear_attention.py b/python/sglang/srt/layers/radix_linear_attention.py
-index 6696945..7854f7a 100644
+index 6696945d2c..7854f7a5f3 100644
 --- a/python/sglang/srt/layers/radix_linear_attention.py
 +++ b/python/sglang/srt/layers/radix_linear_attention.py
 @@ -35,6 +35,27 @@ if TYPE_CHECKING:
@@ -236,7 +264,7 @@ index 6696945..7854f7a 100644
      """
      The Linear Attention Layer Implementation.
 diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
-index e83e4157fa..19ed3f244b 100644
+index e83e4157fa..6adf5f7873 100644
 --- a/python/sglang/srt/layers/sampler.py
 +++ b/python/sglang/srt/layers/sampler.py
 @@ -81,6 +81,170 @@ class Sampler(nn.Module):
@@ -488,7 +516,7 @@ index e83e4157fa..19ed3f244b 100644
              return batch_next_token_ids.to(torch.int32)
          else:
              assert (
-@@ -353,9 +532,14 @@ class Sampler(nn.Module):
+@@ -353,16 +532,31 @@ class Sampler(nn.Module):
          token_ids_logprobs: List[List[int]],
          sampling_info: SamplingBatchInfo,
          batch_next_token_ids: torch.Tensor,
@@ -505,7 +533,6 @@ index e83e4157fa..19ed3f244b 100644
  
          # Attach logprobs to logits_output (in-place modification)
          if any(x > 0 for x in top_logprobs_nums):
-@@ -362,7 +546,17 @@ class Sampler(nn.Module):
 -            (
 -                logits_output.next_token_top_logprobs_val,
 -                logits_output.next_token_top_logprobs_idx,
@@ -527,7 +554,7 @@ index e83e4157fa..19ed3f244b 100644
  
          if any(x is not None for x in token_ids_logprobs):
              (
-@@ -372,10 +567,19 @@ class Sampler(nn.Module):
+@@ -372,10 +566,19 @@ class Sampler(nn.Module):
                  logprobs, token_ids_logprobs, no_copy_to_cpu=True
              )
  
@@ -688,7 +715,7 @@ index 031ab4fe87..93e14ff483 100644
                  # 3 * N
                  if (
 diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
-index d5aac381dc..e710d83b05 100644
+index d5aac381dc..487e7157df 100644
 --- a/python/sglang/srt/models/qwen2_moe.py
 +++ b/python/sglang/srt/models/qwen2_moe.py
 @@ -37,6 +37,7 @@ from sglang.srt.distributed import (
@@ -770,7 +797,7 @@ index d5aac381dc..e710d83b05 100644
              config,
              quant_config,
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index fed78cf..11cbadd 100644
+index fed78cf888..11cbaddcc6 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -35,6 +35,7 @@ from sglang.srt.configs.qwen3_5 import (
@@ -1109,7 +1136,7 @@ index ad98e59283..a5b2cdfd32 100644
      @contextmanager
 diff --git a/test/registered/unit/layers/test_conv_weight_cache_refresh.py b/test/registered/unit/layers/test_conv_weight_cache_refresh.py
 new file mode 100644
-index 0000000000..ed2574df66 100644
+index 0000000000..ed2574df66
 --- /dev/null
 +++ b/test/registered/unit/layers/test_conv_weight_cache_refresh.py
 @@ -0,0 +1,109 @@
@@ -1222,72 +1249,9 @@ index 0000000000..ed2574df66 100644
 +
 +if __name__ == "__main__":
 +    unittest.main()
-diff --git a/test/registered/unit/mem_cache/test_mamba_unittest.py b/test/registered/unit/mem_cache/test_mamba_unittest.py
-index 9ad577b42e..390a3721c5 100755
---- a/test/registered/unit/mem_cache/test_mamba_unittest.py
-+++ b/test/registered/unit/mem_cache/test_mamba_unittest.py
-@@ -419,6 +419,58 @@ class TestMamba(unittest.TestCase):
-         self.assertEqual(list(second_insert_events[0].token_ids), [5])
-         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
- 
-+    def test_mamba_radix_cache_limited_partial_page_match_does_not_split(self):
-+        page_size = 64
-+        tree = self._setup_minimal_mamba_radix_cache(page_size)
-+        token_ids = array("q", range(page_size))
-+
-+        tree.insert(
-+            InsertParams(
-+                key=RadixKey(token_ids, None),
-+                value=torch.arange(page_size),
-+                mamba_value=torch.tensor([0]),
-+            )
-+        )
-+
-+        match = tree.match_prefix(
-+            MatchPrefixParams(key=RadixKey(token_ids, None, limit=page_size - 1))
-+        )
-+
-+        self.assertEqual(len(match.device_indices), 0)
-+        self.assertEqual(self._non_root_key_lengths(tree), [page_size])
-+
-+    def _setup_minimal_mamba_radix_cache(self, page_size: int) -> MambaRadixCache:
-+        tree = MambaRadixCache.__new__(MambaRadixCache)
-+        tree.page_size = page_size
-+        tree.mamba_cache_chunk_size = page_size
-+        tree.disable = False
-+        tree.device = torch.device("cpu")
-+        tree.enable_kv_cache_events = False
-+        tree.kv_event_queue = []
-+        tree.full_evictable_size_ = 0
-+        tree.mamba_evictable_size_ = 0
-+        tree.full_protected_size_ = 0
-+        tree.mamba_protected_size_ = 0
-+
-+        tree.root_node = TreeNode()
-+        tree.root_node.key = RadixKey(array("q"), None)
-+        tree.root_node.value = []
-+        tree.root_node.hash_value = []
-+        tree.root_node.full_lock_ref = 1
-+        tree.root_node.mamba_lock_ref = 1
-+        tree.full_lru_list = LRUList(mamba=False)
-+        tree.mamba_lru_list = LRUList(mamba=True)
-+        return tree
-+
-+    def _non_root_key_lengths(self, tree: MambaRadixCache) -> list[int]:
-+        lengths = []
-+        stack = list(tree.root_node.children.values())
-+        while stack:
-+            node = stack.pop()
-+            lengths.append(len(node.key))
-+            stack.extend(node.children.values())
-+        return lengths
-+
-     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
-         """Helper to create a MambaRadixCache with allocator for testing."""
-         server_args = ServerArgs(model_path="dummy", page_size=1)
 diff --git a/test/registered/unit/layers/test_sampler_attach_logprobs.py b/test/registered/unit/layers/test_sampler_attach_logprobs.py
 new file mode 100644
-index 0000000000..9dfc930392 100644
+index 0000000000..9dfc930392
 --- /dev/null
 +++ b/test/registered/unit/layers/test_sampler_attach_logprobs.py
 @@ -0,0 +1,156 @@
@@ -1447,3 +1411,95 @@ index 0000000000..9dfc930392 100644
 +
 +if __name__ == "__main__":
 +    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_mamba_unittest.py b/test/registered/unit/mem_cache/test_mamba_unittest.py
+index 9ad577b42e..390a3721c5 100755
+--- a/test/registered/unit/mem_cache/test_mamba_unittest.py
++++ b/test/registered/unit/mem_cache/test_mamba_unittest.py
+@@ -419,6 +419,58 @@ class TestMamba(unittest.TestCase):
+         self.assertEqual(list(second_insert_events[0].token_ids), [5])
+         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
+ 
++    def test_mamba_radix_cache_limited_partial_page_match_does_not_split(self):
++        page_size = 64
++        tree = self._setup_minimal_mamba_radix_cache(page_size)
++        token_ids = array("q", range(page_size))
++
++        tree.insert(
++            InsertParams(
++                key=RadixKey(token_ids, None),
++                value=torch.arange(page_size),
++                mamba_value=torch.tensor([0]),
++            )
++        )
++
++        match = tree.match_prefix(
++            MatchPrefixParams(key=RadixKey(token_ids, None, limit=page_size - 1))
++        )
++
++        self.assertEqual(len(match.device_indices), 0)
++        self.assertEqual(self._non_root_key_lengths(tree), [page_size])
++
++    def _setup_minimal_mamba_radix_cache(self, page_size: int) -> MambaRadixCache:
++        tree = MambaRadixCache.__new__(MambaRadixCache)
++        tree.page_size = page_size
++        tree.mamba_cache_chunk_size = page_size
++        tree.disable = False
++        tree.device = torch.device("cpu")
++        tree.enable_kv_cache_events = False
++        tree.kv_event_queue = []
++        tree.full_evictable_size_ = 0
++        tree.mamba_evictable_size_ = 0
++        tree.full_protected_size_ = 0
++        tree.mamba_protected_size_ = 0
++
++        tree.root_node = TreeNode()
++        tree.root_node.key = RadixKey(array("q"), None)
++        tree.root_node.value = []
++        tree.root_node.hash_value = []
++        tree.root_node.full_lock_ref = 1
++        tree.root_node.mamba_lock_ref = 1
++        tree.full_lru_list = LRUList(mamba=False)
++        tree.mamba_lru_list = LRUList(mamba=True)
++        return tree
++
++    def _non_root_key_lengths(self, tree: MambaRadixCache) -> list[int]:
++        lengths = []
++        stack = list(tree.root_node.children.values())
++        while stack:
++            node = stack.pop()
++            lengths.append(len(node.key))
++            stack.extend(node.children.values())
++        return lengths
++
+     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
+         """Helper to create a MambaRadixCache with allocator for testing."""
+         server_args = ServerArgs(model_path="dummy", page_size=1)
+-- 
+2.34.1
+
+
+From ac51fdf6388271e698f44135f7598cde795c382a Mon Sep 17 00:00:00 2001
+From: temp <temp@example.com>
+Date: Thu, 24 Sep 2026 06:31:19 +0000
+Subject: [PATCH 2/2] [feat][npu] fix empty_cache
+
+---
+ python/sglang/srt/managers/scheduler.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index bfdd72bd54..5f3840e359 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3740,7 +3740,7 @@ class Scheduler(
+                 self.draft_worker.clear_cache_pool()
+ 
+             if empty_cache:
+-                current_platform.empty_cache()
++                torch.npu.empty_cache()
+             # Per-DP-group leader logs once: ranks within a DP group are
+             # state-synchronous, but DP groups may diverge.
+             if self.metrics_reporter.is_stats_logging_rank:
+-- 
+2.34.1
+
