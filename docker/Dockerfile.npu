@@ -152,6 +152,7 @@ RUN cd /root/Megatron-Bridge && \
     git add . && git commit -m "base line" && \
     cd /root/MindSpeed-Bridge && \
     patch -p1 < /root/Relax/docker/npu_patch/mindspeed-bridge.patch && \
+    patch -p1 < /root/Relax/docker/npu_patch/mindspeed-bridge-qwen4-exp.patch && \
     git add . && git commit -m "base line" && \
     cd /root/MindSpeed-Ops && \
     patch -p1 < /root/Relax/docker/npu_patch/mindspeed-ops.patch && \
