@@ -6859,10 +6859,10 @@ index 0000000..28f2f1b
 +]
 diff --git a/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/qsa/kernels/qsa_block_sparse_attn.py b/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/qsa/kernels/qsa_block_sparse_attn.py
 new file mode 100644
-index 0000000..09cb464
+index 0000000..5191555
 --- /dev/null
 +++ b/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/qsa/kernels/qsa_block_sparse_attn.py
-@@ -0,0 +1,811 @@
+@@ -0,0 +1,824 @@
 +# Copyright (c) 2026, HUAWEI CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0.
@@ -6945,6 +6945,17 @@ index 0000000..09cb464
 +_FWD_CACHE = deque(maxlen=32)
 +_WARNED_MISMATCH = False
 +_CALL_MODE = 0  # 0 = plain call, 1 = checkpointed first pass (stash), 2 = replay (reuse)
++
++
++def _cp_world_size() -> int:
++    """Context-parallel world size, or 1 outside a Megatron run."""
++    try:
++        from megatron.core import parallel_state
++    except ImportError:
++        return 1
++    return (
++        parallel_state.get_context_parallel_world_size() if parallel_state.model_parallel_is_initialized() else 1
++    )
 +
 +
 +def _in_checkpointed_block() -> bool:
@@ -7497,11 +7508,13 @@ index 0000000..09cb464
 +        cached = _take_cached(qc, selc) if mode == 2 else None
 +        klist = kcnt = None
 +        if cached is None:
-+            BQ_, BK_ = 64, 64
-+            klist, kcnt = build_tile_index(selc, BQ_, BK_, block_size)
++            # Under CP the queries are run over the gathered full sequence, and the
++            # 64x64 tile overflows the AI-core UB (bishengir: 1,918,976 bits required
++            # against 1,572,864 available). 32x32 fits; CP=1 keeps the larger tile.
++            BQ, BK = (32, 32) if _cp_world_size() > 1 else (64, 64)
++            klist, kcnt = build_tile_index(selc, BQ, BK, block_size)
 +            o = torch.empty(T, Hq, D, device=q.device, dtype=torch.float32)
 +            lse = torch.empty(Hq, T, device=q.device, dtype=torch.float32)
-+            BQ, BK = 64, 64
 +            grid = (triton.cdiv(T, BQ), Hq)
 +            _qsa_bs_fwd_kernel[grid](
 +                qc,
