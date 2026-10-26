@@ -7,20 +7,17 @@
 # **The n-gram table is the released one and stays frozen**: it is the model's
 # PLE weight, host-pinned, never a parameter and never in the optimizer.
 #
-# This is the NPU counterpart of the reference 64xH800 full-48L script, and it
-# is deliberately aligned to it in every knob that is *not* the model, the
-# dataset or the parallel decomposition -- same batch shape (32K packed, mbs 1),
-# same MTP head and scaling factor, same optimizer hyper-parameters, same freeze
-# set, same recompute and logits-chunking policy. What differs, and why:
+# This is the NPU counterpart of the reference 64xH800 full-48L script. The
+# numerically relevant knobs are aligned to it -- GBS 32, 32K packed, mbs 1,
+# MTP 1 layer at scaling 0.1 with no detach, the same optimizer hyper-parameters,
+# the same freeze set, and the same recompute/logits chunking. What differs:
 #
-#   tensor-model-parallel-size   8 -> 4   --num-query-groups 2 has to divide TP;
-#                                         TP=4 keeps 6 of the 12 q heads per rank
-#                                         (attention.py:355-372). See "TP, and why 4"
-#   pipeline-model-parallel-size 8 -> 1   64 dies over 4 nodes; PP=1 is the only
-#                                         decomposition with no bubble and no
-#                                         pipeline layout to keep in sync
-#   expert-model-parallel-size   8 -> 32  world = TP x CP x PP x DP = 64 with
-#                                         DP = 16, and EP x EDP tiles DP
+#   tensor-model-parallel-size   8      same as the reference
+#   pipeline-model-parallel-size 8 -> 1 64 dies over 4 nodes; PP=1 avoids the
+#                                       pipeline bubble and the layout string
+#   expert-model-parallel-size   8 -> 64 the expert grid owns its own axis:
+#                                       ET1 x EP64 x PP1 = 64, EDP=1; eight
+#                                       local experts per rank
 #   moe-token-dispatcher-type    flex -> alltoall
 #   moe-flex-dispatcher-backend  deepep   dropped, needs NVSHMEM/DeepEP
 #   the RELAX_QWEN38_QSA_* env block      dropped, no NPU counterpart exists
@@ -49,23 +46,22 @@
 #
 # ── The decomposition, and the two budgets it is chosen against ─────────────
 #
-#   world 64 = TP 4 x CP 1 x PP 1 x DP 16,  DP 16 = EP 32 x EDP 2 (ET=1)
+#   dense world 64 = TP 8 x CP 1 x PP 1 x DP 8
+#   expert grid    = ET 1 x EP 64 x PP 1 = 64, EDP = 1
 #
 # Device memory per die (bf16 params, fp32 gradients -- see
 # --accumulate-allreduce-grads-in-fp32 below; the optimizer state is on the
 # host, see --optimizer-cpu-offload):
 #
-#   experts     120.796e9 / (EP x PP)  = 3.775e9 el  ->  7.03 GiB params
-#                                                    -> 14.06 GiB grads @4 B
-#   dense         8.004e9 / (TP x PP)  = 2.001e9 el  ->  3.73 GiB params
-#   dense grads   7.535e9 trainable / TP             ->  7.02 GiB
+#   experts     120.796e9 / (EP 64 x PP 1) = 1.887e9 el -> 3.52 GiB params
+#                                                       -> 7.03 GiB grads @4 B
+#   dense         8.004e9 / (TP 8 x PP 1)  = 1.000e9 el -> 1.86 GiB params
+#   dense grads   7.535e9 trainable / TP 8              -> 3.51 GiB
 #   activations  48 layers x 32K tokens x 2560 x 2 B under full recompute
-#                                                    ->  8.05 GiB (167.8 MB per
-#                                                       checkpointed layer)
-#   workspace    MoE permute/a2a buffers, the chunked logits (2048 x 248320 x
-#                4 B = 1.9 GiB) and the fixed communication buffers
-#                                                    -> ~6 GiB, measured at 4L
-#   ── 31.8 + 8.1 + 6 = ~46 GiB of the 61 GiB a die reports, ~15 GiB of headroom
+#                                                       -> 8.05 GiB
+#   workspace    MoE permute/a2a buffers, chunked logits, comm buffers
+#                                                       -> ~6 GiB
+#   ── 15.9 + 8.1 + 6 = ~30 GiB of the 61 GiB a die reports, ~31 GiB headroom
 #
 # The parameter counts are the checkpoint's own safetensors headers, summed by
 # name over its 131 files: 180.000e9 bf16 elements = 335.3 GiB, of which experts
@@ -81,31 +77,30 @@
 #
 # Host memory per node (~1.88 TiB usable):
 #
-#   pinned n-gram table  next_pow2(102.4e9 B / TP) x 16 ranks
-#                      = next_pow2(25.6 GB) x 16 = 32 GiB x 16 = 512 GiB
-#   optimizer state      12 B x 128.331e9 trainable / 64 ranks = 22.4 GiB/rank
-#                      = 358 GiB per node at 16 ranks
-#   ── ~0.85 TiB of 1.88 TiB
+#   pinned n-gram table  next_pow2(102.4e9 B / TP 8) x 16 ranks
+#                      = next_pow2(12.8 GB) x 16 = 16 GiB x 16 = 256 GiB
+#   optimizer state      dense 7.535e9 / DP 8 + experts 120.796e9 / EP 64 / EDP 1
+#                      = 10.5 + 21.1 = 31.6 GiB/rank = 506 GiB per node
+#   ── ~0.75 TiB of 1.88 TiB (the sharding above is the assumption; measure
+#      free -g at step 0)
 #
 # Both figures are load-bearing and both have a measured basis: on Ascend a
 # pinned allocation is charged as next_power_of_two(payload) and is invisible to
 # /proc, RSS and the cgroup (measured on this node: a 95.37 GiB table -> 129.93
 # GiB charged), and the 16-die 8L runs of this same model already ran with 1 TiB
-# of pinned table plus ~0.5 TiB of host optimizer state on one node. TP=2 (the 8L
-# setting) would double the table to 64 GiB/rank = 1 TiB/node here; TP=4 is what
-# buys the headroom, and TP=8 would halve it again at 4x the redundant qkv work.
-# TP, and why 4:
+# of pinned table plus ~0.5 TiB of host optimizer state on one node. TP=8 halves
+# the pinned table to 256 GiB/node versus TP=4's 512 GiB.
 #
-#   TP=4 with --num-query-groups 2 takes the `num_query_groups < world_size`
-#   branch of attention.py:357-364: every rank computes 12 q heads and keeps
-#   `num_attention_heads / tp_size` = 6 of them, the other 6 being computed and
-#   thrown away. That is the price of TP=4, and it is bounded: only 12 of the 48
-#   layers are full attention, so the redundant q-projection is
-#   12 layers x 2560 x 6144 = 189M MACs per token against a per-token total
-#   dominated by the MoE block's 48 x topk10 x 3 x 2560 x 640 = 2.6G -- a few
-#   percent. In exchange the pinned table halves (1 TiB -> 512 GiB per node),
-#   the dense params/grads halve, and each of the 16 DP ranks carries 4 samples
-#   per step at gbs 64 instead of 2.
+# TP, and why 8:
+#
+#   TP=8 halves the dense params/grads and the pinned table relative to TP=4.
+#   With --num-query-groups 2 the attention takes the
+#   `num_query_groups < world_size` branch (attention.py:357-364): each rank
+#   keeps `num_attention_heads / tp_size` = 3 of the 12 full-attention q heads,
+#   so the redundant q-projection work grows with TP. It is bounded -- only 12
+#   of the 48 layers are full attention, and the per-token total is dominated by
+#   the MoE block (48 x topk10 x 3 x 2560 x 640 = 2.6G MACs).
+
 
 set -ex
 set -o pipefail
@@ -117,7 +112,7 @@ echo "当前时间: $now"
 # local-npu-multinode.sh sets none of these, and its Ray head inherits whatever
 # is exported here, so they must come before the source below.
 export ASCEND_COREDUMP_SIGNAL=none
-# 64 dies over 4 nodes: world size = TP * CP * PP * DP = 4 * 1 * 1 * 16. Each
+# 64 dies over 4 nodes: dense world = TP * CP * PP * DP = 8 * 1 * 1 * 8. Each
 # node contributes its own 16 dies; this list is per-node, not per-cluster.
 export ASCEND_RT_VISIBLE_DEVICES="${NPU_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_HOST_SOCKET_PORT_RANGE:-63000-63150}"
@@ -159,6 +154,9 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-npu-multinode.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen38-flash-next-48L.sh"
+# The reference selects global_aux_loss for the router. --moe-aux-loss-coeff is
+# 0 in the model config, so this only names the (disabled) auxiliary term.
+MODEL_ARGS+=(--moe-router-load-balancing-type global_aux_loss)
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/sft/pokemon}"
 EXP_NAME="${EXP_NAME:-qwen38-flash-next-48L-mtp-sft-pokemon-npu64}"
@@ -192,7 +190,11 @@ TRAIN_FILES=()
 for lang in ${TRAIN_LANGS:-en zh}; do
     TRAIN_FILES+=("'${DATA_DIR}/sft/data/pokemon-gpt4o-captions/pokemon_gpt4o_${lang}.parquet'")
 done
-PROMPT_DATA="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
+DEFAULT_PROMPT_DATA="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
+# Override to point at the reference's `train_le32k.jsonl` (and set
+# INPUT_KEY=messages) when running the same corpus as the GPU recipe.
+PROMPT_DATA="${PROMPT_DATA:-${DEFAULT_PROMPT_DATA}}"
+INPUT_KEY="${INPUT_KEY:-conversations}"
 SAVE_DIR="${SAVE_DIR:-${EXP_DIR}/qwen38-flash-next-48L-sft}"
 
 CKPT_ARGS=(
@@ -200,20 +202,23 @@ CKPT_ARGS=(
    --ref-load ${MODEL_DIR}/${CKPT_NAME}
    --megatron-to-hf-mode bridge
    --save ${SAVE_DIR}/sft/${EXP_NAME}
-   # --load ${SAVE_DIR}/sft/${EXP_NAME}
    --save-interval 100
    --max-actor-ckpt-to-keep 1
-   # NUM_EPOCH scales with gbs: the corpus is 1666 rows, so one epoch is 26
-   # optimizer steps at gbs=64 and 104 at gbs=16. The default keeps NUM_ROLLOUT
-   # (20) inside a single pass.
-   --num-epoch ${NUM_EPOCH:-1}
-   --num-rollout ${NUM_ROLLOUT:-20}
+   # 1000 optimizer steps matches the reference's NUM_STEPS default. Set
+   # NUM_ROLLOUT for a shorter run; at gbs=32 the pokemon corpus is 52 steps
+   # per epoch, so this is ~19 passes.
+   --num-rollout ${NUM_ROLLOUT:-1000}
    # Model weights only: the full checkpoint (with the Adam moments) is huge for
    # this model, and the shared volume ${EXP_DIR} sits on runs at 100% -- the run
    # saves the weights and exports them to HF instead. Drop this flag to get a
    # resumable checkpoint back.
    --no-save-optim
 )
+# The reference resumes from a previous run unconditionally; keep that
+# capability opt-in so a fresh 64-die run does not fail on a missing directory.
+if [ -n "${LOAD_FROM:-}" ]; then
+   CKPT_ARGS+=(--load "${LOAD_FROM}")
+fi
 # The HF export rewrites the whole 336 GB checkpoint, ~102 GB of which is the
 # hashed n-gram table, so the baseline run skips it. SAVE_HF=1 turns it back on
 # (and needs ~240 GB free wherever ${SAVE_DIR} lives).
@@ -224,12 +229,10 @@ fi
 SFT_ARGS=(
    --loss-type sft
    --prompt-data "${PROMPT_DATA}"
-   # Dataset mapping, deliberately NOT aligned to the reference (it reads a
-   # `messages` JSONL and applies a chat template; this corpus is already
-   # tokenised conversations in parquet).
-   --input-key conversations
+   # The default corpus is already-tokenised conversations; set INPUT_KEY=messages
+   # to read the reference's chat-template JSONL instead.
+   --input-key "${INPUT_KEY}"
    --multimodal-keys '{"image":"images"}'
-   --conversation-key-map '{"from":"role","value":"content","human":"user","gpt":"assistant"}'
    # -- from here down every knob is aligned to the reference script --
    --image-max-token-num 128
    --sft-invalid-multimodal-strategy skip
@@ -242,12 +245,10 @@ SFT_ARGS=(
    # longest real sample, 9457 tokens) lets the token-budget packer split the
    # batch into gradient-accumulation micro-batches again.
    --rollout-max-context-len ${ROLLOUT_MAX_CONTEXT_LEN:-32768}
-   # gbs 64 over DP 16 = 4 samples per rank per step, ~38K tokens, which the
-   # packer splits into two ~19K-token micro-batches at --max-tokens-per-gpu
-   # 32768. The reference's gbs 32 would be 2 samples per rank here: enough to
-   # be correct, too little to amortize a step's collectives over (the 8L
-   # profile is 63% communication).
-   --global-batch-size ${GLOBAL_BATCH_SIZE:-64}
+   # gbs 32 over dense DP 8 = 4 samples per rank per step, ~38K tokens, which
+   # the packer splits into two ~19K-token micro-batches at
+   # --max-tokens-per-gpu 32768. This matches the reference GBS.
+   --global-batch-size ${GLOBAL_BATCH_SIZE:-32}
    --micro-batch-size 1
    --seq-length 32768
    # SFT requires dynamic batching (relax/utils/arguments.py rejects
@@ -268,6 +269,11 @@ SFT_ARGS=(
 # --sft-prefetch-buffer-size has no counterpart in the reference and is kept
 # from the 4L recipe: dropping it changes only prefetch depth, not the data.
 SFT_ARGS+=(--sft-prefetch-buffer-size ${SFT_PREFETCH_BUFFER_SIZE:-512})
+if [ "${INPUT_KEY}" = "conversations" ]; then
+   SFT_ARGS+=(--conversation-key-map '{"from":"role","value":"content","human":"user","gpt":"assistant"}')
+else
+   SFT_ARGS+=(--apply-chat-template --apply-chat-template-kwargs '{"add_generation_prompt":false}')
+fi
 
 # MTP aligned to the reference: 1 layer, scaling factor 0.1, detach path
 # `none`. The CP == 1 text/bridge layout it needs is handled on the plugin
@@ -310,15 +316,14 @@ else
 fi
 
 PERF_ARGS=(
-   # TP * CP * PP * DP = 4 * 1 * 1 * 16 = 64 dies, with DP = EP * EDP = 32 * 2.
-   # The expert grid tiles the world on its own axis (--expert-tensor-parallel-
-   # size 1), so EP=32 is 16 local experts per rank and the a2a spans the four
-   # nodes; the 128-weight ceiling of aclnnGroupedMatmulV5 (which is what caps
-   # EP at 4 with 512 experts) is nowhere near binding here.
-   --tensor-model-parallel-size ${TP_SIZE:-4}
+   # Dense world = TP 8 x CP 1 x PP 1 x DP 8 = 64 dies; the expert grid is
+   # ET 1 x EP 64 x PP 1 = 64 with EDP=1. Each rank holds 512/64 = 8 experts
+   # and the a2a spans all four nodes; the 128-weight ceiling of
+   # aclnnGroupedMatmulV5 is nowhere near binding with 8 local experts.
+   --tensor-model-parallel-size ${TP_SIZE:-8}
    --pipeline-model-parallel-size ${PP_SIZE:-1}
    --context-parallel-size ${CP_SIZE:-1}
-   --expert-model-parallel-size ${EP_SIZE:-32}
+   --expert-model-parallel-size ${EP_SIZE:-64}
    --expert-tensor-parallel-size 1
 
    # One pipeline stage over 48 decoder layers: E + t*48 + m + L. The `|` and
@@ -349,9 +354,6 @@ PERF_ARGS=(
 
 
    --no-store-param-remainders
-   --no-gradient-accumulation-fusion
-
-   --cross-entropy-loss-fusion
    --sft-chunked-logits
    --sft-logits-chunk-size ${SFT_LOGITS_CHUNK_SIZE:-2048}
 
@@ -386,14 +388,14 @@ OPTIMIZER_ARGS=(
 # of the Free 11.4 s that the same trace's step_trace_time.csv reports (the
 # device is idle 68% of that step). At full depth this loop is NOT 12x the 4L
 # one: the Adam call granularity follows the bucket size, and the per-rank
-# optimizer state only grows 5.336e9/4 -> 128.331e9/64 = 1.33e9 -> 2.01e9
-# elements (1.5x), so 5-12 s per step is the range to check against, not minutes.
+# optimizer state grows 5.336e9/4 -> ~2.8e9 elements (about 2.1x), so 5-12 s
+# per step is the range to check against, not minutes.
 #
-# What is not optional is the offload itself: 128.33e9 trainable parameters x
-# 12 B = 1.4 TiB of fp32 master/m/v, which no 64-die layout can hold on device
-# (12 B x 128.33e9 / 64 ranks = 24 GB per rank, on top of the ~32 GiB of params
-# and grads). OPTIMIZER_CPU_OFFLOAD=0 is kept as a knob for diagnosing the host
-# loop, not as a configuration that fits.
+# What is not optional is the offload itself: the dense and expert masters do
+# not fit on device next to the ~16 GiB of params and grads this TP8/EP64 layout
+# already holds (dense 7.535e9 / DP 8 + experts 120.796e9 / EP 64 / EDP 1 at
+# 12 B per element is ~34 GB/rank). OPTIMIZER_CPU_OFFLOAD=0 is kept as a knob
+# for diagnosing the host loop, not as a configuration that fits.
 if [ "${OPTIMIZER_CPU_OFFLOAD:-1}" != "0" ]; then
    OPTIMIZER_ARGS+=(
       --optimizer-cpu-offload
@@ -424,7 +426,7 @@ fi
 # with it OFF, of which 3.66 s is step 10 alone). Re-run the pair here before
 # trusting either number; at 64 dies across four nodes the latency term is
 # larger, not smaller.
-if [ "${OVERLAP_COMM:-1}" != "0" ]; then
+if [ "${OVERLAP_COMM:-0}" != "0" ]; then
    OPTIMIZER_ARGS+=(
       --overlap-grad-reduce
       --overlap-param-gather
@@ -436,8 +438,8 @@ fi
 # profile of step 3-5 measures 60 of those gathers per step, of which 8 cost
 # >=100 ms and own 96% of that operator's 27.2 s, so SEQUENCE_PARALLEL=0 is the
 # one lever that removes collectives rather than reordering them. Per rank, the
-# all-gather volume is T x (TP-1)/TP x hidden x 2 B, so TP=4 pays 1.5x what TP=2
-# pays for the same token count -- the first A/B this script deserves.
+# all-gather volume is T x (TP-1)/TP x hidden x 2 B, so TP=8 pays 1.75x what
+# TP=2 pays (1.17x what TP=4 pays) for the same token count.
 # Activations are replicated across TP instead of sharded, which full recompute
 # bounds; the arithmetic is unchanged either way.
 if [ "${SEQUENCE_PARALLEL:-1}" != "0" ]; then
@@ -461,8 +463,10 @@ fi
 #   host-pinned and never a nn.Parameter (modelling_qwen4_exp/ple.py), so it is
 #   absent from the optimizer and from the DCP checkpoint. That is exactly what
 #   this script wants -- the released 95.37 GiB table is not trainable at any
-#   legal TP: at TP=4 its row shard is 25.6 GB of parameters and 4 bytes per
-#   element of grad on top, which is a die's entire budget.
+#   legal TP: at TP=8 its row shard is 12.8 GB of parameters and 4 bytes per
+#   element of grad on top. The six PLE projections around the table are named
+#   `ple.*` and are frozen by the `ple.` pattern, which matches the reference's
+#   `per_layer_embedding` freeze.
 #
 # `--freeze-params-name-list` is nargs="*" (relax/utils/arguments.py:553-571), so it
 # takes a *list* of independent re.search patterns. That is what lets this script
@@ -472,10 +476,10 @@ fi
 # `'(^|\.)visual\.|self_attention\.indexer\.'`, died with
 # `/bin/sh: 1: Syntax error: "(" unexpected`; backslash-escaping is not a way out
 # either, because dash eats the backslash in `\.` (verified through job submission).
-# Two plain-substring patterns carry no metacharacters at all and select exactly
-# the same tensors.
+# Three plain-substring patterns carry no shell metacharacters and select exactly
+# the same tensors; `ple.` is a plain regex dot, not an escaped one.
 TRAINABLE_ARGS=(
-   --freeze-params-name-list visual indexer
+   --freeze-params-name-list visual indexer ple.
 )
 
 WANDB_ARGS=(
@@ -522,12 +526,16 @@ MISC_ARGS=(
    #
    # Measured on the 8L recipe (16 dies, TP2/PP1/EP8, gbs 192): 4 calls per rank
    # per step, 98 ms each, 0.39 s/step per rank, worst single call 1.82 s.
-   --no-check-for-nan-in-loss-and-grad
+   # The reference leaves the check on, so it is opt-in here: NO_CHECK_NAN=1
+   # restores the measured NPU speedup.
    # --use-flash-attn is deliberately absent: it is a dead no-op (zero reads of
    # `use_flash_attn` in megatron/), the reference does not pass it either, and
    # `--attention-backend flash` is the knob that actually selects the kernel.
    --use-health-check
 )
+if [ "${NO_CHECK_NAN:-0}" != "0" ]; then
+   MISC_ARGS+=(--no-check-for-nan-in-loss-and-grad)
+fi
 
 # Off by default. PROFILE_STEPS="<first>,<last>" (inclusive, 0-based rollout ids)
 # records the training loop with torch.profiler, one `<...>_ascend_pt` dir per
@@ -566,8 +574,8 @@ mkdir -p log
 # The placement group has to ask for exactly as many actor dies as there are
 # visible dies on the four nodes, and the SFT batcher keeps one storage unit per
 # die. The two are easy to let drift: a 64-die cluster with a hardcoded 16 trains
-# a TP4/EP32/DP4 world while every flag still looks right -- the only clue is
-# `using world size: 16, data-parallel size: 4` in the log. The node count is
+# a TP8/EP64/DP8 world while every flag still looks right -- the only clue is
+# `using world size: 64, data-parallel size: 8` in the log. The node count is
 # read from the same place the entrypoint read it, WORLD_SIZE.
 NPU_COUNT="$(awk -F, '{print NF}' <<< "${ASCEND_RT_VISIBLE_DEVICES}")"
 NODE_COUNT="${WORLD_SIZE:-1}"
