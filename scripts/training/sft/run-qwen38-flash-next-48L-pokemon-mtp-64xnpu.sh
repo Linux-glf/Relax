@@ -18,6 +18,12 @@
 #   expert-model-parallel-size   8 -> 64 the expert grid owns its own axis:
 #                                       ET1 x EP64 x PP1 = 64, EDP=1; eight
 #                                       local experts per rank
+#   context-parallel-size       1 -> 8  keeps EP64 while making dense DP=1.
+#                                       EP64 fixes PP=1, and the 24 attention
+#                                       heads cap TP at 8, so 64 = TP8 x CP8.
+#                                       The MTP mean-of-means then averages
+#                                       ~7 micro-batches, the reference's DP1
+#                                       grouping, instead of one per DP rank.
 #   moe-token-dispatcher-type    flex -> alltoall
 #   moe-flex-dispatcher-backend  deepep   dropped, needs NVSHMEM/DeepEP
 #   the RELAX_QWEN38_QSA_* env block      dropped, no NPU counterpart exists
@@ -46,7 +52,7 @@
 #
 # ── The decomposition, and the two budgets it is chosen against ─────────────
 #
-#   dense world 64 = TP 8 x CP 1 x PP 1 x DP 8
+#   dense world 64 = TP 8 x CP 8 x PP 1 x DP 1
 #   expert grid    = ET 1 x EP 64 x PP 1 = 64, EDP = 1
 #
 # Device memory per die (bf16 params, fp32 gradients -- see
@@ -58,6 +64,9 @@
 #   dense         8.004e9 / (TP 8 x PP 1)  = 1.000e9 el -> 1.86 GiB params
 #   dense grads   7.535e9 trainable / TP 8              -> 3.51 GiB
 #   activations  48 layers x 32K tokens x 2560 x 2 B under full recompute
+#                (CP8 shards the backbone sequence 1/8, but the QSA and PLE
+#                 CP paths still materialize the full 32K sequence per rank,
+#                 so keep the old DP8-layout figure as the conservative bound)
 #                                                       -> 8.05 GiB
 #   workspace    MoE permute/a2a buffers, chunked logits, comm buffers
 #                                                       -> ~6 GiB
@@ -79,8 +88,12 @@
 #
 #   pinned n-gram table  next_pow2(102.4e9 B / TP 8) x 16 ranks
 #                      = next_pow2(12.8 GB) x 16 = 16 GiB x 16 = 256 GiB
-#   optimizer state      dense 7.535e9 / DP 8 + experts 120.796e9 / EP 64 / EDP 1
+#   optimizer state      dense 7.535e9 / (DP 1 x CP 8)
+#                      + experts 120.796e9 / EP 64 / EDP 1
 #                      = 10.5 + 21.1 = 31.6 GiB/rank = 506 GiB per node
+#                      (the distributed optimizer shards over the DP+CP group;
+#                       if it does not include CP, the dense term is 8x and
+#                       this layout will not fit -- check free -g at step 0)
 #   ── ~0.75 TiB of 1.88 TiB (the sharding above is the assumption; measure
 #      free -g at step 0)
 #
@@ -100,6 +113,10 @@
 #   so the redundant q-projection work grows with TP. It is bounded -- only 12
 #   of the 48 layers are full attention, and the per-token total is dominated by
 #   the MoE block (48 x topk10 x 3 x 2560 x 640 = 2.6G MACs).
+#
+#   CP=8 is the other half of DP1: with EP64 the expert grid fixes PP=1, and
+#   24 heads cap TP at 8, so TP8 x CP8 is the only split of the 64 dies that
+#   leaves the dense data-parallel group at 1.
 
 
 set -ex
@@ -112,7 +129,7 @@ echo "当前时间: $now"
 # local-npu-multinode.sh sets none of these, and its Ray head inherits whatever
 # is exported here, so they must come before the source below.
 export ASCEND_COREDUMP_SIGNAL=none
-# 64 dies over 4 nodes: dense world = TP * CP * PP * DP = 8 * 1 * 1 * 8. Each
+# 64 dies over 4 nodes: dense world = TP * CP * PP * DP = 8 * 8 * 1 * 1. Each
 # node contributes its own 16 dies; this list is per-node, not per-cluster.
 export ASCEND_RT_VISIBLE_DEVICES="${NPU_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_HOST_SOCKET_PORT_RANGE:-63000-63150}"
@@ -226,6 +243,12 @@ if [ "${SAVE_HF:-0}" != "0" ]; then
    CKPT_ARGS+=(--save-hf ${SAVE_DIR}/sft/${EXP_NAME}-hf)
 fi
 
+# Dense world on 64 dies: TP8 x CP8 x PP1 x DP1 keeps EP64 (the expert grid
+# needs PP1). Scale the per-rank token budget with CP so the packed microbatch
+# stays at the reference's 32K: CP8 x 4096.
+CP_SIZE="${CP_SIZE:-8}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((32768 / CP_SIZE))}"
+
 SFT_ARGS=(
    --loss-type sft
    --prompt-data "${PROMPT_DATA}"
@@ -239,15 +262,14 @@ SFT_ARGS=(
    # For a pure SFT run nothing in relax/engine/sft/ reads this -- it drives the
    # context_parallel_size derivation (backends/megatron/arguments.py:119) and
    # the validator at utils/arguments.py:4126, and nothing else. Since that
-   # validator requires max_tokens_per_gpu * cp >= rollout_max_context_len, a
-   # 32K value here forces --max-tokens-per-gpu to 32K as well, which forces the
-   # whole per-rank batch into ONE micro-batch. Lowering it (to just above the
-   # longest real sample, 9457 tokens) lets the token-budget packer split the
-   # batch into gradient-accumulation micro-batches again.
+   # validator requires max_tokens_per_gpu * cp >= rollout_max_context_len.
+   # With CP8 the 32K context is satisfied by 4096 per rank, so the packer can
+   # still split the DP1 batch into several 32K micro-batches.
    --rollout-max-context-len ${ROLLOUT_MAX_CONTEXT_LEN:-32768}
-   # gbs 32 over dense DP 8 = 4 samples per rank per step, ~38K tokens, which
-   # the packer splits into two ~19K-token micro-batches at
-   # --max-tokens-per-gpu 32768. This matches the reference GBS.
+   # gbs 32 over dense DP1 = the whole 32-sample step on one DP group, ~197K
+   # tokens; the packer splits it into ~7 32K micro-batches (CP8 x 4096 per
+   # rank), the same grouping as the reference's DP1 run. This is what makes
+   # the MTP mean-of-means comparable across the two.
    --global-batch-size ${GLOBAL_BATCH_SIZE:-32}
    --micro-batch-size 1
    --seq-length 32768
@@ -255,7 +277,7 @@ SFT_ARGS=(
    # --loss-type sft without it), and dynamic batching is thd-only. thd is also
    # what the plugin's own GDN implements (modelling_qwen4_exp/gdn.py).
    --use-dynamic-batch-size
-   --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU:-32768}
+   --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU}
    --data-pad-size-multiplier 4096
    --calculate-per-token-loss
    --per-rank-fetch
@@ -276,10 +298,10 @@ else
 fi
 
 # MTP aligned to the reference: 1 layer, scaling factor 0.1, detach path
-# `none`. The CP == 1 text/bridge layout it needs is handled on the plugin
-# side (`Qwen4ExpModel._prepare_mtp_loss_mask`); the CP > 1 right-roll exists
-# (`_roll_loss_mask_right_cp`) but is unverified, and the PLE table's row shard
-# is not widened for CP -- so this recipe stays at CP == 1.
+# `none`. `Qwen4ExpModel._prepare_mtp_loss_mask` right-rolls the mask and has
+# the CP > 1 path (`_roll_loss_mask_right_cp`); CP2 on the 8L recipe matches
+# CP1 within 4e-4. The PLE table stays TP-row-sharded -- CP replicates it with
+# the model rather than widening the shard, and the CP2 host-table run passed.
 MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-1}"
 MTP_ARGS=(--mtp-num-layers "${MTP_NUM_LAYERS}")
 if [ "${MTP_NUM_LAYERS}" != "0" ]; then
@@ -316,13 +338,14 @@ else
 fi
 
 PERF_ARGS=(
-   # Dense world = TP 8 x CP 1 x PP 1 x DP 8 = 64 dies; the expert grid is
+   # Dense world = TP 8 x CP 8 x PP 1 x DP 1 = 64 dies; the expert grid is
    # ET 1 x EP 64 x PP 1 = 64 with EDP=1. Each rank holds 512/64 = 8 experts
    # and the a2a spans all four nodes; the 128-weight ceiling of
    # aclnnGroupedMatmulV5 is nowhere near binding with 8 local experts.
+   # EP64 fixes PP=1, so CP is the only axis left that reaches DP1.
    --tensor-model-parallel-size ${TP_SIZE:-8}
    --pipeline-model-parallel-size ${PP_SIZE:-1}
-   --context-parallel-size ${CP_SIZE:-1}
+   --context-parallel-size ${CP_SIZE}
    --expert-model-parallel-size ${EP_SIZE:-64}
    --expert-tensor-parallel-size 1
 
@@ -393,7 +416,7 @@ OPTIMIZER_ARGS=(
 #
 # What is not optional is the offload itself: the dense and expert masters do
 # not fit on device next to the ~16 GiB of params and grads this TP8/EP64 layout
-# already holds (dense 7.535e9 / DP 8 + experts 120.796e9 / EP 64 / EDP 1 at
+# already holds (dense 7.535e9 / (DP 1 x CP 8) + experts 120.796e9 / EP 64 / EDP 1 at
 # 12 B per element is ~34 GB/rank). OPTIMIZER_CPU_OFFLOAD=0 is kept as a knob
 # for diagnosing the host loop, not as a configuration that fits.
 if [ "${OPTIMIZER_CPU_OFFLOAD:-1}" != "0" ]; then
@@ -574,17 +597,15 @@ mkdir -p log
 # The placement group has to ask for exactly as many actor dies as there are
 # visible dies on the four nodes, and the SFT batcher keeps one storage unit per
 # die. The two are easy to let drift: a 64-die cluster with a hardcoded 16 trains
-# a TP8/EP64/DP8 world while every flag still looks right -- the only clue is
-# `using world size: 64, data-parallel size: 8` in the log. The node count is
+# a TP8/EP64/DP1/CP8 world while every flag still looks right -- the only clue is
+# `using world size: 64, data-parallel size: 1` in the log. The node count is
 # read from the same place the entrypoint read it, WORLD_SIZE.
 NPU_COUNT="$(awk -F, '{print NF}' <<< "${ASCEND_RT_VISIBLE_DEVICES}")"
 NODE_COUNT="${WORLD_SIZE:-1}"
 ACTOR_DIES=$(( NPU_COUNT * NODE_COUNT ))
-if [ "${CP_SIZE:-1}" != "1" ]; then
-   echo "FATAL: this script is written for CP=1 (CP=${CP_SIZE}); the CP>1 MTP mask" >&2
-   echo "       right-roll is unverified and the PLE table's row shard is not widened to include CP." >&2
-   exit 2
-fi
+# CP>1 is the DP1 layout (TP8 x CP8 x PP1 x EP64). The CP label roll and the
+# PLE whole-sequence layout were validated at CP2 on the 8L recipe (MTP loss
+# matches CP1 within 4e-4); the QSA forward switches to its 32x32 tile under CP.
 
 ray job submit ${RAY_NO_WAIT:+--no-wait} \
    --address="http://${HOST_IP:-${MASTER_ADDR:-127.0.0.1}}:8265" \
