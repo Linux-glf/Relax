@@ -211,9 +211,30 @@ def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dic
             forward_kwargs["loss_mask"] = batch["unsplit_mtp_loss_mask"]
         return
 
-    # Use the packed text-model labels. Qwen3/VL bridge forwards may receive
-    # unsplit input_ids, then convert them to this layout internally.
-    forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
+    # MCore rolls supplied labels once for each MTP depth. They must already
+    # be next-token labels here: the MTP layer also rolls input_ids once to
+    # condition on the next token. Use MCore's packed/CP-aware roll so the
+    # shift stops at each document boundary and crosses CP ranks correctly.
+    from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+    cp_group = None
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        dynamic_cp_size = batch.get("dynamic_cp_size")
+        dynamic_cp_groups = getattr(mpu, "get_dynamic_data_context_parallel_groups", None)
+        cp_group = (
+            dynamic_cp_groups(group_size=dynamic_cp_size)
+            if dynamic_cp_size is not None and dynamic_cp_groups is not None
+            else mpu.get_context_parallel_group()
+        )
+    mtp_labels, _ = roll_tensor(
+        batch["tokens"],
+        shifts=-1,
+        dims=-1,
+        cp_group=cp_group,
+        packed_seq_params=batch.get("packed_seq_params"),
+        return_sum=False,
+    )
+    forward_kwargs["mtp_kwargs"] = {"mtp_labels": mtp_labels}
     if forward_kwargs.get("loss_mask") is None:
         forward_kwargs["loss_mask"] = batch["full_loss_masks"]
 
@@ -1547,69 +1568,35 @@ def train(
 
             mtp_loss_scale = 1 / num_microbatches[step_id]
             tracker = MTPLossLoggingHelper.tracker
-            # mcore >= 0.19 renamed the tracker payload: the per-microbatch
-            # accumulator is now "loss_sums" (plus "num_tokens" in per-token mode)
-            # instead of "values", and the cross-rank reduction moved into
-            # MTPLossLoggingHelper.reduce_loss_in_tracker(), which repopulates
-            # "values" and handles both normalization modes. Older mcore exposes
-            # "values" directly with no such helper, so reduce by hand there.
+            # Newer MCore accumulates normalized losses in "loss_values" and
+            # reduces that tensor in place via reduce_metrics_in_tracker(). Older
+            # variants use either reduce_loss_in_tracker() or expose "values"
+            # directly, so retain both compatibility fallbacks.
             # Mirrors upstream MTPLossLoggingHelper.track_mtp_metrics.
-            mtp_losses = None
-            loss_sums = tracker.get("_relax_mtp_loss_sum")
-            token_counts = tracker.get("_relax_mtp_token_count")
-            if loss_sums is not None and token_counts is not None:
-                # Token-weighted aggregation: sum the raw CE numerators and valid
-                # token counts across every microbatch and DP/CP rank, then divide
-                # once. The result does not depend on how the dynamic batcher
-                # partitioned the global batch, matching the GPU stack's per-token
-                # tracker (Megatron >= 0e6ac576f, `mtp_loss_scale = 1.0`). The
-                # legacy path below instead averages per-microbatch means.
-                packed = torch.cat((loss_sums, token_counts))
-                for group_key in ("reduce_group", "avg_group"):
-                    group = tracker.get(group_key)
-                    if group is not None:
-                        torch.distributed.all_reduce(packed, group=group)
-                loss_sums, token_counts = packed.chunk(2)
-                mtp_values = loss_sums / token_counts.clamp(min=1)
-                mtp_loss_scale = 1.0
-                tracker.pop("_relax_mtp_loss_sum", None)
-                tracker.pop("_relax_mtp_token_count", None)
-            else:
+            reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_metrics_in_tracker", None)
+            if reduce_in_tracker is None:
                 reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
-                if reduce_in_tracker is not None:
-                    reduce_in_tracker()
-                else:
-                    reduce_metrics_in_tracker = getattr(MTPLossLoggingHelper, "reduce_metrics_in_tracker", None)
-                    if reduce_metrics_in_tracker is not None:
-                        # The npu-port tracker stores "loss_values" and reduces
-                        # them here. Skipping this call left `train/mtp_loss` as
-                        # the logging rank's local microbatch mean (one DP shard)
-                        # instead of the DP-reduced value.
-                        reduce_metrics_in_tracker()
-                    elif "values" in tracker:
-                        values = tracker["values"]
-                        if tracker.get("reduce_group") is not None:
-                            torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
-                        if tracker.get("avg_group") is not None:
-                            torch.distributed.all_reduce(
-                                values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG
-                            )
-                # "values" is the reduced payload on both old and new mcore;
-                # "loss_values" is the compatibility slot used by older helpers.
-                mtp_values = tracker.get("values")
-                if mtp_values is None:
-                    mtp_values = tracker.get("loss_values")
+            if reduce_in_tracker is not None:
+                reduce_in_tracker()
+            elif "values" in tracker:
+                values = tracker["values"]
+                if tracker.get("reduce_group") is not None:
+                    torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
+                if tracker.get("avg_group") is not None:
+                    torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
+            # The legacy payload is "values"; the renamed metrics tracker uses
+            # "loss_values".
+            mtp_values = tracker.get("values")
+            if mtp_values is None:
+                mtp_values = tracker.get("loss_values")
             if mtp_values is not None:
                 scaled = mtp_values * mtp_loss_scale
                 mtp_loss_per_depth = scaled.flatten().tolist()
                 mtp_losses = sum(mtp_loss_per_depth)
-                # Renamed alongside `save_loss_to_tracker` -> `save_metrics_to_tracker`
-                # (see the API probe at the top of megatron_patch/chunked_mtp_loss_patch);
-                # the tracker slot the values above were read from is the same either way.
-                if hasattr(MTPLossLoggingHelper, "clean_metrics_in_tracker"):
-                    MTPLossLoggingHelper.clean_metrics_in_tracker()
-                else:
-                    MTPLossLoggingHelper.clean_loss_in_tracker()
+                clean_tracker = getattr(MTPLossLoggingHelper, "clean_metrics_in_tracker", None)
+                if clean_tracker is None:
+                    clean_tracker = MTPLossLoggingHelper.clean_loss_in_tracker
+                clean_tracker()
 
                 # CI check: verify MTP loss is within expected bounds
                 if args.ci_test:

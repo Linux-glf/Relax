@@ -169,24 +169,6 @@ try:
                 config.mtp_num_layers,
                 avg_group=avg_group,
             )
-            # The metrics tracker stores this microbatch's already-normalized
-            # mean, and the trainer multiplies the sum by 1/num_microbatches:
-            # that is a mean of microbatch means, whose value depends on how the
-            # dynamic batcher partitioned the global batch. The GPU stack's
-            # per-token tracker logs sum(CE)/sum(tokens), which is invariant to
-            # that partition. Keep the raw numerator and denominator here; the
-            # ``track_mtp_metrics`` wrapper installed below substitutes the
-            # ratio before the original tracker reduces and logs it.
-            tracker = MTPLossLoggingHelper.tracker
-            if "_relax_mtp_loss_sum" not in tracker:
-                tracker["_relax_mtp_loss_sum"] = torch.zeros(
-                    config.mtp_num_layers, device=mtp_loss.device, dtype=torch.float32
-                )
-                tracker["_relax_mtp_token_count"] = torch.zeros(
-                    config.mtp_num_layers, device=mtp_loss.device, dtype=torch.float32
-                )
-            tracker["_relax_mtp_loss_sum"][layer_number] += torch.sum(mtp_loss).detach().float()
-            tracker["_relax_mtp_token_count"][layer_number] += num_tokens.detach().float()
             return
         if _MTP_TRACKER_API == "none":
             return
@@ -450,39 +432,10 @@ try:
     if _mamba_mod is not None and hasattr(_mamba_mod, "process_mtp_loss"):
         _mamba_mod.process_mtp_loss = process_mtp_loss
 
-    # Token-weighted MTP-loss metric. The npu-port tracker logs a mean of
-    # per-microbatch means, so `train/mtp_loss` changes when the micro-batch/DP
-    # partition changes even if the per-token loss is identical. Wrap the
-    # tracker's entry point: reduce the raw sums/token counts collected above
-    # with SUM, replace `loss_values` with their ratio, and let the original
-    # implementation log it (its DP AVG then averages identical values).
-    _ORIG_TRACK_MTP_METRICS = getattr(MTPLossLoggingHelper, "track_mtp_metrics", None)
-    if _ORIG_TRACK_MTP_METRICS is not None:
-
-        def _track_mtp_metrics_token_weighted(loss_scale, *args, **kwargs):
-            tracker = MTPLossLoggingHelper.tracker
-            loss_sums = tracker.pop("_relax_mtp_loss_sum", None)
-            token_counts = tracker.pop("_relax_mtp_token_count", None)
-            if loss_sums is not None and token_counts is not None and "loss_values" in tracker:
-                packed = torch.cat((loss_sums, token_counts))
-                for group_key in ("reduce_group", "avg_group"):
-                    group = tracker.get(group_key)
-                    if group is not None:
-                        torch.distributed.all_reduce(packed, group=group)
-                loss_sums, token_counts = packed.chunk(2)
-                values = loss_sums / token_counts.clamp(min=1)
-                tracker["loss_values"] = values.to(dtype=tracker["loss_values"].dtype)
-                tracker["reduce_group"] = None
-                loss_scale = 1.0
-            return _ORIG_TRACK_MTP_METRICS(loss_scale, *args, **kwargs)
-
-        MTPLossLoggingHelper.track_mtp_metrics = staticmethod(_track_mtp_metrics_token_weighted)
-
     logger.info(
         "Relax chunked MTP loss patch applied to process_mtp_loss "
         "(multi_token_prediction + gpt_model bindings; native CE branch chunked by "
-        "--sft-logits-chunk-size, gated on enable_mtp_training AND sft_chunked_logits; "
-        "MTP loss logged token-weighted)."
+        "--sft-logits-chunk-size, gated on enable_mtp_training AND sft_chunked_logits)."
     )
 
 except ImportError as exc:  # pragma: no cover - Megatron not importable in some envs
