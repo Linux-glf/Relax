@@ -58,8 +58,16 @@ logger = get_logger(__name__)
 
 
 def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
-    """Propagate MTP detach-path settings to every Megatron model config."""
+    """Propagate MTP detach-path settings to every Megatron model config.
+
+    ``mtp_detach_heads`` is the current MCore's single-boolean equivalent of the
+    three per-path flags; it is only true when every path is selected. The qwen4_exp
+    MTP layer consumes the per-path flags itself (embedding/backbone), and the
+    chunked MTP patch consumes ``mtp_detach_lm_head``, so partial selections still
+    detach exactly the requested paths on this stack.
+    """
     detach_paths = frozenset(getattr(args, "mtp_detach_paths", ("embedding", "backbone", "lm-head")))
+    detach_all_paths = {"embedding", "backbone", "lm-head"}.issubset(detach_paths)
     seen_configs: set[int] = set()
     for module in model.modules():
         config = getattr(module, "config", None)
@@ -68,6 +76,7 @@ def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module)
         setattr(config, "mtp_detach_embedding", "embedding" in detach_paths)
         setattr(config, "mtp_detach_backbone", "backbone" in detach_paths)
         setattr(config, "mtp_detach_lm_head", "lm-head" in detach_paths)
+        setattr(config, "mtp_detach_heads", detach_all_paths)
         seen_configs.add(id(config))
 
 

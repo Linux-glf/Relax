@@ -1555,25 +1555,61 @@ def train(
             # "values" directly with no such helper, so reduce by hand there.
             # Mirrors upstream MTPLossLoggingHelper.track_mtp_metrics.
             mtp_losses = None
-            reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
-            if reduce_in_tracker is not None:
-                reduce_in_tracker()
-            elif "values" in tracker:
-                values = tracker["values"]
-                if tracker.get("reduce_group") is not None:
-                    torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
-                if tracker.get("avg_group") is not None:
-                    torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
-            # "values" is the reduced payload on both old and new mcore;
-            # "loss_values" is the compatibility slot used by older helpers.
-            mtp_values = tracker.get("values")
-            if mtp_values is None:
-                mtp_values = tracker.get("loss_values")
+            loss_sums = tracker.get("_relax_mtp_loss_sum")
+            token_counts = tracker.get("_relax_mtp_token_count")
+            if loss_sums is not None and token_counts is not None:
+                # Token-weighted aggregation: sum the raw CE numerators and valid
+                # token counts across every microbatch and DP/CP rank, then divide
+                # once. The result does not depend on how the dynamic batcher
+                # partitioned the global batch, matching the GPU stack's per-token
+                # tracker (Megatron >= 0e6ac576f, `mtp_loss_scale = 1.0`). The
+                # legacy path below instead averages per-microbatch means.
+                packed = torch.cat((loss_sums, token_counts))
+                for group_key in ("reduce_group", "avg_group"):
+                    group = tracker.get(group_key)
+                    if group is not None:
+                        torch.distributed.all_reduce(packed, group=group)
+                loss_sums, token_counts = packed.chunk(2)
+                mtp_values = loss_sums / token_counts.clamp(min=1)
+                mtp_loss_scale = 1.0
+                tracker.pop("_relax_mtp_loss_sum", None)
+                tracker.pop("_relax_mtp_token_count", None)
+            else:
+                reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
+                if reduce_in_tracker is not None:
+                    reduce_in_tracker()
+                else:
+                    reduce_metrics_in_tracker = getattr(MTPLossLoggingHelper, "reduce_metrics_in_tracker", None)
+                    if reduce_metrics_in_tracker is not None:
+                        # The npu-port tracker stores "loss_values" and reduces
+                        # them here. Skipping this call left `train/mtp_loss` as
+                        # the logging rank's local microbatch mean (one DP shard)
+                        # instead of the DP-reduced value.
+                        reduce_metrics_in_tracker()
+                    elif "values" in tracker:
+                        values = tracker["values"]
+                        if tracker.get("reduce_group") is not None:
+                            torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
+                        if tracker.get("avg_group") is not None:
+                            torch.distributed.all_reduce(
+                                values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG
+                            )
+                # "values" is the reduced payload on both old and new mcore;
+                # "loss_values" is the compatibility slot used by older helpers.
+                mtp_values = tracker.get("values")
+                if mtp_values is None:
+                    mtp_values = tracker.get("loss_values")
             if mtp_values is not None:
                 scaled = mtp_values * mtp_loss_scale
                 mtp_loss_per_depth = scaled.flatten().tolist()
                 mtp_losses = sum(mtp_loss_per_depth)
-                MTPLossLoggingHelper.clean_loss_in_tracker()
+                # Renamed alongside `save_loss_to_tracker` -> `save_metrics_to_tracker`
+                # (see the API probe at the top of megatron_patch/chunked_mtp_loss_patch);
+                # the tracker slot the values above were read from is the same either way.
+                if hasattr(MTPLossLoggingHelper, "clean_metrics_in_tracker"):
+                    MTPLossLoggingHelper.clean_metrics_in_tracker()
+                else:
+                    MTPLossLoggingHelper.clean_loss_in_tracker()
 
                 # CI check: verify MTP loss is within expected bounds
                 if args.ci_test:
@@ -1930,7 +1966,10 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
 
         # Relax only for a group that really will end up absent.
         allow_missing_vision_keys = vision_absent_from_model and not supplementing_vision
-        strict = not (allow_missing_mtp_keys or allow_missing_vision_keys)
+        # Every relaxation here is paired with a reconcile step below, which is
+        # what keeps the export complete despite the missing tensors.
+        relax_strict = allow_missing_mtp_keys or allow_missing_vision_keys
+        strict = not relax_strict
 
         try:
             with patch_megatron_model(model):
@@ -1954,9 +1993,11 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
             not torch.distributed.is_initialized()
             or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
         )
-        if (allow_missing_mtp_keys or allow_missing_vision_keys) and is_export_writer and not save_fp8:
+        if relax_strict and is_export_writer and not save_fp8:
             reconcile_hf_export_index(
-                str(path), reference_hf_dir=args.hf_checkpoint, supplement_mtp=allow_missing_mtp_keys
+                str(path),
+                reference_hf_dir=args.hf_checkpoint,
+                supplement_mtp=allow_missing_mtp_keys,
             )
 
         if save_fp8 and is_export_writer and fp8_writer is not None:

@@ -80,10 +80,26 @@ def _make_config(calculate_per_token_loss=False, fuse_linear=False):
         calculate_per_token_loss=calculate_per_token_loss,
         cross_entropy_loss_fusion=fuse_linear,
         cross_entropy_fusion_impl="linear" if fuse_linear else "native",
+        # Present on the real TransformerConfig; the upstream implementation reads
+        # `mtp_detach_heads` unconditionally.
+        mtp_detach_heads=False,
+        mtp_detach_embedding=False,
+        mtp_detach_backbone=False,
+        mtp_detach_lm_head=False,
     )
 
 
-def _run_and_capture(fn, *, head, config, monkeypatch, chunk_size=None, scale_logits_fn=None, is_training=False):
+def _run_and_capture(
+    fn,
+    *,
+    head,
+    config,
+    monkeypatch,
+    chunk_size=None,
+    scale_logits_fn=None,
+    is_training=False,
+    mtp_input_mask=None,
+):
     """Run a process_mtp_loss impl, spying on MTPLossAutoScaler.apply to
     capture the per-depth loss tensors it would send to backward.
 
@@ -123,6 +139,7 @@ def _run_and_capture(fn, *, head, config, monkeypatch, chunk_size=None, scale_lo
         cp_group=None,
         packed_seq_params=None,
         scale_logits_fn=scale_logits_fn,
+        mtp_input_mask=mtp_input_mask,
     )
     return ret, captured
 
@@ -144,6 +161,46 @@ def test_chunked_mtp_matches_original(chunk_size, monkeypatch):
     assert len(got) == len(ref) == LAYERS
     for d, (g, r) in enumerate(zip(got, ref)):
         assert torch.equal(g, r), f"depth {d} chunk={chunk_size}: max|Δ|={(g - r).abs().max()}"
+
+
+@pytest.mark.parametrize("chunk_size", [S, 3])
+def test_chunked_mtp_matches_original_with_input_mask(chunk_size, monkeypatch):
+    """The VL conditioning mask (`mtp_input_mask`) must match upstream.
+
+    A depth whose rolled-in conditioning token is an image/video placeholder is
+    excluded from the loss, and the cumulative mask is rolled in lockstep with the
+    loss mask. Chunking must not change any of that.
+    """
+    head = _FakeHead(H, V)
+    cfg = _make_config()
+    torch.manual_seed(3)
+    mtp_input_mask = torch.rand(B, S) > 0.3
+
+    _, ref = _run_and_capture(
+        _patch._ORIG_PROCESS_MTP_LOSS,
+        head=head,
+        config=cfg,
+        monkeypatch=monkeypatch,
+        mtp_input_mask=mtp_input_mask,
+    )
+    _, got = _run_and_capture(
+        _patch.process_mtp_loss,
+        head=head,
+        config=cfg,
+        monkeypatch=monkeypatch,
+        chunk_size=chunk_size,
+        mtp_input_mask=mtp_input_mask,
+    )
+    _, unmasked = _run_and_capture(
+        _patch.process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, chunk_size=chunk_size
+    )
+
+    assert len(got) == len(ref) == LAYERS
+    for d, (g, r) in enumerate(zip(got, ref)):
+        assert torch.equal(g, r), f"depth {d} chunk={chunk_size}: max|Δ|={(g - r).abs().max()}"
+    # The mask must actually change the supervised set, otherwise the comparison
+    # above could pass trivially.
+    assert not torch.equal(got[0], unmasked[0])
 
 
 def test_scale_logits_fn_per_chunk(monkeypatch):
@@ -174,12 +231,11 @@ def test_calculate_per_token_loss_branch(monkeypatch):
 def test_is_training_logging_matches(monkeypatch):
     """is_training path: both the per-depth GRADIENT tensor
     (MTPLossAutoScaler.apply) AND the LOGGED per-depth loss
-    (save_loss_to_tracker's first arg) must match upstream.
+    (save_metrics_to_tracker's first arg) must match upstream.
 
-    Spies on save_loss_to_tracker so a divergence in mtp_loss_for_log (e.g.
+    Spies on save_metrics_to_tracker so a divergence in mtp_loss_for_log (e.g.
     dropping the mtp_loss_scale factor from the log-only value) is caught — the
-    gradient path alone would still match and hide it (regression: chunked
-    patch logged the UNSCALED loss).
+    gradient path alone would still match and hide it.
     """
     head = _FakeHead(H, V)
     cfg = _make_config()
@@ -192,16 +248,16 @@ def test_is_training_logging_matches(monkeypatch):
     monkeypatch.setattr(_mtp_mod.parallel_state, "get_data_parallel_group", lambda **k: None)
     monkeypatch.setattr(_patch.parallel_state, "get_data_parallel_group", lambda **k: None, raising=False)
 
-    monkeypatch.setattr(_mtp_mod.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["ref"]))
+    monkeypatch.setattr(_mtp_mod.MTPLossLoggingHelper, "save_metrics_to_tracker", _spy_tracker(logged["ref"]))
     monkeypatch.setattr(
-        _patch.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["ref"]), raising=False
+        _patch.MTPLossLoggingHelper, "save_metrics_to_tracker", _spy_tracker(logged["ref"]), raising=False
     )
     _, ref = _run_and_capture(
         _patch._ORIG_PROCESS_MTP_LOSS, head=head, config=cfg, monkeypatch=monkeypatch, is_training=True
     )
-    monkeypatch.setattr(_mtp_mod.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["got"]))
+    monkeypatch.setattr(_mtp_mod.MTPLossLoggingHelper, "save_metrics_to_tracker", _spy_tracker(logged["got"]))
     monkeypatch.setattr(
-        _patch.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["got"]), raising=False
+        _patch.MTPLossLoggingHelper, "save_metrics_to_tracker", _spy_tracker(logged["got"]), raising=False
     )
     _, got = _run_and_capture(
         _patch.process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, chunk_size=3, is_training=True
@@ -213,25 +269,21 @@ def test_is_training_logging_matches(monkeypatch):
         assert torch.equal(g, r), f"logged mtp_loss_for_log mismatch at depth {d}: {g} vs {r}"
 
 
-def test_token_aware_tracker_api_receives_scaled_sum_and_count(monkeypatch):
-    """New Megatron tracker APIs receive the raw scaled sum and token count."""
+def test_token_aware_tracker_api_receives_normalized_loss_and_counts(monkeypatch):
+    """The metrics tracker receives the normalized loss plus acceptance counts."""
     seen = {}
 
-    def tracker(loss_sum, num_tokens, layer_number, num_layers, **kwargs):
+    def tracker(loss, correct, total, layer_number, num_layers, **kwargs):
         seen.update(
-            loss_sum=loss_sum,
-            num_tokens=num_tokens,
+            loss=loss,
+            correct=correct,
+            total=total,
             layer_number=layer_number,
             num_layers=num_layers,
             kwargs=kwargs,
         )
 
-    monkeypatch.setattr(
-        _patch,
-        "_MTP_TRACKER_PARAMETERS",
-        {"loss_sum", "num_tokens", "layer_number", "num_layers", "correct", "total"},
-    )
-    monkeypatch.setattr(_patch.MTPLossLoggingHelper, "save_loss_to_tracker", staticmethod(tracker))
+    monkeypatch.setattr(_patch.MTPLossLoggingHelper, "save_metrics_to_tracker", staticmethod(tracker))
     monkeypatch.setattr(_patch.parallel_state, "get_data_parallel_group", lambda **_kwargs: None)
     config = _make_config()
     loss = torch.tensor([[1.0, 2.0]])
@@ -241,13 +293,11 @@ def test_token_aware_tracker_api_receives_scaled_sum_and_count(monkeypatch):
 
     _patch._save_mtp_loss_to_tracker(loss, num_tokens, 0, config, correct, total)
 
-    expected_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
-    assert torch.equal(seen["loss_sum"], expected_scale * loss.sum())
-    assert seen["num_tokens"] is num_tokens
+    assert torch.equal(seen["loss"], loss.sum() / num_tokens)
+    assert seen["correct"] is correct
+    assert seen["total"] is total
     assert seen["layer_number"] == 0
     assert seen["num_layers"] == config.mtp_num_layers
-    assert seen["kwargs"]["correct"] is correct
-    assert seen["kwargs"]["total"] is total
 
 
 def test_fuse_linear_delegates(monkeypatch):

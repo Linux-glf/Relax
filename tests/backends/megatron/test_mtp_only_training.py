@@ -141,6 +141,8 @@ def test_configure_mtp_detach_paths_updates_all_module_configs(detach_paths, exp
 
     for config in (model.config, model.child.config, model.shared_child.config):
         assert (config.mtp_detach_embedding, config.mtp_detach_backbone, config.mtp_detach_lm_head) == expected
+        # MCore's single-boolean equivalent fires only when every path is selected.
+        assert config.mtp_detach_heads is all(expected)
 
 
 def test_configure_mtp_detach_paths_defaults_to_all_detached():
@@ -151,6 +153,7 @@ def test_configure_mtp_detach_paths_defaults_to_all_detached():
     assert model.config.mtp_detach_embedding is True
     assert model.config.mtp_detach_backbone is True
     assert model.config.mtp_detach_lm_head is True
+    assert model.config.mtp_detach_heads is True
 
 
 def test_mtp_only_freeze_exposes_only_mtp_parameters():

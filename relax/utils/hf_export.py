@@ -2,32 +2,35 @@
 
 """Reconcile Megatron-Bridge HuggingFace exports that omit reference tensors.
 
-Megatron-Bridge's non-distributed ``save_generator`` has a bug: when the source
-Megatron checkpoint lacks some tensors that the reference HF model expects — for
-example an RL/SFT checkpoint trained without MTP, while the reference config
-enables MTP — ``AutoBridge.export_ckpt(..., strict=False)`` writes the
-incomplete shards correctly (skipping the absent tensors) but still records each
-incomplete shard's *full expected* key set as "saved". The resulting
-``model.safetensors.index.json`` therefore lists "ghost" keys that point at
-shards which do not actually contain them.
+A Megatron model does not always carry every tensor its reference HF model
+declares: an RL/SFT checkpoint trained without MTP against a reference that
+enables it, or a text-only run on a VL base. (The qwen4_exp PLE n-gram table
+was the structural case here -- the module mmapped it out of the checkpoint it
+was converted from and no Megatron tensor carried it. The bridge now owns the
+table as a persistent buffer with an export mapping, so it is one more group
+the model emits itself; see ``PLENGramEmbeddingMapping``.)
 
-Downstream loaders (transformers / SGLang) then fail: the index references
-tensors that cannot be found. This is especially fatal when serving with EAGLE
-speculative decoding, whose draft model *is* the MTP (nextn) layer.
+The bridge treats the reference's key set as its completeness oracle, so with
+``strict=True`` it raises ``RuntimeError: N tensors from the original checkpoint
+were not written``, and with ``strict=False`` it writes the incomplete shards and
+warns. Either way the exported checkpoint is short of tensors its own config
+declares -- which breaks downstream loaders (transformers / SGLang), and is
+especially fatal when serving with EAGLE speculative decoding, whose draft model
+*is* the MTP (nextn) layer.
 
-Root cause (in the dependency, not in Relax):
-``megatron/bridge/models/hf_pretrained/state.py`` does
-``all_saved_keys.update(keys_for_file)`` in the ``strict=False`` incomplete-shard
-fallback; it should be ``all_saved_keys.update(tensors_to_save.keys())`` (the
-distributed save path already does the equivalent). Until that is fixed
-upstream, this module reconciles the exported checkpoint on the Relax side:
+Relax therefore reconciles the export once the bridge is done, in
+``reconcile_hf_export_index``:
 
-1. Rebuilds ``model.safetensors.index.json`` from the tensors that are
-   physically present, so the index can never reference a missing tensor.
-2. Optionally supplements MTP tensors the checkpoint lacked from the reference
-   HF model, so the export matches the reference structure and stays deployable
-   (e.g. for EAGLE speculative decoding). Both sharded exports (with an index)
-   and single-file ``model.safetensors`` exports are handled.
+1. Supplements the missing tensors from the reference HF model, so the export
+   matches the reference structure and stays deployable. Both sharded exports
+   (with an index) and single-file ``model.safetensors`` exports are handled.
+2. Rebuilds ``model.safetensors.index.json`` from the tensors that are
+   physically present -- re-indexing the supplemented shards, and dropping any
+   "ghost" entry (an index key no shard contains) left by a bridge revision that
+   records an incomplete shard's full expected key set as saved. The revision
+   built here records only the tensors it wrote
+   (``hf_pretrained/state.py``), so the ghost path is defence in depth rather
+   than the live failure.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+from contextlib import ExitStack
 from typing import Optional
 
 from relax.utils.logging_utils import get_logger
@@ -120,6 +124,46 @@ def reference_expects_vision(reference_hf_dir: str) -> bool:
     return any("vision" in key.lower() for key in _weight_map_of(reference_hf_dir))
 
 
+def _supplement_keys(
+    output_dir: str,
+    reference_hf_dir: str,
+    keys: list[str],
+    ref_map: dict[str, str],
+    shard_name: str,
+) -> list[str]:
+    """Copy ``keys`` verbatim from the reference into one new shard.
+
+    The reference file layout is *not* reproduced -- these tensors are appended
+    as ``shard_name``, so an export's own shards (which share the reference's
+    filenames) are never rewritten. The index is rebuilt from what is physically
+    present by the caller, so only the file name has to describe itself. The
+    keys are read in reference-file order, so each reference shard is opened
+    once.
+    """
+    import safetensors
+    import safetensors.torch
+
+    if not keys:
+        return []
+
+    written: list[str] = []
+    with ExitStack() as stack:
+        handles: dict[str, object] = {}
+        tensors = {}
+        for key in sorted(keys, key=lambda key: (ref_map[key], key)):
+            ref_file = ref_map[key]
+            handle = handles.get(ref_file)
+            if handle is None:
+                handle = stack.enter_context(
+                    safetensors.safe_open(os.path.join(reference_hf_dir, ref_file), framework="pt", device="cpu")
+                )
+                handles[ref_file] = handle
+            tensors[key] = handle.get_tensor(key)
+        safetensors.torch.save_file(tensors, os.path.join(output_dir, shard_name), metadata={"format": "pt"})
+        written.extend(tensors)
+    return sorted(written)
+
+
 def reconcile_hf_export_index(
     output_dir: str,
     reference_hf_dir: Optional[str] = None,
@@ -129,12 +173,11 @@ def reconcile_hf_export_index(
     """Make an exported HF checkpoint consistent with the tensors on disk.
 
     Removes ghost entries (index keys not present in any shard) and, when
-    ``supplement_mtp`` is set and ``reference_hf_dir`` is given, fills MTP
-    tensors the Megatron checkpoint lacked from the reference model. Afterwards
-    ``model.safetensors.index.json`` is rebuilt from what is physically present,
-    so it can never reference a missing tensor. A single-file
-    ``model.safetensors`` export is also handled: if MTP has to be supplemented,
-    an index is created alongside the original file.
+    ``reference_hf_dir`` is given, fills the MTP tensors the export lacked from
+    the reference model. Afterwards ``model.safetensors.index.json`` is rebuilt
+    from what is physically present, so it can never reference a missing tensor.
+    A single-file ``model.safetensors`` export is also handled: if a supplement is
+    needed, an index is created alongside the original file.
 
     Args:
         output_dir: Exported HF checkpoint directory (modified in place).
@@ -146,8 +189,8 @@ def reconcile_hf_export_index(
     Returns:
         Summary dict ``{"ghosts": [...], "supplemented": [...], "dropped":
         [...]}``. ``ghosts`` are index keys missing from the shards;
-        ``supplemented`` were filled from the reference; ``dropped`` were removed
-        from the index.
+        ``supplemented`` were filled from the reference; ``dropped`` were
+        removed from the index.
     """
     empty = {"ghosts": [], "supplemented": [], "dropped": []}
     index_path = os.path.join(output_dir, _INDEX_NAME)
@@ -161,10 +204,10 @@ def reconcile_hf_export_index(
     # Ghost keys only exist when an index lists tensors absent from every shard.
     ghosts = sorted(k for k in _load_weight_map(index_path) if k not in physical) if has_index else []
 
-    # MTP keys the reference declares but the export does not physically contain.
+    # Keys the reference declares but the export does not physically contain.
     missing_mtp: list[str] = []
     ref_map: dict[str, str] = {}
-    if supplement_mtp and reference_hf_dir:
+    if reference_hf_dir and supplement_mtp:
         ref_map = _weight_map_of(reference_hf_dir)
         missing_mtp = sorted(k for k in ref_map if "mtp" in k.lower() and k not in physical)
 
@@ -183,21 +226,8 @@ def reconcile_hf_export_index(
     # weights.
     supplemented: list[str] = []
     if missing_mtp:
-        import safetensors
-        import safetensors.torch
-
-        by_file: dict[str, list[str]] = {}
-        for key in missing_mtp:
-            by_file.setdefault(ref_map[key], []).append(key)
-        tensors = {}
-        for ref_file, keys in by_file.items():
-            with safetensors.safe_open(os.path.join(reference_hf_dir, ref_file), framework="pt", device="cpu") as fh:
-                for key in keys:
-                    tensors[key] = fh.get_tensor(key)
-        safetensors.torch.save_file(tensors, os.path.join(output_dir, mtp_shard_name), metadata={"format": "pt"})
-        supplemented = sorted(tensors.keys())
-        logger.info("Supplemented %d MTP tensor(s) from reference model %s", len(supplemented), reference_hf_dir)
-        del tensors
+        supplemented += _supplement_keys(output_dir, reference_hf_dir, missing_mtp, ref_map, mtp_shard_name)
+        logger.info("Supplemented %d MTP tensor(s) from reference model %s", len(missing_mtp), reference_hf_dir)
 
     # Rebuild the index purely from what is physically present (now including any
     # supplemented MTP shard). This drops every remaining ghost entry, and creates
