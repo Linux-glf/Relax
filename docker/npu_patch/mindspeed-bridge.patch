@@ -1,322 +1,1624 @@
-diff --git a/mindspeed_bridge/models/conversion/utils.py b/mindspeed_bridge/models/conversion/utils.py
-index 99ccba5..8fa07a1 100644
---- a/mindspeed_bridge/models/conversion/utils.py
-+++ b/mindspeed_bridge/models/conversion/utils.py
-@@ -57,6 +57,15 @@ def remove_non_pickleables(obj, max_depth: int = 3, current_depth: int = 0):
+diff --git a/mindspeed_bridge/features/data/vlm_datasets/shuffle_control.py b/mindspeed_bridge/features/data/vlm_datasets/shuffle_control.py
+index 3353d04..61006a8 100644
+--- a/mindspeed_bridge/features/data/vlm_datasets/shuffle_control.py
++++ b/mindspeed_bridge/features/data/vlm_datasets/shuffle_control.py
+@@ -6,9 +6,11 @@
+ from __future__ import annotations
  
-             # Recursively clean attribute
-             cleaned_value = remove_non_pickleables(attr_value, max_depth, current_depth + 1)
-+            if hasattr(cleaned_obj, '__setattr__'):
-+                try:
-+                    setattr(cleaned_obj, attr_name, cleaned_value)
-+                except (ValueError, TypeError) as e:
-+                    # Skip OmegaConf unsupport type.
-+                    if "Unions of containers" in str(e):
-+                        print(f"Skipping attribute '{attr_name}' due to Union type")
-+                        continue
-+                    raise
+ import dataclasses
++from importlib import util as importlib_util
  
-             # Set the cleaned value (or None if it was removed)
-             setattr(cleaned_obj, attr_name, cleaned_value)
-diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
-index 19a3b9d..00a3a80 100644
---- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
-+++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
-@@ -1,6 +1,6 @@
- # pylint: disable=R0801
- from typing import List, Optional, Tuple
--
-+import os
+ from megatron_adaptor.features_manager.mindspeed_feature import MindSpeedFeature
+ 
++_PROVIDER_MODULE = "megatron.bridge.data.vlm_datasets.preloaded_provider"
+ _SHUFFLE_FIELD_INSTALLED = "_msb_vlm_shuffle_control_installed"
+ 
+ 
+@@ -32,6 +34,17 @@ class PreloadedVLMShuffleControlFeature(MindSpeedFeature):
+     def __init__(self):
+         super().__init__(feature_name="preloaded_vlm_shuffle_control", optimization_level=0)
+ 
++    def is_need_apply(self, args):
++        # Megatron-Bridge moved the VLM collators into the model modules and the
++        # preloaded provider is gone in newer revisions. Nothing to patch there,
++        # so stay inert instead of failing the whole feature pass.
++        try:
++            if importlib_util.find_spec(_PROVIDER_MODULE) is None:
++                return False
++        except ImportError:
++            return False
++        return super().is_need_apply(args)
++
+     def register_patches(self, patch_manager, args):
+         from megatron.bridge.data.vlm_datasets.preloaded_provider import (
+             PreloadedVLMConversationProvider,
+diff --git a/mindspeed_bridge/features/megatron/common/fla_npu_causal_conv1d.py b/mindspeed_bridge/features/megatron/common/fla_npu_causal_conv1d.py
+index 4353aee..7e19d29 100644
+--- a/mindspeed_bridge/features/megatron/common/fla_npu_causal_conv1d.py
++++ b/mindspeed_bridge/features/megatron/common/fla_npu_causal_conv1d.py
+@@ -1,132 +1,94 @@
+ # Copyright (c) 2026, HUAWEI CORPORATION. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0.
+-"""FLA-compatible adapter for fla-npu 26.1 causal-conv1d."""
++"""FLA-compatible ``causal_conv1d`` backed by the MindSpeed-Ops Triton kernels.
++
++The GDN layers import ``fla.modules.convolution.causal_conv1d``; the feature that owns
++them patches that name with :func:`fla_npu_causal_conv1d`, so the packed-sequence
++convolution runs on device instead of through the torch fallback. The computation comes
++from ``mindspeed_ops``, which dispatches on the running architecture -- the arch32 Triton
++kernels on the 910B/910_93 parts, the arch35 ones on 910_95/950 -- and those are the
++kernels already serving this path's backward.
++
++The fla-npu AscendC operator (``torch.ops.npu.npu_causal_conv1d``) is deliberately not
++used. Its wheel ships the kernel json for ``causal_conv1d`` with a fixed set of
++``simplifiedKey`` combinations, and the packed multi-sequence input of a training step
++falls outside that set: the run aborts in NNopbase with ``Cannot find tilingKey[0] in
++kernel json file of CausalConv1d``. The miss follows from the shapes handed to the
++operator, which a load-time availability check cannot rule out, so the operator is left
++alone rather than probed. The module keeps its original name for compatibility with
++earlier revisions.
++"""
+ 
+ from __future__ import annotations
+ 
++from functools import cache
+ from typing import Optional
+ 
  import torch
- from torch import nn
- import torch.nn.functional as F
-@@ -36,13 +36,15 @@ from megatron.core.ssm.gated_delta_net import (
-     _split_tensor_factory,
- )
  
--try:
--    from causal_conv1d import causal_conv1d
--except ImportError:
+ 
+-def _activation_mode(activation: Optional[str]) -> int:
+-    if activation is None:
+-        return 0
+-    if activation in ("silu", "swish"):
+-        return 1
+-    raise ValueError(f"Unsupported activation for fla-npu causal_conv1d: {activation}")
++@cache
++def _causal_conv1d():
++    """Return MindSpeed-Ops' architecture-dispatched ``causal_conv1d``."""
++    from mindspeed_ops.api.triton.convolution import causal_conv1d
+ 
++    return causal_conv1d
+ 
+-def _query_start_loc(cu_seqlens: Optional[torch.Tensor]) -> Optional[list[int]]:
+-    if cu_seqlens is None:
+-        return None
+-    return [int(offset) for offset in cu_seqlens.detach().cpu().tolist()]
+ 
+-
+-def _load_causal_conv1d_op():
+-    """Load fla-npu 26.1's causal-conv1d forward operator."""
++def is_fla_npu_causal_conv1d_available() -> bool:
++    """Return whether the on-device causal-conv1d kernels can be imported."""
+     try:
+-        import fla_npu  # noqa: F401
+-    except ModuleNotFoundError as exc:
+-        raise RuntimeError("Ascend causal_conv1d requires the flash-linear-attention-npu wheel") from exc
+-
+-    op = getattr(torch.ops.npu, "npu_causal_conv1d", None)
+-    if op is None:
+-        raise RuntimeError(
+-            "torch.ops.npu.npu_causal_conv1d is not registered. Install and import a compatible "
+-            "flash-linear-attention-npu 26.1 wheel."
+-        )
+-    return op
++        _causal_conv1d()
++    except Exception:
++        return False
++    return True
+ 
+ 
+-def _optimized_causal_conv1d_backward(x, grad_output, weight, bias, activation, cu_seqlens):
+-    """Run the architecture-specific MindSpeed-Ops Triton backward kernel."""
+-    from mindspeed_ops.utils import is_arch35
+-
+-    if is_arch35():
+-        from mindspeed_ops.arch35.triton.causal_conv1d_bwd import causal_conv1d_bwd
+-    else:
+-        from mindspeed_ops.arch32.triton.convolution import causal_conv1d_bwd_impl as causal_conv1d_bwd
++def fla_npu_causal_conv1d(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: Optional[torch.Tensor] = None,
++    activation: Optional[str] = None,
++    initial_state: Optional[torch.Tensor] = None,
++    output_final_state: bool = False,
++    cu_seqlens: Optional[torch.Tensor] = None,
++):
++    """Causal conv1d over packed sequences, following FLA's call contract.
++
++    Args:
++        x: ``[b, s, d]`` packed input.
++        weight: ``[d, w]``. The kernels take ``[w, d]``; the transpose stays inside the
++            autograd graph, so the weight gradient keeps the caller's layout.
++        bias: optional ``[d]``.
++        activation: ``"silu"`` / ``"swish"``, or ``None`` to skip the activation.
++        initial_state: unused -- see ``Raises``.
++        output_final_state: unused -- see ``Raises``.
++        cu_seqlens: ``[num_seqs + 1]`` device tensor delimiting the packed sequences, or
++            ``None`` to treat the input as a single sequence.
++
++    Returns:
++        ``(y, None)``, matching ``fla.modules.convolution.causal_conv1d``.
++
++    Raises:
++        NotImplementedError: if a recurrent state is requested. Training never carries
++            conv state, and the state layouts of the implementations involved have not
++            been matched up, so a state is rejected instead of being silently mis-shaped.
++    """
++    if initial_state is not None or output_final_state:
++        raise NotImplementedError("causal_conv1d conv-state arguments are not supported")
+ 
+-    return causal_conv1d_bwd(
++    out, _ = _causal_conv1d()(
+         x=x,
+-        dy=grad_output.contiguous(),
+-        dht=None,
+-        weight=weight,
++        weight=weight.transpose(0, 1).contiguous(),
+         bias=bias,
+         residual=None,
+         initial_state=None,
+         activation=activation,
+         cu_seqlens=cu_seqlens,
++        output_final_state=False,
+     )
++    return out, None
+ 
+ 
+-class _FlaNpu26CausalConv1d(torch.autograd.Function):
+-    """Combine fla-npu 26.1 AscendC forward with MindSpeed-Ops backward."""
+-
+-    @staticmethod
+-    def forward(ctx, x, weight, bias, activation, cu_seqlens):
+-        op_weight = weight.transpose(0, 1).contiguous()
+-        conv_states = x.new_zeros((x.shape[0], op_weight.shape[0] - 1, x.shape[-1]))
+-        output = _load_causal_conv1d_op()(
+-            x.contiguous(),
+-            op_weight,
+-            bias,
+-            conv_states,
+-            query_start_loc=_query_start_loc(cu_seqlens),
+-            activation_mode=_activation_mode(activation),
+-            run_mode=0,
+-        )
+-
+-        tensors = [x, op_weight]
+-        ctx.has_bias = bias is not None
+-        if bias is not None:
+-            tensors.append(bias)
+-        ctx.save_for_backward(*tensors)
+-        ctx.activation = activation
+-        ctx.cu_seqlens = cu_seqlens
+-        return output
+-
+-    @staticmethod
+-    def backward(ctx, grad_output):
+-        saved_tensors = list(ctx.saved_tensors)
+-        x = saved_tensors.pop(0)
+-        op_weight = saved_tensors.pop(0)
+-        bias = saved_tensors.pop(0) if ctx.has_bias else None
+-        dx, op_weight_grad, bias_grad, _, _ = _optimized_causal_conv1d_backward(
+-            x,
+-            grad_output,
+-            op_weight,
+-            bias,
+-            ctx.activation,
+-            ctx.cu_seqlens,
+-        )
+-        weight_grad = op_weight_grad.transpose(0, 1).contiguous()
+-        return dx, weight_grad, bias_grad, None, None
+-
+-
+-def fla_npu_causal_conv1d(
+-    x,
+-    weight,
+-    bias=None,
+-    activation=None,
+-    initial_state=None,
+-    output_final_state=False,
+-    cu_seqlens=None,
+-):
+-    """Call fla-npu 26.1 causal-conv1d with FLA's public call contract."""
+-    if initial_state is not None or output_final_state:
+-        raise NotImplementedError("fla-npu causal_conv1d training adapter does not support recurrent state")
+-
+-    output = _FlaNpu26CausalConv1d.apply(
+-        x,
+-        weight,
+-        bias,
+-        activation,
+-        cu_seqlens,
+-    )
+-    return output, None
+-
+-
+-__all__ = ["fla_npu_causal_conv1d"]
++__all__ = ["fla_npu_causal_conv1d", "is_fla_npu_causal_conv1d_available"]
+diff --git a/mindspeed_bridge/features/megatron/common/gdn_cp_a2a_fast_perm.py b/mindspeed_bridge/features/megatron/common/gdn_cp_a2a_fast_perm.py
+new file mode 100644
+index 0000000..35a95c2
+--- /dev/null
++++ b/mindspeed_bridge/features/megatron/common/gdn_cp_a2a_fast_perm.py
+@@ -0,0 +1,133 @@
++# Copyright (c) 2026, HUAWEI CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0.
++"""Apply the GDN context-parallel head permutation without a dim-2 IndexAdd.
++
++``megatron.core.ssm.gated_delta_net.common.a2a_cp_to_hp`` pre-permutes the
++in_proj output along the head dim before the CP-to-HP all-to-all::
++
++    qkvzba = qkvzba.index_select(-1, head_perm)
++
++The gather is cheap (0.10 ms on Ascend 910, bf16, ``[8096, 1, 3088]``, index
++length 3088 = the Qwen3.5 per-TP-rank ``qkvzba`` width).  Its autograd
++backward, ``aten::index_add_(dim=2)``, is not: CANN only dispatches the sorted
++``SortAiCore`` / ``InplaceIndexAddWithSorted`` kernels for ``dim == 0`` and
++otherwise falls back to a per-element kernel, whatever the index dtype is and
++even when the index is sorted::
++
++    index_add_(dim=2, head_perm)      295.99 ms    [8096, 1, 3088] bf16
++    index_add_(dim=2, arange)         295.65 ms    identity index, no better
++    index_add_(dim=0, same volume)      0.17 ms    same element count, dim 0
++    index_select(-1, head_perm)         0.10 ms    the forward gather itself
++
++Production impact (Qwen3.5-9B, TP4/CP4, 16xAscend 910, one ``actor_train``
++window of 938.98 s): 1944 calls x 238.7 ms = 464 s, i.e. 74.7 % of the 621 s of
++kernel time, all of it the autograd backward of that one ``index_select``.
++
++The same permutation written so that the reduction runs along dim 0 keeps every
++value bit for bit (checked with ``torch.equal``) and brings the forward plus
++backward pair down to 0.39 ms::
++
++    qkvzba.transpose(0, -1).index_select(0, head_perm).transpose(0, -1).contiguous()
++
++``transpose`` is a view, so the gather selects exactly the same head-permuted
++elements, while its backward becomes ``index_add_(dim=0)`` on the transposed
++grad -- identical element count, fast kernel.  ``contiguous()`` restores the
++layout upstream hands to the all-to-all.
++
++The permutation happens inside ``a2a_cp_to_hp``, so the wrapper below replays
++that function.  It mirrors the upstream body statement for statement except for
++the head-permutation expression, and resolves ``tensor_a2a_cp2hp``,
++``_build_thd_cp_a2a_perm`` and ``_build_head_perm_for_split_sections`` on
++``megatron.core.ssm.gated_delta_net.common`` at call time, so other patches on
++those entry points (the GDN host cache memoizes the sequence permutation) still
++apply.  Upstream's signature is checked when the patch is installed, and an
++unexpected one disables the wrapper rather than guessing -- the wrapper has to
++be re-checked against upstream whenever that function changes.
++"""
++
++from __future__ import annotations
++
++import inspect
++import logging
++import os
++
++import torch
++
++_LOGGER = logging.getLogger(__name__)
++
++# Set to "0" to keep the upstream implementation; lets a run be measured or
++# reverted without editing the tree.
++_ENABLE_ENV = "MINDSPEED_BRIDGE_GDN_FAST_HEAD_PERM"
++
++# Parameter names of megatron.core.ssm.gated_delta_net.common.a2a_cp_to_hp that
++# this wrapper mirrors. Checked before the patch is installed.
++_UPSTREAM_PARAMETERS = (
++    "qkvzba",
++    "in_proj_split_sections",
++    "cp_size",
++    "cp_group",
++    "cu_seqlens_q",
++    "seq_len",
++    "packed_seq_params",
++)
++
++
++def gdn_head_perm_a2a_wrapper(original):
++    """Reorder the GDN CP head permutation so its backward uses the dim-0 kernel.
++
++    The patched function is upstream's ``a2a_cp_to_hp`` with one statement
++    replaced: the head permutation runs as a dim-0 gather on the transposed
++    view instead of a dim-2 gather, which moves the autograd backward off the
++    slow ``IndexAdd`` kernel.  Calls the wrapper cannot serve -- no context
++    parallelism, a non-3-d ``qkvzba``, no autograd (there is no backward to fix,
++    so the cheaper upstream gather is kept) -- are forwarded to ``original``.
++    ``MINDSPEED_BRIDGE_GDN_FAST_HEAD_PERM=0`` disables the whole wrapper.
++    """
++    if os.environ.get(_ENABLE_ENV, "1") == "0":
++        _LOGGER.info("%s=0; keeping the upstream dim-2 head permutation.", _ENABLE_ENV)
++        return original
++
++    parameters = tuple(inspect.signature(original).parameters)
++    if parameters != _UPSTREAM_PARAMETERS:
++        _LOGGER.warning(
++            "a2a_cp_to_hp has an unexpected signature %s; keeping the upstream implementation, "
++            "whose dim-2 IndexAdd backward stays slow.",
++            parameters,
++        )
++        return original
++
++    _LOGGER.info("installing the GDN CP head permutation as a dim-0 gather (fast IndexAdd backward).")
++
++    def patched_a2a_cp_to_hp(
++        qkvzba, in_proj_split_sections, cp_size, cp_group, cu_seqlens_q, seq_len, packed_seq_params
++    ):
++        if cp_size <= 1 or qkvzba.dim() != 3 or not torch.is_grad_enabled():
++            return original(
++                qkvzba, in_proj_split_sections, cp_size, cp_group, cu_seqlens_q, seq_len, packed_seq_params
++            )
++
++        from megatron.core.ssm.gated_delta_net import common as gdn_common
++
++        head_perm = gdn_common._build_head_perm_for_split_sections(
++            in_proj_split_sections, cp_size, qkvzba.device
++        )
++        # Upstream: qkvzba = qkvzba.index_select(-1, head_perm)
++        qkvzba = qkvzba.transpose(0, -1).index_select(0, head_perm).transpose(0, -1).contiguous()
++
++        thd_cp_a2a_inv = None
++        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
++            qkvzba = gdn_common.tensor_a2a_cp2hp(
++                qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group, undo_attention_load_balancing=False
++            )
++            thd_cp_a2a_idx, thd_cp_a2a_inv = gdn_common._build_thd_cp_a2a_perm(cu_seqlens_q, cp_size, seq_len)
++            qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
++        else:
++            qkvzba = gdn_common.tensor_a2a_cp2hp(qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group)
++
++        return qkvzba, thd_cp_a2a_inv
++
++    return patched_a2a_cp_to_hp
++
++
++__all__ = ["gdn_head_perm_a2a_wrapper"]
+diff --git a/mindspeed_bridge/features/megatron/common/gdn_packed_seq_host_cache.py b/mindspeed_bridge/features/megatron/common/gdn_packed_seq_host_cache.py
+new file mode 100644
+index 0000000..0348883
+--- /dev/null
++++ b/mindspeed_bridge/features/megatron/common/gdn_packed_seq_host_cache.py
+@@ -0,0 +1,111 @@
++# Copyright (c) 2026, HUAWEI CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0.
++"""Host-side caching for the GDN packed-sequence context-parallel path.
++
++``_GDNBase._resolve_cu_seqlens`` and ``_build_thd_cp_a2a_perm`` are pure
++functions of tensors that the model builds once per microbatch and then hands to
++every GDN layer.  Upstream re-runs them per layer anyway: the validation costs
++three host synchronisations per call and the permutation launches about ten tiny
++indexing kernels, which a Qwen3.5-style hybrid stack repeats 24 times per
++forward pass.  On the host-bound forward phases (log-probs, reference
++log-probs) that lands directly in the step time, so the wrappers below memoize
++both results.
++
++The caches are keyed on tensor identity together with ``Tensor._version`` and
++keep the tensors they are keyed on alive, so neither a recycled ``id()`` nor an
++in-place update can produce a stale hit, while a new microbatch (new tensors)
++always recomputes.  Cached values are handed out as-is: ``_resolve_cu_seqlens``
++returns one of its inputs, and the permutation tensors are only consumed by
++``index_select``.
++"""
++
++from __future__ import annotations
++
++from collections import OrderedDict
++from typing import Any
++
++import torch
++
++# Two keys per microbatch (cu_seqlens_q / cu_seqlens_kv) plus one for the
++# permutation; the forward pass of a layer is re-run under recompute with the
++# very same tensors, so a small cache already turns every repeat into a hit.
++_CACHE_MAXSIZE = 4
++
++
++def _identity(value: Any) -> Any:
++    """Return a hashable identity key for one argument.
++
++    Tensors are keyed by object identity plus their mutation counter; nested
++    containers are keyed element-wise.  Values that are not tensors are used
++    directly, which makes the key equal only for equal scalars.
++    """
++    if isinstance(value, torch.Tensor):
++        return (id(value), value._version)
++    if isinstance(value, (list, tuple)):
++        return tuple(_identity(item) for item in value)
++    if isinstance(value, dict):
++        return tuple((key, _identity(item)) for key, item in value.items())
++    return value
++
++
++def _remember(cache: OrderedDict, key: Any, entry: Any) -> None:
++    """Insert one entry into ``cache`` and drop the least recently used one."""
++    cache[key] = entry
++    cache.move_to_end(key)
++    while len(cache) > _CACHE_MAXSIZE:
++        cache.popitem(last=False)
++
++
++def gdn_resolve_cu_seqlens_wrapper(original):
++    """Memoize ``_GDNBase._resolve_cu_seqlens`` for the repeated packed-sequence validation.
++
++    The upstream body only checks ``cu_seqlens`` against ``total_seq_len`` and
++    ``cp_size`` and returns the tensor it was given, so caching on those
++    arguments is exact.  ``name`` is deliberately not part of the key: the
++    upstream signature (positional ``cu_seqlens_padded``, ``cu_seqlens_actual``,
++    ``total_seq_len``, ``name``, keyword ``cp_size``) uses it for the error
++    message alone, and failures are never cached.
++    """
++    cache: OrderedDict = OrderedDict()
++
++    def patched_resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size=1):
++        key = (_identity(cu_seqlens_padded), _identity(cu_seqlens_actual), total_seq_len, cp_size)
++        entry = cache.get(key)
++        if entry is not None:
++            cache.move_to_end(key)
++            return entry[1]
++
++        resolved = original(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size)
++        # Keep both inputs referenced: identity keys are only safe while the
++        # objects they were built from cannot be collected and their id reused.
++        _remember(cache, key, ((cu_seqlens_padded, cu_seqlens_actual), resolved))
++        return resolved
++
++    return patched_resolve_cu_seqlens
++
++
++def gdn_thd_cp_a2a_perm_wrapper(original):
++    """Memoize ``_build_thd_cp_a2a_perm`` for the repeated per-layer CP permutation.
++
++    Every layer rebuilds the same sequence-dimension permutation from the same
++    ``cu_seqlens`` and re-allocates the same two index tensors.  Callers only
++    feed the result to ``index_select``, so sharing the cached pair is safe.
++    """
++    cache: OrderedDict = OrderedDict()
++
++    def patched_build_thd_cp_a2a_perm(cu_seqlens, cp_size, t_global):
++        key = (_identity(cu_seqlens), cp_size, t_global)
++        entry = cache.get(key)
++        if entry is not None:
++            cache.move_to_end(key)
++            return entry[1]
++
++        perm = original(cu_seqlens, cp_size, t_global)
++        _remember(cache, key, (cu_seqlens, perm))
++        return perm
++
++    return patched_build_thd_cp_a2a_perm
++
++
++__all__ = ["gdn_resolve_cu_seqlens_wrapper", "gdn_thd_cp_a2a_perm_wrapper"]
+diff --git a/mindspeed_bridge/features/megatron/moe_permute_masked_select.py b/mindspeed_bridge/features/megatron/moe_permute_masked_select.py
+index 3a8a458..33e69e4 100644
+--- a/mindspeed_bridge/features/megatron/moe_permute_masked_select.py
++++ b/mindspeed_bridge/features/megatron/moe_permute_masked_select.py
+@@ -76,6 +76,7 @@ def make_masked_select_permute(orig_permute):
+         drop_and_pad: bool = False,
+         tokens_per_expert: Optional[torch.Tensor] = None,
+         align_size: int = 0,
++        return_batch_invariant_inverse_map: bool = False,
+     ) -> Tuple[
+         torch.Tensor,
+         Optional[torch.Tensor],
+@@ -83,7 +84,7 @@ def make_masked_select_permute(orig_permute):
+         Optional[torch.Tensor],
+         Optional[torch.Tensor],
+     ]:
+-        if fused or (drop_and_pad and num_out_tokens is not None):
++        if fused or (drop_and_pad and num_out_tokens is not None) or return_batch_invariant_inverse_map:
+             return orig_permute(
+                 tokens,
+                 routing_map,
+@@ -93,6 +94,7 @@ def make_masked_select_permute(orig_permute):
+                 drop_and_pad=drop_and_pad,
+                 tokens_per_expert=tokens_per_expert,
+                 align_size=align_size,
++                return_batch_invariant_inverse_map=return_batch_invariant_inverse_map
+             )
+ 
+         num_tokens, _ = tokens.shape
+diff --git a/mindspeed_bridge/features/megatron/qwen_vl/gdn.py b/mindspeed_bridge/features/megatron/qwen_vl/gdn.py
+index 638a9b0..e9aa129 100644
+--- a/mindspeed_bridge/features/megatron/qwen_vl/gdn.py
++++ b/mindspeed_bridge/features/megatron/qwen_vl/gdn.py
+@@ -5,8 +5,12 @@
+ 
+ from __future__ import annotations
+ 
++import logging
++
+ from megatron_adaptor.features_manager.mindspeed_feature import MindSpeedFeature
+ 
++_LOGGER = logging.getLogger(__name__)
++
+ 
+ class GDNFeature(MindSpeedFeature):
+     """Install Bridge extensions required by the GDN training path.
+@@ -27,6 +31,13 @@ class GDNFeature(MindSpeedFeature):
+             _npu_causal_conv1d,
+             _npu_l2norm,
+         )
++        from mindspeed_bridge.features.megatron.common.gdn_cp_a2a_fast_perm import (
++            gdn_head_perm_a2a_wrapper,
++        )
++        from mindspeed_bridge.features.megatron.common.gdn_packed_seq_host_cache import (
++            gdn_resolve_cu_seqlens_wrapper,
++            gdn_thd_cp_a2a_perm_wrapper,
++        )
+         from mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.gated_delta_net import (
+             gated_delta_net_init_wrapper,
+         )
+@@ -41,24 +52,42 @@ class GDNFeature(MindSpeedFeature):
+ 
+         config = get_bridge_model_config(args)
+ 
+-        if getattr(config, "use_fused_causal_conv1d", False):
++        # ``use_fused_causal_conv1d`` is a model-provider field (both Qwen3.5
++        # providers declare it True, Kimi pins it False). Integrations that never
++        # bind a finalized Bridge config to ``args`` -- i.e. that call neither
++        # ``build_feature_args`` nor ``apply_overrides_and_finalize``, such as an
++        # AutoBridge-only runtime -- leave ``args.bridge_config`` unset. Reading
++        # the field with a ``False`` default then silently selects the torch conv
++        # for a model that declares the fused one, so resolve the flat runtime
++        # argument first and fall back to the Qwen3.5 default.
++        use_fused_causal_conv1d = getattr(config, "use_fused_causal_conv1d", None)
++        if use_fused_causal_conv1d is None:
++            use_fused_causal_conv1d = getattr(args, "use_fused_causal_conv1d", True)
++
++        conv1d_impl = None
++        if use_fused_causal_conv1d:
+             from mindspeed_bridge.features.megatron.common.fla_npu_causal_conv1d import (
+                 fla_npu_causal_conv1d,
++                is_fla_npu_causal_conv1d_available,
+             )
+ 
+-            patch_manager.register_patch(
+-                "fla.modules.convolution.causal_conv1d",
+-                fla_npu_causal_conv1d,
+-                force_patch=True,
+-                create_dummy=True,
+-            )
+-        else:
+-            patch_manager.register_patch(
+-                "fla.modules.convolution.causal_conv1d",
+-                _npu_causal_conv1d,
+-                force_patch=True,
+-                create_dummy=True,
+-            )
++            if is_fla_npu_causal_conv1d_available():
++                conv1d_impl = fla_npu_causal_conv1d
++            else:
++                _LOGGER.warning(
++                    "use_fused_causal_conv1d is enabled but the MindSpeed-Ops causal-conv1d "
++                    "kernels cannot be imported; falling back to the torch causal_conv1d kernel."
++                )
++
++        if conv1d_impl is None:
++            conv1d_impl = _npu_causal_conv1d
++
++        patch_manager.register_patch(
++            "fla.modules.convolution.causal_conv1d",
++            conv1d_impl,
++            force_patch=True,
++            create_dummy=True,
++        )
+         patch_manager.register_patch(
+             "fla.modules.l2norm.l2norm",
+             _npu_l2norm,
+@@ -70,6 +99,35 @@ class GDNFeature(MindSpeedFeature):
+             "megatron.core.ssm.gated_delta_net.GatedDeltaNet.__init__",
+             gated_delta_net_init_wrapper,
+         )
++        # Both targets are pure functions of the per-microbatch packed-sequence
++        # tensors that every GDN layer shares, yet upstream re-runs them per
++        # layer: the validation synchronises the host three times and the
++        # permutation rebuilds two index tensors. The wrappers memoize the
++        # results; the values they return are unchanged.
++        patch_manager.register_patch(
++            "megatron.core.ssm.gated_delta_net.common._GDNBase._resolve_cu_seqlens",
++            gdn_resolve_cu_seqlens_wrapper,
++        )
++        patch_manager.register_patch(
++            "megatron.core.ssm.gated_delta_net.common._build_thd_cp_a2a_perm",
++            gdn_thd_cp_a2a_perm_wrapper,
++        )
++        # ``common.a2a_cp_to_hp`` reorders the in_proj output along the head dim
++        # with ``index_select(-1, head_perm)``; on Ascend its autograd backward
++        # (dim-2 IndexAdd) takes the per-element CANN kernel, ~1700x the dim-0
++        # path for the same element count (295.99 ms vs 0.17 ms at
++        # [8096, 1, 3088] bf16), which cost 464 s of one 939 s actor_train
++        # window. The wrapper runs that permutation on dim 0 instead and returns
++        # the same values bit for bit (0.39 ms).
++        #
++        # ``gdn``/``gdn2`` import it by name, so register the source function
++        # only: the manager syncs the aliases it finds loaded (and a module
++        # imported later binds the patched function). Registering the call sites
++        # as well would stack a second copy of the wrapper on the same binding.
++        patch_manager.register_patch(
++            "megatron.core.ssm.gated_delta_net.common.a2a_cp_to_hp",
++            gdn_head_perm_a2a_wrapper,
++        )
+         patch_manager.register_patch(
+             "megatron.bridge.models.qwen_vl.qwen35_vl_provider.Qwen3VLModel",
+             Qwen3VLModel,
+@@ -85,6 +143,21 @@ class GDNFeature(MindSpeedFeature):
+             Qwen35VLMoEModelProvider,
+             force_patch=True,
+         )
++        # The upstream Bridge classes bind ``PROVIDER_CLASS`` while their class body
++        # executes, so replacing the module attribute above never reaches an
++        # AutoBridge-based entrypoint (it keeps instantiating the upstream provider,
++        # which has no ``use_ascend_gdn``/``use_triton_gdn`` and silently falls back
++        # to the torch kernel). Patch the class attributes themselves.
++        patch_manager.register_patch(
++            "megatron.bridge.models.qwen_vl.qwen35_vl_bridge.Qwen35VLBridge.PROVIDER_CLASS",
++            Qwen35VLModelProvider,
++            force_patch=True,
++        )
++        patch_manager.register_patch(
++            "megatron.bridge.models.qwen_vl.qwen35_vl_bridge.Qwen35VLMoEBridge.PROVIDER_CLASS",
++            Qwen35VLMoEModelProvider,
++            force_patch=True,
++        )
+ 
+ 
+ __all__ = ["GDNFeature"]
+diff --git a/mindspeed_bridge/models/glm_vl/glm53_flash_bridge.py b/mindspeed_bridge/models/glm_vl/glm53_flash_bridge.py
+index f2d8eb5..f2e2778 100644
+--- a/mindspeed_bridge/models/glm_vl/glm53_flash_bridge.py
++++ b/mindspeed_bridge/models/glm_vl/glm53_flash_bridge.py
+@@ -19,7 +19,7 @@ from megatron.bridge.models.conversion.param_mapping import (
+     MegatronParamMapping,
+     ReplicatedMapping,
+ )
+-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
++from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+ 
+ from mindspeed_bridge.models.glm_moe_dsa.glm_moe_mappings import (
+     GLMExpertDownProjMapping,
+@@ -54,7 +54,7 @@ class GLM53FlashBridge(MegatronModelBridge):
+         legacy_switch = getattr(config, "index_kpool_compress", None)
+         return bool(legacy_switch) if legacy_switch is not None else int(getattr(config, "index_kpool", 1)) > 1
+ 
+-    def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> GLM53FlashModelProvider:
++    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> GLM53FlashModelProvider:
+         vl_config = hf_pretrained.config
+         text_config = vl_config.text_config
+         vision_config = vl_config.vision_config
+diff --git a/mindspeed_bridge/models/kimi/kimi_k3_bridge.py b/mindspeed_bridge/models/kimi/kimi_k3_bridge.py
+index 34597db..9b1f7ed 100644
+--- a/mindspeed_bridge/models/kimi/kimi_k3_bridge.py
++++ b/mindspeed_bridge/models/kimi/kimi_k3_bridge.py
+@@ -37,7 +37,7 @@ from megatron.bridge.models.conversion.param_mapping import (
+     ReplicatedMapping,
+     RowParallelMapping,
+ )
+-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
++from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+ from mindspeed_bridge.models.conversion import quantization_utils
+ from mindspeed_bridge.models.kimi.modelling_kimi_moe_kda.kimi_k3_model import KimiK3Model
+ from mindspeed_bridge.models.kimi.kimi_k3_provider import KimiK3ModelProvider
+@@ -74,7 +74,7 @@ class KimiK3Bridge(MegatronModelBridge):
+         """Map the nested K3 language configuration with the common config mappings."""
+         return super().hf_config_to_provider_kwargs(getattr(hf_config, "text_config", hf_config))
+ 
+-    def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> KimiK3ModelProvider:
++    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> KimiK3ModelProvider:
+         """Translate the nested Kimi K3 text configuration."""
+         hf_config = hf_pretrained.config
+         text_config = hf_config.text_config
+@@ -387,7 +387,7 @@ class KimiK3Bridge(MegatronModelBridge):
+     def stream_weights_megatron_to_hf(
+         self,
+         megatron_model: GPTModel | list[GPTModel],
+-        hf_pretrained: PreTrainedVLM,
++        hf_pretrained: PreTrainedCausalLM,
+         cpu: bool = True,
+         show_progress: bool = True,
+         conversion_tasks: list[WeightConversionTask] | None = None,
+diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net_old.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net_old.py
+new file mode 100644
+index 0000000..5c76ffd
+--- /dev/null
++++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net_old.py
+@@ -0,0 +1,869 @@
++# pylint: disable=R0801
++from typing import List, Optional, Tuple
++import os
++import torch
++from torch import nn
++import torch.nn.functional as F
++from torch import Tensor
++
++from megatron.core.fp8_utils import get_fp8_align_size
++from megatron.core.inference.contexts import BaseInferenceContext
++from megatron.core.jit import jit_fuser
++from megatron.core.packed_seq_params import PackedSeqParams
++from megatron.core.process_groups_config import ProcessGroupCollection
++from megatron.core.ssm.mamba_context_parallel import (
++    _all_to_all_cp2hp,
++    _all_to_all_hp2cp,
++    _redo_attention_load_balancing,
++    _undo_attention_load_balancing,
++)
++from megatron.core.tensor_parallel import get_cuda_rng_tracker
++from megatron.core.transformer import TransformerConfig
++from megatron.core.transformer.module import MegatronModule
++from megatron.core.transformer.spec_utils import build_module
++from megatron.core.transformer.utils import (
++    ensure_metadata_has_dp_cp_group,
++    make_sharded_tensors_for_checkpoint,
++    sharded_state_dict_default,
++)
++from megatron.core.utils import (
++    deprecate_inference_params,
++    nvtx_range_pop,
++    nvtx_range_push,
++)
++from megatron.core.ssm.gated_delta_net import (
++    GatedDeltaNetSubmodules,
++    _split_tensor_factory,
++)
++
 +if os.environ.get("MINDSPEED_BRIDGE_GDN_USE_TORCH_CONV", "0") == "1":
-     causal_conv1d = None
--    causal_conv1d_update = None
++    causal_conv1d = None
 +else:
 +    try:
 +        import fla_npu
 +        from fla.modules.convolution import causal_conv1d
 +    except ImportError:
 +        causal_conv1d = None
- 
--from mindspeed_ops.api.triton.l2norm import l2norm
- from mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.chunk_gated_delta_rule import (
-     torch_chunk_gated_delta_rule,
- )
-@@ -59,6 +61,12 @@ except ImportError:
- 
- from mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.flash_gated_delta_rule import flash_gated_delta_rule
- 
++
++from mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.chunk_gated_delta_rule import (
++    torch_chunk_gated_delta_rule,
++)
++
++try:
++    from mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.chunk_gated_delta_rule import (
++        chunk_gated_delta_rule,
++    )
++
++    HAVE_FLA = True
++except ImportError:
++    chunk_gated_delta_rule = None
++    HAVE_FLA = False
++
++from mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.flash_gated_delta_rule import flash_gated_delta_rule
++
++
 +def naive_l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
 +    """This function is intended to align with the l2norm implementation in the FLA library."""
 +    original_dtype = x.dtype
 +    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
 +    # Counteract verl's autocast promotion (bf16 -> fp32) by restoring original dtype
 +    return (x * inv_norm).to(original_dtype)
- 
- class GatedDeltaNet(MegatronModule):
-     """Gated Delta Net (GDN) layer class
-@@ -191,9 +199,10 @@ class GatedDeltaNet(MegatronModule):
-         )
-         setattr(self.A_log, "tensor_model_parallel", True)
- 
--        if HAVE_FLA and self.use_triton_gdn:
++
++
++class GatedDeltaNet(MegatronModule):
++    """Gated Delta Net (GDN) layer class
++
++    GDN layer takes input with size [s, b, h]
++    and returns output of the same size.
++    """
++
++    def __init__(
++        self,
++        config: TransformerConfig,
++        submodules: GatedDeltaNetSubmodules,
++        layer_number: int = None,
++        bias: bool = False,
++        conv_bias: bool = False,
++        conv_init: Optional[float] = None,
++        use_qk_l2norm: bool = True,
++        A_init_range: Tuple[float, float] = (1, 16),
++        pg_collection: ProcessGroupCollection = None,
++        **kwargs,
++    ):
++        """
++        Args:
++            config: The config of the model.
++            submodules: Contains the module specs for the input and output linear layers.
++            layer_number: The layer number of this GDN layer.
++            bias: Whether to use bias in the linear layers.
++            conv_bias: Whether to use bias in the causal convolution.
++            conv_init: The initialization range for the causal convolution weights.
++            use_qk_l2norm: Whether to use L2 normalization in the kernel of the gated delta rule.
++            A_init_range: The initialization range for the attention weights.
++            pg_collection: The required process groups to use for tensor model parallel and context
++                parallel.
++        """
++
++        super().__init__(config)
++
++        # Attributes from arguments
++        self.layer_number = layer_number
++        self.bias = bias
++        self.conv_bias = conv_bias
++        self.conv_init = conv_init
++        assert A_init_range[0] >= 0 and A_init_range[1] >= A_init_range[0]
++        self.A_init_range = A_init_range
++        self.use_qk_l2norm = use_qk_l2norm
++        assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
++        self.pg_collection = pg_collection
++        self.cp_size = self.pg_collection.cp.size()
++        self.tp_size = self.pg_collection.tp.size()
++        self.sp_size = self.tp_size if config.sequence_parallel else 1
++
++        # Attributes from config
++        self.config = config
++        self.hidden_size = config.hidden_size
++        self.act_fn = config.activation_func
++        self.activation = self.act_fn.__name__
++        self.conv_kernel_dim = config.linear_conv_kernel_dim
++        self.key_head_dim = config.linear_key_head_dim
++        self.value_head_dim = config.linear_value_head_dim
++        self.num_key_heads = config.linear_num_key_heads
++        self.num_value_heads = config.linear_num_value_heads
++        self.qk_dim = self.key_head_dim * self.num_key_heads
++        self.v_dim = self.value_head_dim * self.num_value_heads
++        self.qk_dim_local_tp = self.qk_dim // self.tp_size
++        self.v_dim_local_tp = self.v_dim // self.tp_size
++        self.use_triton_gdn = getattr(config, "use_triton_gdn", False)
++        self.use_ascend_gdn = getattr(config, "use_ascend_gdn", False)
++
++        # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
++        # We may remove this restriction in the future.
++        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.num_value_heads * 2
++        if self.config.fp8:
++            fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
++            assert self.in_proj_dim % fp8_align_size == 0, (
++                "For FP8, the innermost dimension of the GDN layer "
++                "input projection output tensor must be a multiple of 16."
++            )
++        self.in_proj = build_module(
++            submodules.in_proj,
++            self.hidden_size,
++            self.in_proj_dim,
++            config=self.config,
++            init_method=self.config.init_method,
++            gather_output=False,
++            bias=bias,
++            skip_bias_add=False,
++            is_expert=False,
++            tp_comm_buffer_name="fc1",
++            tp_group=self.pg_collection.tp,
++        )
++
++        # Conv1d for QKV
++        self.conv_dim = self.qk_dim * 2 + self.v_dim
++        self.conv_dim_local_tp = self.conv_dim // self.tp_size
++
++        # weight shape: [conv_dim, 1, d_conv]
++        # bias shape: [conv_dim]
++        self.conv1d = nn.Conv1d(
++            in_channels=self.conv_dim_local_tp,
++            out_channels=self.conv_dim_local_tp,
++            bias=conv_bias,
++            kernel_size=self.conv_kernel_dim,
++            groups=self.conv_dim_local_tp,
++            padding=self.conv_kernel_dim - 1,
++            device=torch.cuda.current_device(),
++            dtype=config.params_dtype,
++        )
++        setattr(self.conv1d.weight, "tensor_model_parallel", True)
++        if conv_bias:
++            setattr(self.conv1d.bias, "tensor_model_parallel", True)
++
++        # Time step projection (discretization)
++        self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
++        # dt_bias parameter
++        self.dt_bias = nn.Parameter(
++            torch.empty(
++                self.num_v_heads_local_tp,
++                dtype=config.params_dtype,
++                device=torch.cuda.current_device(),
++            )
++        )
++        setattr(self.dt_bias, "tensor_model_parallel", True)
++        # A_log parameter
++        self.A_log = nn.Parameter(
++            torch.empty(
++                self.num_v_heads_local_tp,
++                dtype=config.params_dtype,
++                device=torch.cuda.current_device(),
++            )
++        )
++        setattr(self.A_log, "tensor_model_parallel", True)
++
 +        gdn_backend = os.environ.get("MINDSPEED_BRIDGE_GDN_BACKEND", "triton").strip().lower()
 +        if gdn_backend == "triton":
-             self.gated_delta_rule = chunk_gated_delta_rule
--        elif self.use_ascend_gdn:
-+        elif gdn_backend=="ascendc":
-             self.gated_delta_rule = flash_gated_delta_rule
-         else:
-             self.gated_delta_rule = torch_chunk_gated_delta_rule
-@@ -474,7 +483,7 @@ class GatedDeltaNet(MegatronModule):
-             beta=beta,
-             initial_state=None,
-             output_final_state=False,
--            use_qk_l2norm_in_kernel=True,
++            self.gated_delta_rule = chunk_gated_delta_rule
++        elif gdn_backend == "ascendc":
++            self.gated_delta_rule = flash_gated_delta_rule
++        else:
++            self.gated_delta_rule = torch_chunk_gated_delta_rule
++
++        # Output layernorm before projection
++        self.out_norm = build_module(
++            submodules.out_norm,
++            config=self.config,
++            hidden_size=self.value_head_dim,
++            eps=self.config.layernorm_epsilon,
++        )
++
++        self.out_proj = build_module(
++            submodules.out_proj,
++            self.v_dim,
++            self.hidden_size,
++            config=self.config,
++            init_method=self.config.output_layer_init_method,
++            bias=bias,
++            input_is_parallel=True,
++            skip_bias_add=True,
++            is_expert=False,
++            tp_comm_buffer_name="fc2",
++            tp_group=self.pg_collection.tp,
++        )
++
++        self.reset_parameters()
++
++    def reset_parameters(self):
++        """Reset the parameters."""
++        if self.config.perform_initialization:
++            with get_cuda_rng_tracker().fork():
++                # conv1d.weight
++                if self.conv_init is not None:
++                    nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
++                # dt_bias
++                torch.ones(
++                    self.num_v_heads_local_tp,
++                    out=self.dt_bias.data,
++                    dtype=self.config.params_dtype,
++                    device=torch.cuda.current_device(),
++                )
++                # A_log
++                A = torch.empty(
++                    self.num_v_heads_local_tp,
++                    dtype=self.config.params_dtype,
++                    device=torch.cuda.current_device(),
++                ).uniform_(*self.A_init_range)
++                self.A_log.data.copy_(torch.log(A))
++
++    def forward(
++        self,
++        hidden_states: Tensor,
++        attention_mask: Tensor,
++        inference_context: Optional[BaseInferenceContext] = None,
++        packed_seq_params: Optional[PackedSeqParams] = None,
++        sequence_len_offset: Optional[int] = None,
++        *,
++        inference_params: Optional[BaseInferenceContext] = None,
++        **kwargs,
++    ):
++        """
++        Perform a forward pass through the GDN module.
++
++        Args:
++            hidden_states (Tensor): Hidden states.
++            attention_mask (Tensor): Attention mask.
++            inference_context (Optional[BaseInferenceContext]): Inference context that manages
++                KV cache.
++            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
++            sequence_len_offset (Optional[int]): Sequence length offset used for
++                inference CUDA graphs.
++
++        Return:
++            (Tuple[Tensor, Tensor]) GDN output and bias.
++
++        """
++        inference_context = deprecate_inference_params(inference_context, inference_params)
++
++        seq_len, batch, _ = hidden_states.shape
++        seq_len = seq_len * self.sp_size * self.cp_size
++
++        if inference_context is not None:
++            assert inference_context.is_static_batching(), "GDN does not currently support dynamic inference batching."
++            assert not self.config.sequence_parallel
++            raise NotImplementedError("GDN does not support inference for now.")
++
++        if packed_seq_params is not None:
++            assert batch == 1, "Packed sequence expects batch dimension to be 1"
++            assert not self.config.deterministic_mode, "Packed sequence does not support deterministic mode."
++
++            # Prefer cu_seqlens_q_padded if available, otherwise use cu_seqlens_q
++            if packed_seq_params.cu_seqlens_q_padded is not None:
++                cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
++            else:
++                cu_seqlens_q = packed_seq_params.cu_seqlens_q
++            # Prefer cu_seqlens_kv_padded if available, otherwise use cu_seqlens_kv
++            if packed_seq_params.cu_seqlens_kv_padded is not None:
++                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
++            else:
++                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
++            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
++                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
++                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++            )
++            num_packed_seqs = cu_seqlens_q.shape[0] - 1
++            assert num_packed_seqs > 0, (
++                f"Number of packed sequences must be greater than 0, but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++            )
++        else:
++            cu_seqlens_q = None
++            cu_seqlens_kv = None
++
++        # Input projection
++        nvtx_range_push(suffix="in_proj")
++        qkvzba, _ = self.in_proj(hidden_states)
++        nvtx_range_pop(suffix="in_proj")
++
++        if packed_seq_params is not None:
++            unpacked_qkvzba = self._unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
++            outputs = []
++            for qkvzba_i in unpacked_qkvzba:
++                qkvzba_i = tensor_a2a_cp2hp(
++                    qkvzba_i,
++                    seq_dim=0,
++                    head_dim=-1,
++                    cp_group=self.pg_collection.cp,
++                    split_sections=[
++                        self.qk_dim_local_tp,
++                        self.qk_dim_local_tp,
++                        self.v_dim_local_tp,
++                        self.v_dim_local_tp,
++                        self.num_value_heads // self.tp_size,
++                        self.num_value_heads // self.tp_size,
++                    ],
++                )
++                outputs.append(qkvzba_i)
++            qkvzba = torch.cat(outputs, dim=0)
++        else:
++            qkvzba = tensor_a2a_cp2hp(
++                qkvzba,
++                seq_dim=0,
++                head_dim=-1,
++                cp_group=self.pg_collection.cp,
++                split_sections=[
++                    self.qk_dim_local_tp,
++                    self.qk_dim_local_tp,
++                    self.v_dim_local_tp,
++                    self.v_dim_local_tp,
++                    self.num_value_heads // self.tp_size,
++                    self.num_value_heads // self.tp_size,
++                ],
++            )
++
++        # Transpose: s b x --> b s x
++        # From sbhd to bshd format
++        qkvzba = qkvzba.transpose(0, 1)
++
++        # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
++        qkv, gate, beta, alpha = torch.split(
++            qkvzba,
++            [
++                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
++                self.v_dim_local_tp // self.cp_size,
++                self.num_value_heads // self.tp_size // self.cp_size,
++                self.num_value_heads // self.tp_size // self.cp_size,
++            ],
++            dim=-1,
++        )
++        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
++        beta = beta.reshape(batch, seq_len, -1)
++        alpha = alpha.reshape(batch, seq_len, -1)
++
++        # Convolution on qkv
++        nvtx_range_push(suffix="conv1d")
++        seq_len = qkv.shape[1]
++        qkv_channels_split_sections = [
++            self.qk_dim_local_tp,
++            self.qk_dim_local_tp,
++            self.v_dim_local_tp,
++        ]
++        conv1d_weight = get_parameter_local_cp(
++            self.conv1d.weight,
++            dim=0,
++            cp_group=self.pg_collection.cp,
++            split_sections=qkv_channels_split_sections,
++        )
++        conv1d_bias = (
++            get_parameter_local_cp(
++                self.conv1d.bias,
++                dim=0,
++                cp_group=self.pg_collection.cp,
++                split_sections=qkv_channels_split_sections,
++            )
++            if self.conv_bias
++            else None
++        )
++
++        if (causal_conv1d is None) or self.config.deterministic_mode:
++            if packed_seq_params is not None:
++                # Packed sequence: process each sequence separately with for loop
++                cu_seqlens_q_list = cu_seqlens_q.tolist()
++                num_seqs = len(cu_seqlens_q_list) - 1
++                qkv_out_list = []
++
++                for i in range(num_seqs):
++                    start_idx = cu_seqlens_q_list[i]
++                    end_idx = cu_seqlens_q_list[i + 1]
++                    seq_len_i = end_idx - start_idx
++
++                    # Extract this sequence: [b, seq_len_i, d] -> [b, d, seq_len_i]
++                    qkv_i = qkv[:, start_idx:end_idx, :].transpose(1, 2).contiguous()
++
++                    # Apply conv1d
++                    conv_out_i = F.conv1d(
++                        input=qkv_i,
++                        weight=conv1d_weight,
++                        bias=conv1d_bias,
++                        stride=self.conv1d.stride,
++                        padding=self.conv1d.padding,
++                        dilation=self.conv1d.dilation,
++                        groups=self.conv_dim_local_tp // self.cp_size,
++                    )
++
++                    # Apply activation and truncate
++                    qkv_i = self.act_fn(conv_out_i[..., :seq_len_i])
++                    qkv_i = qkv_i.transpose(1, 2)  # [b, seq_len_i, d]
++                    qkv_out_list.append(qkv_i)
++
++                # Concatenate all sequences back
++                qkv = torch.cat(qkv_out_list, dim=1)
++            else:
++                qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
++                conv_out = F.conv1d(
++                    input=qkv,
++                    weight=conv1d_weight,
++                    bias=conv1d_bias,
++                    stride=self.conv1d.stride,
++                    padding=self.conv1d.padding,
++                    dilation=self.conv1d.dilation,
++                    groups=self.conv_dim_local_tp // self.cp_size,
++                )
++                qkv = self.act_fn(conv_out[..., :seq_len])
++                qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
++        else:
++            assert self.activation in ["silu", "swish"]
++            qkv, _ = causal_conv1d(
++                x=qkv,  # FLA conv1d accepts [b, s, d] format input
++                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
++                bias=conv1d_bias,
++                activation=self.activation,
++                initial_state=None,
++                output_final_state=False,
++                cu_seqlens=cu_seqlens_q,
++            )
++        nvtx_range_pop(suffix="conv1d")
++
++        # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
++        nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
++        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
++            qkv, gate, beta, alpha, batch, seq_len
++        )
++        nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
++
++        # Calculate g and beta
++        nvtx_range_push(suffix="g_and_beta")
++        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
++        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=self.pg_collection.cp)
++        g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
++        nvtx_range_pop(suffix="g_and_beta")
++
++        nvtx_range_push(suffix="gated_delta_rule")
++        core_attn_out, last_recurrent_state = self.gated_delta_rule(
++            query,
++            key,
++            value,
++            g=g,
++            beta=beta,
++            initial_state=None,
++            output_final_state=False,
 +            use_qk_l2norm_in_kernel=False,
-             cu_seqlens=cu_seqlens_q,
-         )
-         nvtx_range_pop(suffix="gated_delta_rule")
-@@ -555,7 +564,7 @@ class GatedDeltaNet(MegatronModule):
- 
-         # Apply L2 norm to query and key
-         if self.use_qk_l2norm:
--            query_key = l2norm(query_key.contiguous())
++            cu_seqlens=cu_seqlens_q,
++        )
++        nvtx_range_pop(suffix="gated_delta_rule")
++
++        # RMSNorm
++        nvtx_range_push(suffix="gated_norm")
++        norm_out = self._apply_gated_norm(core_attn_out, gate)
++        nvtx_range_pop(suffix="gated_norm")
++
++        # Transpose: b s x --> s b x
++        # From bshd back to sbhd format
++        norm_out = norm_out.reshape(batch, seq_len, -1)
++        norm_out = norm_out.transpose(0, 1).contiguous()
++
++        # CP all to all: HP to CP
++        # norm_out = tensor_a2a_hp2cp(
++        #     norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
++        # )
++
++        if packed_seq_params is not None:
++            unpacked_norm_out = self._unpack_sequence(norm_out, cu_seqlens_q, dim=0)
++            outputs = []
++            for norm_out_i in unpacked_norm_out:
++                norm_out_i = tensor_a2a_hp2cp(norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
++                outputs.append(norm_out_i)
++            norm_out = torch.cat(outputs, dim=0)
++        else:
++            norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
++
++        # Output projection
++        nvtx_range_push(suffix="out_proj")
++        out, out_bias = self.out_proj(norm_out)
++        nvtx_range_pop(suffix="out_proj")
++
++        return out, out_bias
++
++    def _unpack_sequence(self, x, cu_seqlens, dim=1):
++        unpacked_x = []
++        num_seqs = cu_seqlens.shape[0] - 1
++        for i in range(num_seqs):
++            idx_start = cu_seqlens[i].item()
++            idx_end = cu_seqlens[i + 1].item()
++            chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
++            unpacked_x.append(x[tuple(chunked_index)])
++        return unpacked_x
++
++    @jit_fuser
++    def _apply_gated_norm(self, x, gate):
++        # Output Norm
++        x_dtype = x.dtype
++        x = x.reshape(-1, x.shape[-1])
++        y = self.out_norm(x)
++        # Output gate
++        gate = gate.reshape(-1, gate.shape[-1])
++        y = y * self.act_fn(gate.float())
++        y = y.to(x_dtype)
++        return y
++
++    @jit_fuser
++    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
++        """
++        Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
++        Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
++        """
++        # Split qkv into query_key and value
++        query_key, value = torch.split(
++            qkv,
++            [
++                2 * self.qk_dim_local_tp // self.cp_size,
++                self.v_dim_local_tp // self.cp_size,
++            ],
++            dim=-1,
++        )
++
++        # Reshape query_key and value
++        query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
++        value = value.reshape(batch, seq_len, -1, self.value_head_dim)
++
++        # Apply L2 norm to query and key
++        if self.use_qk_l2norm:
 +            query_key = naive_l2norm(query_key.contiguous())
- 
-         # Split query and key
-         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
-diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
-index 529eaa3..1df512c 100644
---- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
-+++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
-@@ -108,6 +108,7 @@ class Qwen3VLGPTModel(GPTModel):
-         # args for deepstack
-         visual_pos_masks: Optional[torch.Tensor] = None,
-         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
-+        mtp_kwargs: Optional[dict] = None,
-     ) -> Tensor:
-         """Forward function of the GPT Model This function passes the input tensors
-         through the embedding layer, and then the decoeder and finally into the post
-@@ -195,6 +196,7 @@ class Qwen3VLGPTModel(GPTModel):
-             runtime_gather_output=runtime_gather_output,
-             extra_block_kwargs=extra_block_kwargs,
-             inference_context=inference_context,
-+            mtp_kwargs=mtp_kwargs,
-         )
- 
-         if _shadow_embedding:
-diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py
-index 5d03f85..2488ef7 100644
---- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py
-+++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py
-@@ -56,6 +56,8 @@ def get_vision_model_config(hf_config, megatron_config=None):
-         ffn_hidden_size=hf_config.intermediate_size,
-         add_bias_linear=True,
-         add_qkv_bias=True,
-+        moe_permute_fusion=False,              # ← 新增：vision model 没有 MoE，不需要 permute fusion
-+        use_fused_moe_token_permute_and_unpermute=False,  # ← 新增：同上
-     )
- 
-     # apply text model config to vision model config
-diff --git a/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py b/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py
-index ebbd2a3..9accb3f 100644
---- a/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py
-+++ b/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py
-@@ -458,62 +458,53 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
-         # Megatron VL prefix: language_model.mtp.*
-         # HF prefix: mtp.* (top-level, not under model.language_model.)
-         # =================================================================
--        if not hasattr(self, "_hf_config"):
--            logger.warning("No HF config found, skipping MTP mappings.")
--            return MegatronMappingRegistry(*mapping_list)
--
--        hf_config = self._hf_config
--        num_mtp_layers = getattr(hf_config.text_config, "mtp_num_hidden_layers", None)
--
--        if num_mtp_layers is not None:
--            for mtp_layer in range(num_mtp_layers):
--                mtp_param_mappings = {
--                    f"language_model.mtp.layers.{mtp_layer}.eh_proj.weight": "mtp.fc.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.final_layernorm.weight": "mtp.norm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.router.weight": f"mtp.layers.{mtp_layer}.mlp.gate.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.pre_mlp_layernorm.weight": f"mtp.layers.{mtp_layer}.post_attention_layernorm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_qkv.layer_norm_weight": f"mtp.layers.{mtp_layer}.input_layernorm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.q_layernorm.weight": f"mtp.layers.{mtp_layer}.self_attn.q_norm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.k_layernorm.weight": f"mtp.layers.{mtp_layer}.self_attn.k_norm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_proj.weight": f"mtp.layers.{mtp_layer}.self_attn.o_proj.weight",
--                }
--                for megatron_param, hf_param in mtp_param_mappings.items():
--                    mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
--
--                mapping_list.extend(
--                    [
--                        QKVMapping(
--                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_qkv.weight",
--                            q=f"mtp.layers.{mtp_layer}.self_attn.q_proj.weight",
--                            k=f"mtp.layers.{mtp_layer}.self_attn.k_proj.weight",
--                            v=f"mtp.layers.{mtp_layer}.self_attn.v_proj.weight",
--                        ),
--                        GatedMLPMapping(
--                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.experts.linear_fc1.weight*",
--                            gate=f"mtp.layers.{mtp_layer}.mlp.experts.*.gate_proj.weight",
--                            up=f"mtp.layers.{mtp_layer}.mlp.experts.*.up_proj.weight",
--                        ),
--                        AutoMapping(
--                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.experts.linear_fc2.weight*",
--                            hf_param=f"mtp.layers.{mtp_layer}.mlp.experts.*.down_proj.weight",
--                        ),
--                        GatedMLPMapping(
--                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.shared_experts.linear_fc1.weight",
--                            gate=f"mtp.layers.{mtp_layer}.mlp.shared_expert.gate_proj.weight",
--                            up=f"mtp.layers.{mtp_layer}.mlp.shared_expert.up_proj.weight",
--                        ),
--                        AutoMapping(
--                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.shared_experts.linear_fc2.weight",
--                            hf_param=f"mtp.layers.{mtp_layer}.mlp.shared_expert.down_proj.weight",
--                        ),
--                        ReplicatedMapping(
--                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.shared_experts.gate_weight",
--                            hf_param=f"mtp.layers.{mtp_layer}.mlp.shared_expert_gate.weight",
--                        ),
--                    ]
--                )
-+        mtp_param_mappings = {
-+            "language_model.mtp.layers.0.eh_proj.weight": "mtp.fc.weight",
-+            "language_model.mtp.layers.0.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
-+            "language_model.mtp.layers.0.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
-+            "language_model.mtp.layers.0.final_layernorm.weight": "mtp.norm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.mlp.router.weight": "mtp.layers.0.mlp.gate.weight",
-+            "language_model.mtp.layers.0.transformer_layer.pre_mlp_layernorm.weight": "mtp.layers.0.post_attention_layernorm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.self_attention.linear_qkv.layer_norm_weight": "mtp.layers.0.input_layernorm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.self_attention.q_layernorm.weight": "mtp.layers.0.self_attn.q_norm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.self_attention.k_layernorm.weight": "mtp.layers.0.self_attn.k_norm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.self_attention.linear_proj.weight": "mtp.layers.0.self_attn.o_proj.weight",
-+        }
-+        for megatron_param, hf_param in mtp_param_mappings.items():
-+            mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
 +
-+        mapping_list.extend(
-+            [
-+                QKVMapping(
-+                    megatron_param="language_model.mtp.layers.0.transformer_layer.self_attention.linear_qkv.weight",
-+                    q="mtp.layers.0.self_attn.q_proj.weight",
-+                    k="mtp.layers.0.self_attn.k_proj.weight",
-+                    v="mtp.layers.0.self_attn.v_proj.weight",
-+                ),
-+                GatedMLPMapping(
-+                    megatron_param="language_model.mtp.layers.0.transformer_layer.mlp.experts.linear_fc1.weight*",
-+                    gate="mtp.layers.0.mlp.experts.*.gate_proj.weight",
-+                    up="mtp.layers.0.mlp.experts.*.up_proj.weight",
-+                ),
-+                AutoMapping(
-+                    megatron_param="language_model.mtp.layers.0.transformer_layer.mlp.experts.linear_fc2.weight*",
-+                    hf_param="mtp.layers.0.mlp.experts.*.down_proj.weight",
-+                ),
-+                GatedMLPMapping(
-+                    megatron_param="language_model.mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc1.weight",
-+                    gate="mtp.layers.0.mlp.shared_expert.gate_proj.weight",
-+                    up="mtp.layers.0.mlp.shared_expert.up_proj.weight",
-+                ),
-+                AutoMapping(
-+                    megatron_param="language_model.mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc2.weight",
-+                    hf_param="mtp.layers.0.mlp.shared_expert.down_proj.weight",
-+                ),
-+                ReplicatedMapping(
-+                    megatron_param="language_model.mtp.layers.0.transformer_layer.mlp.shared_experts.gate_weight",
-+                    hf_param="mtp.layers.0.mlp.shared_expert_gate.weight",
-+                ),
-+            ]
-+        )
- 
-         return MegatronMappingRegistry(*mapping_list)
- 
-@@ -769,46 +760,37 @@ class Qwen35VLBridge(MegatronModelBridge):
-         # Megatron VL prefix: language_model.mtp.*
-         # HF prefix: mtp.* (top-level, not under model.language_model.)
-         # =================================================================
--        if not hasattr(self, "_hf_config"):
--            logger.warning("No HF config found, skipping MTP mappings.")
--            return MegatronMappingRegistry(*mapping_list)
--
--        hf_config = self._hf_config
--        num_mtp_layers = getattr(hf_config.text_config, "mtp_num_hidden_layers", None)
--
--        if num_mtp_layers is not None:
--            for mtp_layer in range(num_mtp_layers):
--                mtp_param_mappings = {
--                    f"language_model.mtp.layers.{mtp_layer}.eh_proj.weight": "mtp.fc.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.final_layernorm.weight": "mtp.norm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.linear_fc1.layer_norm_weight": f"mtp.layers.{mtp_layer}.post_attention_layernorm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.linear_fc2.weight": f"mtp.layers.{mtp_layer}.mlp.down_proj.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.pre_mlp_layernorm.weight": f"mtp.layers.{mtp_layer}.post_attention_layernorm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_qkv.layer_norm_weight": f"mtp.layers.{mtp_layer}.input_layernorm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.q_layernorm.weight": f"mtp.layers.{mtp_layer}.self_attn.q_norm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.k_layernorm.weight": f"mtp.layers.{mtp_layer}.self_attn.k_norm.weight",
--                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_proj.weight": f"mtp.layers.{mtp_layer}.self_attn.o_proj.weight",
--                }
--                for megatron_param, hf_param in mtp_param_mappings.items():
--                    mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
--
--                mapping_list.extend(
--                    [
--                        QKVMapping(
--                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_qkv.weight",
--                            q=f"mtp.layers.{mtp_layer}.self_attn.q_proj.weight",
--                            k=f"mtp.layers.{mtp_layer}.self_attn.k_proj.weight",
--                            v=f"mtp.layers.{mtp_layer}.self_attn.v_proj.weight",
--                        ),
--                        GatedMLPMapping(
--                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.linear_fc1.weight",
--                            gate=f"mtp.layers.{mtp_layer}.mlp.gate_proj.weight",
--                            up=f"mtp.layers.{mtp_layer}.mlp.up_proj.weight",
--                        ),
--                    ]
--                )
-+        mtp_param_mappings = {
-+            "language_model.mtp.layers.0.eh_proj.weight": "mtp.fc.weight",
-+            "language_model.mtp.layers.0.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
-+            "language_model.mtp.layers.0.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
-+            "language_model.mtp.layers.0.final_layernorm.weight": "mtp.norm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.mlp.linear_fc1.layer_norm_weight": "mtp.layers.0.post_attention_layernorm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.mlp.linear_fc2.weight": "mtp.layers.0.mlp.down_proj.weight",
-+            "language_model.mtp.layers.0.transformer_layer.self_attention.linear_qkv.layer_norm_weight": "mtp.layers.0.input_layernorm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.pre_mlp_layernorm.weight": "mtp.layers.0.post_attention_layernorm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.self_attention.q_layernorm.weight": "mtp.layers.0.self_attn.q_norm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.self_attention.k_layernorm.weight": "mtp.layers.0.self_attn.k_norm.weight",
-+            "language_model.mtp.layers.0.transformer_layer.self_attention.linear_proj.weight": "mtp.layers.0.self_attn.o_proj.weight",
-+        }
-+        for megatron_param, hf_param in mtp_param_mappings.items():
-+            mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
++        # Split query and key
++        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
++        query, key = torch.split(query_key, [split_size, split_size], dim=2)
 +
-+        mapping_list.extend(
-+            [
-+                QKVMapping(
-+                    megatron_param="language_model.mtp.layers.0.transformer_layer.self_attention.linear_qkv.weight",
-+                    q="mtp.layers.0.self_attn.q_proj.weight",
-+                    k="mtp.layers.0.self_attn.k_proj.weight",
-+                    v="mtp.layers.0.self_attn.v_proj.weight",
-+                ),
-+                GatedMLPMapping(
-+                    megatron_param="language_model.mtp.layers.0.transformer_layer.mlp.linear_fc1.weight",
-+                    gate="mtp.layers.0.mlp.gate_proj.weight",
-+                    up="mtp.layers.0.mlp.up_proj.weight",
-+                ),
-+            ]
++        # Expand query and key if needed (grouped query attention)
++        if self.num_value_heads // self.num_key_heads > 1:
++            repeat_factor = self.num_value_heads // self.num_key_heads
++            query = query.repeat_interleave(repeat_factor, dim=2)
++            key = key.repeat_interleave(repeat_factor, dim=2)
++
++        # Make all tensors contiguous
++        query = query.contiguous()
++        key = key.contiguous()
++        value = value.contiguous()
++        gate = gate.contiguous()
++        beta = beta.contiguous()
++        alpha = alpha.contiguous()
++
++        return query, key, value, gate, beta, alpha
++
++    @jit_fuser
++    def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
++        """
++        Compute g (decay) and beta (sigmoid) for gated delta rule.
++        Fuses exp, softplus, mul, neg, and sigmoid operations.
++        """
++        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
++        beta = beta.sigmoid()
++        return g, beta
++
++    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
++        """Provide a sharded state dictionary for distributed checkpointing."""
++        # Guard for cases metadata is not provided
++        metadata = ensure_metadata_has_dp_cp_group(metadata)
++
++        sharded_state_dict = {}
++        # Parameters
++        self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
++        sharded_state_dict = make_sharded_tensors_for_checkpoint(
++            sharded_state_dict,
++            prefix,
++            tensor_parallel_layers_axis_map={
++                "A_log": 0,
++                "dt_bias": 0,
++            },  # parameters sharded across TP
++            sharded_offsets=sharded_offsets,
++            tp_group=(tp_group if tp_group is not None else self.pg_collection.tp),
++            dp_cp_group=metadata["dp_cp_group"],
 +        )
++        # Submodules
++        tp_group = tp_group if tp_group is not None else self.pg_collection.tp
++        for name, module in self.named_children():
++            if name == "conv1d":
++                # Add TP sharding for Conv1d
++                module_sd = module.state_dict(prefix="", keep_vars=True)
++                tp_sharding_map = {"weight": 0}
++                if self.conv_bias:
++                    tp_sharding_map["bias"] = 0
++                module_sharded_sd = make_sharded_tensors_for_checkpoint(
++                    module_sd,
++                    f"{prefix}{name}.",
++                    tp_sharding_map,
++                    sharded_offsets,
++                    tp_group=tp_group,
++                    dp_cp_group=metadata["dp_cp_group"],
++                )
++            else:
++                module_sharded_sd = sharded_state_dict_default(
++                    module,
++                    f"{prefix}{name}.",
++                    sharded_offsets,
++                    metadata,
++                    tp_group=tp_group,
++                )
++
++            sharded_state_dict.update(module_sharded_sd)
++
++        # At this point the TP sharding is correctly defined for each tensor, but some of the
++        # tensors must be additionally split into separate parts
++        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
++        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
++            in_proj_dim_local_tp,
++            sharded_state_dict[f"{prefix}in_proj.weight"],
++        )
++
++        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
++            sharded_state_dict[f"{prefix}in_proj.weight"],
++            [
++                self.qk_dim_local_tp,
++                self.qk_dim_local_tp,
++                self.v_dim_local_tp,
++                self.v_dim_local_tp,
++                self.num_value_heads // self.tp_size,
++                self.num_value_heads // self.tp_size,
++            ],
++            ["query", "key", "value", "z", "beta", "alpha"],
++            0,
++        )
++
++        conv_layer_name_list = ["conv1d.weight"]
++        assert sharded_state_dict[f"{prefix}conv1d.weight"].data.size(0) == self.conv_dim_local_tp, (
++            self.conv_dim_local_tp,
++            sharded_state_dict[f"{prefix}conv1d.weight"],
++        )
++        if self.conv_bias:
++            conv_layer_name_list.append("conv1d.bias")
++            assert sharded_state_dict[f"{prefix}conv1d.bias"].data.size(0) == self.conv_dim_local_tp, (
++                self.conv_dim_local_tp,
++                sharded_state_dict[f"{prefix}conv1d.bias"],
++            )
++        for conv_layer_name in conv_layer_name_list:
++            sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
++                sharded_state_dict[f"{prefix}{conv_layer_name}"],
++                [self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp],
++                ["query", "key", "value"],
++                0,
++            )
++
++        return sharded_state_dict
++
++    def backward_dw(self):
++        """Execute weight gradient computation for all linear layers."""
++        self._backward_in_proj()
++        self._backward_out_proj()
++
++    def _backward_in_proj(self):
++        """Computes weight gradients of input projection layer."""
++        self.in_proj.backward_dw()
++
++    def _backward_out_proj(self):
++        """Computes weight gradients of output projection layer."""
++        self.out_proj.backward_dw()
++
++
++####################
++# Context parallel utilities
++####################
++def get_parameter_local_cp(
++    param: torch.Tensor,
++    dim: int,
++    cp_group: torch.distributed.ProcessGroup,
++    split_sections: Optional[List[int]] = None,
++) -> torch.Tensor:
++    """Get the local parameter for the current context parallel rank.
++
++    Args:
++        param (torch.Tensor): The entire parameter to get the local parameter for.
++        dim (int): The dimension to split the parameter along. Usually the dimension of head.
++        cp_group (torch.distributed.ProcessGroup): The context parallel group.
++        split_sections (Optional[List[int]]): If not None,
++            first split the parameter along the dimension dim into sections,
++            then get the local hidden parallel weights separately,
++            finally concatenate the local hidden parallel weights along the dimension dim.
++
++    Returns:
++        torch.Tensor: The local parameter for the current context parallel rank.
++    """
++
++    cp_size = cp_group.size()
++    cp_rank = cp_group.rank()
++
++    # No need to split if CP size is 1.
++    if cp_size == 1:
++        return param
++
++    # Split first if needed.
++    if split_sections is not None:
++        inputs = torch.split(param, split_sections, dim=dim)
++        outputs = []
++        for p in inputs:
++            p = get_parameter_local_cp(p, dim, cp_group)
++            outputs.append(p)
++        return torch.cat(outputs, dim=dim)
++
++    # Slice the parameter.
++    slices = [slice(None)] * param.dim()
++    dim_size = param.size(dim=dim)
++    slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
++    param = param[slices]
++    return param
++
++
++def tensor_a2a_cp2hp(
++    tensor: torch.Tensor,
++    seq_dim: int,
++    head_dim: int,
++    cp_group: torch.distributed.ProcessGroup,
++    split_sections: Optional[List[int]] = None,
++    undo_attention_load_balancing: bool = True,
++):
++    """All-to-all context parallel to hidden parallel.
++
++    Args:
++        tensor (torch.Tensor): The tensor to all-to-all.
++            Currently only support (seq_len, batch, head_dim) shaped tensor.
++        seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
++        head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
++        cp_group (torch.distributed.ProcessGroup): The context parallel group.
++        split_sections (Optional[List[int]]): If not None, split the tensor along the dimension
++            head_dim into sections first, then do all-to-all for each section separately,
++            finally concatenate the separated tensors along the dimension head_dim.
++        undo_attention_load_balancing (bool): Whether to undo the attention load balancing of CP.
++
++    Returns:
++        torch.Tensor: The all-to-all tensor.
++    """
++
++    cp_size = cp_group.size()
++
++    # No need to all-to-all if CP size is 1.
++    if cp_size == 1:
++        return tensor
++
++    # Limitations of mamba_context_parallel._all_to_all_cp2hp.
++    assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
++    assert head_dim in (-1, 2), f"tensor_a2a_cp2hp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
++    assert tensor.dim() == 3, f"tensor_a2a_cp2hp only supports 3-d input tensor for now, but got {tensor.dim()=}"
++
++    # Split first if needed.
++    if split_sections is not None:
++        inputs = torch.split(tensor, split_sections, dim=head_dim)
++        outputs = []
++        for x in inputs:
++            x = tensor_a2a_cp2hp(
++                x,
++                seq_dim=seq_dim,
++                head_dim=head_dim,
++                cp_group=cp_group,
++                undo_attention_load_balancing=False,
++            )
++            outputs.append(x)
++        tensor = torch.cat(outputs, dim=head_dim)
++    else:
++        tensor = _all_to_all_cp2hp(tensor, cp_group)
++
++    # Undo attention load balancing last if needed.
++    if undo_attention_load_balancing:
++        tensor = _undo_attention_load_balancing(tensor, cp_size)
++    return tensor
++
++
++def tensor_a2a_hp2cp(
++    tensor: torch.Tensor,
++    seq_dim: int,
++    head_dim: int,
++    cp_group: torch.distributed.ProcessGroup,
++    split_sections: Optional[List[int]] = None,
++    redo_attention_load_balancing: bool = True,
++):
++    """All-to-all hidden parallel to context parallel.
++
++    Args:
++        tensor (torch.Tensor): The tensor to all-to-all.
++            Currently only support (seq_len, batch, head_dim) shaped tensor.
++        seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
++        head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
++        cp_group (torch.distributed.ProcessGroup): The context parallel group.
++        split_sections (Optional[List[int]]): If not None, first split the tensor along the
++            dimension head_dim into sections, then do all-to-all for each section separately,
++            finally concatenate the separated tensors along the dimension head_dim.
++        redo_attention_load_balancing (bool): Whether to redo the attention load balancing of HP.
++
++    Returns:
++        torch.Tensor: The all-to-all tensor.
++    """
++
++    cp_size = cp_group.size()
++
++    # No need to all-to-all if CP size is 1.
++    if cp_size == 1:
++        return tensor
++
++    # Limitations of mamba_context_parallel._all_to_all_hp2cp.
++    assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
++    assert head_dim in (-1, 2), f"tensor_a2a_cp2hp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
++    assert tensor.dim() == 3, f"tensor_a2a_cp2hp only supports 3-d input tensor for now, but got {tensor.dim()=}"
++
++    # Redo attention load balancing first if needed.
++    if redo_attention_load_balancing:
++        tensor = _redo_attention_load_balancing(tensor, cp_size)
++
++    # Split first if needed.
++    if split_sections is not None:
++        inputs = torch.split(tensor, split_sections, dim=head_dim)
++        outputs = []
++        for x in inputs:
++            x = tensor_a2a_hp2cp(
++                x,
++                seq_dim=seq_dim,
++                head_dim=head_dim,
++                cp_group=cp_group,
++                redo_attention_load_balancing=False,
++            )
++            outputs.append(x)
++        tensor = torch.cat(outputs, dim=head_dim)
++    else:
++        tensor = _all_to_all_hp2cp(tensor, cp_group)
++
++    return tensor
+diff --git a/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py b/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py
+index e734fb4..df8067b 100644
+--- a/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py
++++ b/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py
+@@ -45,18 +45,18 @@ class _Qwen35ProviderFixMixin:
+ class Qwen35VLModelProvider(_Qwen35ProviderFixMixin, NativeQwen35VLModelProvider):
+     """Native dense provider with MindSpeed's MTP and Ascend GDN controls."""
  
-         return MegatronMappingRegistry(*mapping_list)
+-    use_ascend_gdn: bool = False
++    use_ascend_gdn: bool = True
+     use_triton_gdn: bool = False
+-    use_fused_causal_conv1d: bool = False
++    use_fused_causal_conv1d: bool = True
  
+ 
+ @dataclass
+ class Qwen35VLMoEModelProvider(_Qwen35ProviderFixMixin, NativeQwen35VLMoEModelProvider):
+     """Native MoE provider with MindSpeed's MTP and Ascend GDN controls."""
+ 
+-    use_ascend_gdn: bool = False
++    use_ascend_gdn: bool = True
+     use_triton_gdn: bool = False
+-    use_fused_causal_conv1d: bool = False
++    use_fused_causal_conv1d: bool = True
+ 
+ 
+ __all__ = ["Qwen3VLModel", "Qwen35VLModelProvider", "Qwen35VLMoEModelProvider"]

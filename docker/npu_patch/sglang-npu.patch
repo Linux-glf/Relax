@@ -4306,3 +4306,29 @@ index 0000000000..9dfc930392
 +    unittest.main()
 -- 
 2.54.0.windows.1
+From a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 Mon Sep 17 00:00:00 2001
+From: wuliUgliest <ilanzhu@icloud.com>
+Date: Tue, 13 Oct 2026 17:14:35 +0000
+Subject: [PATCH] fix(config): tolerate an already-registered qwen3_asr in AutoConfig
+
+transformers 5.16.1 ships a built-in ``qwen3_asr`` model, so the unguarded
+``AutoConfig.register("qwen3_asr", ...)`` raises "already registered" at import
+time and kills every process that imports sglang (the driver, and therefore the
+whole training job).  Pass exist_ok=True so the local config still wins.
+---
+ python/sglang/srt/configs/qwen3_asr.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/configs/qwen3_asr.py b/python/sglang/srt/configs/qwen3_asr.py
+index cb3252b3d4..ee69b3c727 100644
+--- a/python/sglang/srt/configs/qwen3_asr.py
++++ b/python/sglang/srt/configs/qwen3_asr.py
+@@ -164,5 +164,5 @@ class Qwen3ASRConfig(PretrainedConfig):
+         return self.thinker_config.text_config
+ 
+ 
+-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
++AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
+ AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
+-- 
+2.54.0.windows.1

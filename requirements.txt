@@ -34,7 +34,8 @@ soundfile
 colorlog
 loguru
 av==17.0.0
-transformers
+# 5.16.1 is required by the qwen3_asr registration guard in docker/npu_patch/sglang-npu.patch
+transformers==5.16.1
 huggingface_hub==1.7.2
 blessed==1.38.0
 gpustat

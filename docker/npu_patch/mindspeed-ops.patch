@@ -1,13 +1,19 @@
-diff --git a/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_bwd_dhu.py b/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_bwd_dhu.py
-index bf62b0b..1925eca 100644
---- a/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_bwd_dhu.py
-+++ b/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_bwd_dhu.py
-@@ -21,7 +21,7 @@ from mindspeed_ops.api.triton.utils import prepare_chunk_indices, prepare_chunk_
- )
- @triton.autotune(
-     configs=get_autotune_config(multibuffer_list=(True, False)),
--    key=['H', 'K', 'V', 'BT', 'BV', 'USE_G', 'IS_VARLEN'],
-+    key=['H', 'K', 'V', 'BT', 'BV'],
- )
- @triton.jit(do_not_specialize=['T'])
- def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
+diff --git a/mindspeed_ops/api/triton/utils.py b/mindspeed_ops/api/triton/utils.py
+index 5169973..4514a98 100644
+--- a/mindspeed_ops/api/triton/utils.py
++++ b/mindspeed_ops/api/triton/utils.py
+@@ -158,7 +158,13 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
+     return cu_seqlens[1:] - cu_seqlens[:-1]
+ 
+ 
+-@tensor_cache(maxsize=3)
++# One GDN forward+backward pass reuses a single cu_seqlens with more distinct
++# (cu_seqlens, chunk_size) pairs than the three slots below cover: cumsum's
++# H-dependent forward and reverse tiling, the rule's own chunk size, solve_tril's
++# large block and the conv backward tiling all reach this function. LRU is a
++# stack algorithm, so a larger cache can only raise the hit rate, and every
++# cached entry is a small index tensor.
++@tensor_cache(maxsize=16)
+ def prepare_chunk_indices(cu_seqlens: torch.LongTensor, chunk_size: int) -> torch.LongTensor:
+     indices = torch.cat([torch.arange(n) for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()])
+     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)

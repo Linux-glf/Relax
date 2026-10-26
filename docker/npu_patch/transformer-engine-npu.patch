@@ -1,0 +1,61 @@
+diff --git a/transformer_engine/pytorch/attention/dot_product_attention/ring_context_parallel.py b/transformer_engine/pytorch/attention/dot_product_attention/ring_context_parallel.py
+index c1e3a9e..63835f3 100644
+--- a/transformer_engine/pytorch/attention/dot_product_attention/ring_context_parallel.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/ring_context_parallel.py
+@@ -1,5 +1,6 @@
+ # Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # Copyright (c) 2026, Huawei Technologies Co., Ltd.  All rights reserved.
++import os
+ from functools import lru_cache
+ from abc import ABC, abstractmethod
+ from typing import Any, Optional
+@@ -573,6 +574,24 @@ def forward_update(
+     )
+ 
+ 
++_FAST_WRITE_BACK_ENV = 'TENPU_RING_FAST_WRITE_BACK'
++
++
++def write_back_rows(dst, index, src):
++    """
++    Return a copy of dst whose rows at index are replaced by src along dim 0.
++
++    index_copy lowers to an IndexCopy_ScatterUpdate task whose cost is bound by
++    the number of rows written, while clone + index_put_ moves the same volume
++    ~2.5x faster on 910.  Both are pure data movement with unique indices, so the
++    result is bit-identical.  Set TENPU_RING_FAST_WRITE_BACK=0 to restore
++    index_copy.
++    """
++    if os.environ.get(_FAST_WRITE_BACK_ENV, '1') == '0':
++        return dst.index_copy(0, index, src)
++    return dst.clone().index_put_((index,), src)
++
++
+ def tnd_out_update(
+     q_block_id,
+     kv_block_id,
+@@ -632,17 +651,13 @@ def tnd_out_update(
+             layout=layout,
+             use_fused_ring_attention_update=use_fused_ring_attention_update,
+         )
+-        attn_out.index_copy_(0, q_index, attn_out_updated)
+-        softmax_max = (
+-            softmax_max.view(-1, 8)
+-            .index_copy(0, softmax_indices, softmax_max_updated.view(-1, 8))
+-            .view(-1, n, 8)
+-        )
+-        softmax_sum = (
+-            softmax_sum.view(-1, 8)
+-            .index_copy(0, softmax_indices, softmax_sum_updated.view(-1, 8))
+-            .view(-1, n, 8)
+-        )
++        attn_out = write_back_rows(attn_out, q_index, attn_out_updated)
++        softmax_max = write_back_rows(
++            softmax_max.view(-1, 8), softmax_indices, softmax_max_updated.view(-1, 8)
++        ).view(-1, n, 8)
++        softmax_sum = write_back_rows(
++            softmax_sum.view(-1, 8), softmax_indices, softmax_sum_updated.view(-1, 8)
++        ).view(-1, n, 8)
+ 
+     return [attn_out, softmax_max, softmax_sum, rng_states]
+ 

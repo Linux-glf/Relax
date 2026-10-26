@@ -1,9 +1,29 @@
 # Ascend/NPU image: CANN base -> training stack -> runtime dependencies.
+#
+# Reproduces the single-node 16x Ascend 910 environment used on 2026-10-22:
+#   Ubuntu 22.04.5 · Python 3.12.15 · CANN 9.2.0
+#   torch 2.10.0 · torch_npu 2.10.0.post6
+#   triton 3.6.0 + triton-ascend 3.6.0
+#   ray 2.55.1 · transformers 5.16.1 · tensordict 0.10.0 · pyvers 0.1.0
+#   sglang 0.5.15 (editable) · flash-linear-attention-npu-a3 26.10.0
+#   Megatron-LM / Megatron-Bridge / MindSpeed / MindSpeed-Ops /
+#   MegatronAdaptor / TransformerEngineNPU / MindSpeed-Bridge at the pinned
+#   upstream commits below, each with its docker/npu_patch patch applied.
+#
+# Build from the repository root (the COPY paths are context-relative):
+#   docker build -f Dockerfile.npu -t relax:npu-20261022 .
 # CI can reuse a published train image through TRAIN_IMAGE.
+#
+# Runtime-only dependencies that are intentionally NOT baked in:
+#   * TransferQueue: the entrypoints expect a source checkout on PYTHONPATH
+#     (e.g. /mnt/sfs_turbo/xhs_relax/lxl), since there is no installable
+#     package for it. Mount it and export PYTHONPATH at run time.
+#   * The 3.8-Flash-Next checkpoints / PLE tables: mounted under MODEL_DIR.
+
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.11
+ARG BASE_IMAGE=quay.io/ascend/cann:9.2.0-a3-ubuntu22.04-py3.12
 FROM ${BASE_IMAGE} as base
 
 ARG HTTP_PROXY
@@ -47,7 +67,7 @@ RUN ARCH=$(uname -m) && \
     fi && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
-    source /usr/local/Ascend/cann-9.0.0/share/info/ascendnpu-ir/bin/set_env.sh
+    source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh
 # Configure pip and git.
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 RUN pip config set global.index-url ${PIP_INDEX_URL} && \
@@ -61,36 +81,48 @@ WORKDIR /root
 FROM base as train
 
 # Ascend chip target, defaulting to 910C.
-ARG SOC_VERSION=ascend910_9391
-ENV SOC_VERSION=${SOC_VERSION}
+# ARG SOC_VERSION=ascend910_9391
+# ENV SOC_VERSION=${SOC_VERSION}
 
+# Megatron's TP/CP validation asserts this, and Ray workers inherit it from the
+# image unless the job's runtime_env overrides it. Set it here so a bare
+# `ray job submit` works; the entrypoints also export it for their workers.
+ENV CUDA_DEVICE_MAX_CONNECTIONS=1
+# The SFT runs on 32K packs; expandable segments keeps a tight 64 GiB die from
+# failing on fragmentation (the 16L tests peak around 59-62 GiB).
+ENV PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+# Install torch & torch_npu
 WORKDIR /root
-RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
+RUN pip_install() { pip install "$@" || pip install --index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple "$@"; }; \
     pip_install --upgrade pip packaging setuptools==80.10.2 && \
-    pip_install torch==2.9.0 && \
-    pip_install numpy==1.26.0
-# Build torch_npu.
-RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
-    pip_install pyyaml && \
-    git clone https://gitcode.com/Ascend/pytorch.git /root/pytorch && \
-    cd /root/pytorch && \
-    git checkout v26.0.1-pytorch2.9.0 && \
-    git cherry-pick -n f495de675bce38a2fa21edbf067b73d2a5f26733 && \
-    bash ci/build.sh --python=3.11 && \
-    pip install dist/torch_npu*.whl
-RUN pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple && \
-    cd /root && rm -rf /root/pytorch
+    pip_install torch==2.10.0 && \
+    pip_install torch_npu==2.10.0.post6
+
+# triton-ascend shadows the triton distribution that ships with torch; both are
+# installed at 3.6.0 so `import triton` resolves to the Ascend build.
+RUN pip install triton==3.6.0 && \
+    pip install triton-ascend==3.6.0 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
     pip_install tensordict==0.10.0 pyvers==0.1.0 --no-deps
-RUN git clone https://github.com/redai-studio/TransferQueue.git /root/TransferQueue && \
-    cd /root/TransferQueue && \
-    git checkout 58054a33834aadbcf76aacd6b1e32e25c030f2c9 && \
-    pip install /root/TransferQueue --no-deps --no-build-isolation && \
-    cd /root && \
-    rm -rf /root/TransferQueue
+
+
+# Upstream commits the patch bundle applies on top of. Keep these in sync with
+# the patch files under docker/npu_patch; every patch is checked with
+# `git apply --check` against these commits.
+ARG MEGATRON_BRIDGE_COMMIT=8ec5c9cdc2bf1af3247a2dbe73696534d6055814
+ARG MEGATRON_COMMIT=b26f370df24169e64164aede07507bdda64ef4ec
+ARG MEGATRON_ADAPTOR_COMMIT=34fe86cdbf7c2f6b16cbea9f43fb3ed860f18812
+ARG TRANSFORMER_ENGINE_NPU_COMMIT=0ae3862f41f551dadf499b474899a1c7a1dcbb4c
+ARG MINDSPEED_COMMIT=d7984bf2ea8680aa02b3e6dfcb54ecb76b0a54b7
+ARG MINDSPEED_OPS_COMMIT=ca9543d28230494b661cea80629819d465b8d7db
+ARG MINDSPEED_BRIDGE_COMMIT=3b06ac9d42a0b66e12027ca3607fde702e63958e
 
 # Install the MindSpeed/Megatron stack.
-RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
+RUN git clone https://gitcode.com/Ascend/MegatronAdaptor.git /root/MegatronAdaptor && \
+    git clone https://gitcode.com/Ascend/TransformerEngineNPU.git /root/TransformerEngineNPU && \
+    git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
     git clone https://github.com/NVIDIA/Megatron-LM.git /root/Megatron-LM && \
     git clone https://gitcode.com/ascend/MindSpeed-Ops.git /root/MindSpeed-Ops && \
     git clone https://gitcode.com/ascend/MindSpeed-Bridge.git /root/MindSpeed-Bridge && \
@@ -99,12 +131,14 @@ RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
-    source /usr/local/Ascend/cann-9.0.0/share/info/ascendnpu-ir/bin/set_env.sh && \
-    cd /root/MindSpeed && git checkout core_r0.16.0 && pip install -r requirements.txt && pip install -e . && git checkout e4772499 && \
-    cd /root/Megatron-LM && git checkout core_v0.16.1 && pip install -e . --no-build-isolation && \
-    cd /root/Megatron-Bridge && git checkout v0.3.1 && \
-    cd /root/MindSpeed-Ops && git checkout 33ac80f7 && pip install -e . --no-build-isolation --no-deps && \
-    cd /root/MindSpeed-Bridge && git checkout v0.3.1 && pip install -r requirements.txt && pip install -e . --no-deps
+    source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh && \
+    cd /root/Megatron-LM && git checkout ${MEGATRON_COMMIT} && pip install -e . --no-build-isolation && \
+    cd /root/Megatron-Bridge && git checkout ${MEGATRON_BRIDGE_COMMIT} && \
+    cd /root/MegatronAdaptor && git checkout ${MEGATRON_ADAPTOR_COMMIT} && pip install -e . && \
+    cd /root/TransformerEngineNPU && git checkout ${TRANSFORMER_ENGINE_NPU_COMMIT} && pip install -e . --no-build-isolation && \
+    cd /root/MindSpeed && git checkout ${MINDSPEED_COMMIT} && \
+    cd /root/MindSpeed-Ops && git checkout ${MINDSPEED_OPS_COMMIT} && pip install regex && pip install -e . --no-build-isolation --no-deps && \
+    cd /root/MindSpeed-Bridge && git checkout ${MINDSPEED_BRIDGE_COMMIT} && pip install -r requirements.txt && pip install -e . --no-deps
 
 # Keep Relax code changes out of the dependency cache.
 COPY docker/npu_patch /root/Relax/docker/npu_patch
@@ -122,8 +156,11 @@ RUN cd /root/Megatron-Bridge && \
     cd /root/MindSpeed-Ops && \
     patch -p1 < /root/Relax/docker/npu_patch/mindspeed-ops.patch && \
     git add . && git commit -m "base line" && \
-    cd /root/MindSpeed && \
-    patch -p1 < /root/Relax/docker/npu_patch/mindspeed.patch && \
+    cd /root/MegatronAdaptor && \
+    patch -p1 < /root/Relax/docker/npu_patch/megatron-adaptor.patch && \
+    git add . && git commit -m "base line" && \
+    cd /root/TransformerEngineNPU && \
+    patch -p1 < /root/Relax/docker/npu_patch/transformer-engine-npu.patch && \
     git add . && git commit -m "base line"
 
 
@@ -133,30 +170,44 @@ RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org
     cd /root/sglang && git checkout v0.5.15 && \
     mv python/pyproject.toml python/pyproject.toml.backup && \
     mv python/pyproject_npu.toml python/pyproject.toml && \
-    pip install -e "python[srt_npu]" --constraint <(echo "torch==2.9.0") && \
+    echo "torch==2.10.0" > /tmp/constraint.txt && \
+    pip install -e "python[srt_npu]" --constraint /tmp/constraint.txt && \
     git add . && git commit -m "install info" && \
     git fetch && \
     git cherry-pick ece02ffc9cc32e94382d4f1b553b2c755f83f722 && \
     git am /root/Relax/docker/npu_patch/sglang-npu.patch
 
-# Install SGLang NPU kernels.
-RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
-    cd /root/sgl-kernel-npu && git checkout 2026.7.2 && \
-    git submodule update --init third_party/catlass third_party/pto-isa && \
-    git am /root/Relax/docker/npu_patch/sgl-kernel-npu.patch && \
-    bash build.sh -a kernels ${SOC_VERSION_FOR_SGL_BUILD} && bash build.sh -a memory-saver && bash build.sh -a deepep ${SOC_VERSION_FOR_SGL_BUILD} && \
-    pip install output/*.whl && \
-    cd /root && rm -rf /root/sgl-kernel-npu
+# The NPU editable install resolves ``sglang.srt`` through the path finder; a
+# missing package __init__ makes it raise KeyError('sglang') on the first
+# `import sglang.srt.*`. Upstream v0.5.15 does not ship this file, so create it
+# (empty) exactly as the 2026-10-22 runtime image has it.
+RUN touch /root/sglang/python/sglang/srt/__init__.py
 
-# Install AscendC FLA
+# # Install SGLang NPU kernels.
+# # Not present in the 2026-10-22 SFT image (no rollout server is started and
+# # SGLang is only imported for its config/tokenizer helpers). Enable this block
+# # when the image is used for SGLang rollout/serving on NPU.
+# RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
+#     cd /root/sgl-kernel-npu && git checkout 2026.9.1 && \
+#     git submodule update --init third_party/catlass third_party/pto-isa && \
+#     bash build.sh -a kernels ${SOC_VERSION_FOR_SGL_BUILD} && bash build.sh -a memory-saver && bash build.sh -a deepep ${SOC_VERSION_FOR_SGL_BUILD} && \
+#     pip install output/*.whl && \
+#     cd /root && rm -rf /root/sgl-kernel-npu
+
+# Install AscendC FLA. The runtime image carries
+# flash-linear-attention-npu-a3 26.10.0+unknown.dev67dc99d, built from commit
+# 67dc99d; v26.6.0 is the last tagged release and is the fallback.
+ARG FLA_NPU_COMMIT=67dc99d
 RUN git clone https://github.com/flashserve/flash-linear-attention-npu.git /root/flash-linear-attention-npu && \
-    cd /root/flash-linear-attention-npu && git checkout v26.6.0 && \
+    cd /root/flash-linear-attention-npu && \
+    (git checkout ${FLA_NPU_COMMIT} || git checkout v26.6.0) && \
     apt update && apt-get install -y --no-install-recommends gawk && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
-    source /usr/local/Ascend/cann-9.0.0/share/info/ascendnpu-ir/bin/set_env.sh && \
+    source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh && \
     FLA_NPU_SOC=ascend910_93 python -m pip wheel --no-build-isolation --no-deps . -w dist && \
-    python -m pip install --force-reinstall --no-deps dist/flash_linear_attention_npu-*.whl
+    python -m pip install --force-reinstall --no-deps dist/flash_linear_attention_npu-*.whl && \
+    cd /root && rm -rf /root/flash-linear-attention-npu
 
 FROM train as relax
 
@@ -164,8 +215,20 @@ WORKDIR /root
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
-    pip install --index-url https://pypi.org/simple ray==2.55.1 protobuf==6.33.6 fastokens==0.3.1
+    pip install ray==2.55.1 protobuf==6.33.6 fastokens==0.3.1 transformers==5.16.1
 
 # Clean caches.
 RUN pip cache purge && \
     rm -rf /tmp/*
+
+# Example launch (16 dies, one node):
+# docker run -itd -u root --privileged --shm-size=200gb --net=host --cap-add=SYS_PTRACE \
+#   --device=/dev/davinci0 ... --device=/dev/davinci15 \
+#   --device=/dev/davinci_manager --device=/dev/devmm_svm --device=/dev/hisi_hdc \
+#   -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+#   -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+#   -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+#   -v /etc/ascend_install.info:/etc/ascend_install.info -v /var/log/npu/:/usr/slog \
+#   -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
+#   -v /data:/data -v /mnt/sfs_turbo:/mnt/sfs_turbo \
+#   --name relax_qwen4_920 relax:npu-20261022 /bin/bash
