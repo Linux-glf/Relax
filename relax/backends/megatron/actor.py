@@ -421,7 +421,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         from relax.utils.training.flops_counter import FlopsCounter
 
-        self.flops_counter = FlopsCounter(self.hf_config)
+        # Charge MTP FLOPs only for the head this run builds (--enable-mtp-training),
+        # not for one the checkpoint happens to ship.
+        mtp_training = getattr(args, "enable_mtp_training", False)
+        mtp_num_layers = int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_training else 0
+        self.flops_counter = FlopsCounter(self.hf_config, mtp_num_layers=mtp_num_layers)
 
         self.train_parallel_config = {
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),

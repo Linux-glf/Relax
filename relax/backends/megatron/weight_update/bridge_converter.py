@@ -3,7 +3,7 @@
 import dataclasses
 import re
 from argparse import Namespace
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,6 +22,13 @@ logger = get_logger(__name__)
 
 def _noop_gather_from_ep_ranks(self_m, megatron_weights, megatron_module, hf_param_name):
     return {str(hf_param_name): megatron_weights}
+
+
+# The Qwen4Exp PLE (per-layer embedding) state: the hashed n-gram table, which lives in a
+# pinned host buffer sharded across TP, and the three hash-index buffers next to it. See
+# :meth:`BridgeConverter.ple_entries`.
+_PLE_STATE_MARKER = ".ple.ple_embedding."
+_PLE_TABLE_SUFFIX = ".ple.ple_embedding.weight"
 
 
 class BridgeConverter:
@@ -366,3 +373,106 @@ class BridgeConverter:
             converted_named_tensors = postprocessed
 
         return quantize_params(self._args, name, converted_named_tensors, self._quantization_config)
+
+    # ------------------------------------------------------------------
+    # Qwen4Exp PLE state
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _require_pp_1(what: str) -> None:
+        """Refuse to sync ``what`` under pipeline parallelism.
+
+        The task map is built from this rank's model, so the stages would disagree
+        about which PLE tensors the rollout is missing. PLE runs at PP=1; fail loudly
+        instead of shipping a model with no n-gram table.
+        """
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size > 1:
+            raise NotImplementedError(
+                f"{what} cannot be synced under pipeline parallelism (pipeline-model-parallel-size={pp_size}); "
+                "run PLE with pipeline-model-parallel-size=1."
+            )
+
+    def ple_entries(self) -> list[str]:
+        """Names of the Qwen4Exp PLE state this rank ships on its own.
+
+        The n-gram table and its three hash-index buffers are module buffers, and the
+        sync enumerator only lets ``expert_bias`` through. With the cpu offload off
+        (``QWEN4_EXP_PLE_CPU_OFFLOAD=0``) the table is a device parameter; either way
+        ``_build_param_info_buckets`` keeps these names out of the buckets, so this
+        list is the only route they take.
+
+        The names come from the bridge task map, which already carries each one's
+        weight and mapping. A local PLE buffer missing from that map raises: that is
+        how the table would silently go missing from the rollout.
+        """
+        self.init_tasks()
+        self._require_pp_1("the Qwen4Exp PLE state")
+
+        entries = sorted(name for name in self._bridge_task_map if _PLE_STATE_MARKER in name)
+
+        local: set[str] = set()
+        for chunk in self._model:
+            for module_prefix, module in chunk.named_modules():
+                for local_name, _buffer in module.named_buffers(recurse=False):
+                    if local_name in getattr(module, "_non_persistent_buffers_set", set()):
+                        continue
+                    name = f"{module_prefix}.{local_name}" if module_prefix else local_name
+                    if _PLE_STATE_MARKER in name:
+                        local.add(strip_param_name_prefix(name))
+        missing = sorted(local.difference(entries))
+        if missing:
+            raise ValueError(
+                f"this rank holds the Qwen4Exp PLE buffer(s) {missing} but the bridge conversion task map has no "
+                f"entry for them; the weight sync would ship a model without the n-gram table. Known entries: "
+                f"{entries}. The plugin's mapping registry must register '{_PLE_TABLE_SUFFIX}' and the "
+                f"hash-index buffers."
+            )
+        return entries
+
+    def iter_ple_shards(self, global_name: str) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield the HF tensors of one PLE entry, one shard at a time.
+
+        The table does not go through :meth:`convert`: ``all_gather_param`` would put a
+        whole TP shard on a die, and ``convert`` would materialise all 128 shards at
+        once. The mapping assembles one shard per iteration instead, and each shard is
+        quantised and yielded before the next one exists. The assembly is a collective,
+        so every rank walks the same shards in the same order (``ple_entries`` sorts).
+
+        The three hash-index buffers take the ordinary route: replicated, whole, small.
+        """
+        self.init_tasks()
+
+        global_name, task = self._lookup_task(strip_param_name_prefix(global_name))
+        if task is None or task.param_weight is None:
+            raise ValueError(f"no bridge conversion task with a weight for the Qwen4Exp PLE entry {global_name!r}")
+        mapping = task.mapping
+
+        if global_name.endswith(_PLE_TABLE_SUFFIX):
+            if not hasattr(mapping, "assemble_shard"):
+                raise ValueError(
+                    f"{global_name} is the n-gram table but its mapping ({type(mapping).__name__}) has no "
+                    "`assemble_shard`; the ordinary route would materialise the whole table"
+                )
+            self._require_pp_1(f"the Qwen4Exp PLE table {global_name!r}")
+            # The mapping's process groups are left alone: it asks the module whose
+            # ranks the rows are split over (TP for the host form, EP for device-ep),
+            # and the per-shard assembly sums across that group. pp_size == 1 was just
+            # enforced, so pp_group has nothing to find.
+            shards = mapping.megatron_to_hf(task.param_weight, task.megatron_module)
+            count = 0
+            for hf_name, shard in shards.items():
+                count += 1
+                yield from quantize_params(self._args, global_name, [(hf_name, shard)], self._quantization_config)
+            if count != mapping.num_shards:
+                raise RuntimeError(
+                    f"{global_name}: the mapping handed over {count} of its {mapping.num_shards} HF shards; "
+                    "the rollout would have an incomplete n-gram table"
+                )
+            return
+
+        # Anything else in the PLE group is one of the three hash-index buffers: replicated,
+        # small and whole, so the ordinary conversion is the one it wants. `convert` nulls
+        # the mapping's process groups, which its PP broadcast needs, and leaves
+        # `remove_padding` a no-op (it only knows the embedding and output-layer names).
+        yield from self.convert(global_name, task.param_weight)

@@ -28,7 +28,7 @@ from relax.utils.megatron_peft_utils import (
 )
 from relax.utils.types import ParamInfo
 
-from .bridge_converter import BridgeConverter
+from .bridge_converter import _PLE_STATE_MARKER, BridgeConverter
 from .common import all_gather_param, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
@@ -146,6 +146,22 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
             del params
 
+        # --- Qwen4Exp PLE state: the n-gram table and its hash-index buffers ---
+        # The buckets cannot carry them: they are buffers, and the enumerator only lets
+        # `expert_bias` through. The table is also 47.7 GiB per rank on the host, so it
+        # must not take the all-gather or `convert` (which would materialise all 128
+        # shards at once); `iter_ple_shards` assembles one shard at a time. That
+        # assembly is a collective, so every rank walks the same entries in the same
+        # order (`ple_entries()` sorts). With the cpu offload off the table is a
+        # parameter; `_build_param_info_buckets` keeps it out of the buckets so this
+        # loop remains its only route.
+        for name in self._bridge_converter.ple_entries():
+            t_p0 = time.monotonic()
+            for hf_name, tensor in self._bridge_converter.iter_ple_shards(name):
+                param_count += 1
+                yield hf_name, tensor
+            t_convert_total += time.monotonic() - t_p0
+
         if rank == 0:
             logger.info(
                 "[Bridge Fast] params=%d | bcast=%.1fs | tp_gather=%.1fs | convert=%.1fs | total=%.1fs",
@@ -260,6 +276,14 @@ def _build_param_info_buckets(args, model, collect_adapters=False):
     vanilla_key_map = {}
     adapter_map: dict[str, dict[str, str]] = {}
     for (v_name, v_param), (g_name, _g_param) in zip(vanilla_iter, global_iter, strict=True):
+        if _PLE_STATE_MARKER in g_name:
+            # The PLE state ships through `ple_entries()` / `iter_ple_shards` only.
+            # The bucket path would all-gather the row shard and the mapping would read
+            # the table's geometry off the gathered leading dim. In the host form these
+            # names are buffers and never reach here; with the table trainable
+            # (`QWEN4_EXP_PLE_CPU_OFFLOAD=0`) it would otherwise be sent twice, once
+            # whole and wrong.
+            continue
         if collect_adapters and is_lora_adapter_param(g_name):
             # LoRA adapter param: keep it out of the conversion buckets (no standalone
             # bridge mapping) and record its vanilla key for load-time merging.

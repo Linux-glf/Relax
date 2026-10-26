@@ -6,7 +6,17 @@ import types
 
 import pytest
 
-from relax.utils.training.flops_counter import _DEVICE_FLOPS, FlopsCounter, get_device_peak_flops
+from relax.utils.training.flops_counter import (
+    _DEVICE_FLOPS,
+    FlopsCounter,
+    _count_hybrid_layer_types,
+    _qwen4_exp_gdn_layer_n,
+    _qwen4_exp_hyper_connection_n,
+    _qwen4_exp_moe_layer_n,
+    _qwen4_exp_ple_layer_n,
+    _qwen4_exp_qsa_layer_n,
+    get_device_peak_flops,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +217,50 @@ FLOPS_TEST_VL_CONFIGS = {
     },
 }
 
+# Qwen3.8-Flash-Next. The reference 4-layer checkpoint (the small adaptation
+# target) is the smallest config that exercises every term of the estimator at
+# once: one QSA layer + three GDN layers, one PLE layer, hyper-connections, the
+# MTP head. Values are the reference's own `config.json`; the expected TFLOPS are
+# the arithmetic done longhand from the checkpoint's tensor shapes (see
+# `test_qwen4_exp_layer_terms_match_reference_checkpoint_shapes` below), not by
+# reusing the estimator.
+FLOPS_TEST_QWEN4_EXP_CONFIGS = {
+    "qwen4_exp_4l": {
+        "config": {
+            "model_type": "qwen4_exp",
+            "vocab_size": 248320,
+            "hidden_size": 2560,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "moe_intermediate_size": 640,
+            "shared_expert_intermediate_size": 640,
+            "num_experts_per_tok": 10,
+            "num_experts": 512,
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_compress_ratio": 4,
+            "indexer_budget": 2048,
+            "ple_embed_dim": 2560,
+            "ple_conv_kernel_size": 4,
+            "ple_layer_ids": [2],
+            "mtp_num_hidden_layers": 1,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        },
+        "batch_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
+        "expected_tflops_list": [55933565140992 / 1e12, 192479533989888 / 1e12],
+    },
+}
+
 FLOPS_TEST_OMNI_CONFIGS = {
     "qwen3_omni_moe": {
         "config": {
@@ -286,6 +340,102 @@ def test_flops_counter_vl_estimation(config_name):
         assert math.isclose(estimated_tflops, expected_tflops, rel_tol=1e-6), (
             f"{config_name}: expected {expected_tflops:.2f} TFLOPS, got {estimated_tflops:.2f}"
         )
+
+
+@pytest.mark.parametrize("config_name", list(FLOPS_TEST_QWEN4_EXP_CONFIGS.keys()))
+def test_flops_counter_qwen4_exp_estimation(config_name):
+    test_data = FLOPS_TEST_QWEN4_EXP_CONFIGS[config_name]
+    config = Config(test_data["config"])
+    counter = FlopsCounter(config)
+
+    for batch_seqlens, expected_tflops in zip(
+        test_data["batch_seqlens_list"], test_data["expected_tflops_list"], strict=True
+    ):
+        estimated_tflops, peak_tflops = counter.estimate(batch_seqlens, delta_time=1.0)
+        assert math.isclose(estimated_tflops, expected_tflops, rel_tol=1e-6), (
+            f"{config_name}: expected {expected_tflops:.6f} TFLOPS, got {estimated_tflops:.6f}"
+        )
+        # An unsupported model_type falls back to the dense formula (or to zero)
+        # with a warning instead of raising, so pin the dispatch itself: a peak of
+        # 0.0 here means the estimate never reached a real handler.
+        assert peak_tflops > 0
+
+
+@pytest.mark.parametrize("config_name", list(FLOPS_TEST_QWEN4_EXP_CONFIGS.keys()))
+def test_flops_counter_qwen4_exp_layer_terms_match_reference_checkpoint_shapes(config_name):
+    """Every per-layer term equals the sum of that layer's weight shapes.
+
+    Frozen from ``Qwen3.8-Flash-Next-4L-ple``'s safetensors headers, so this
+    fails if a term drifts from what the checkpoint actually stores -- the
+    end-to-end TFLOPS above would keep passing if two drifted terms cancelled.
+    """
+    config = Config(FLOPS_TEST_QWEN4_EXP_CONFIGS[config_name]["config"])
+    expected = {
+        "gdn": 57958400,  # in_proj + conv1d + out_proj
+        "qsa": 51445760,  # q/k/v/o_proj + indexer q/k/v_proj
+        "moe": 55380480,  # 10 routed experts + router + shared expert
+        "hyper_connection": 13189120,  # 2 mixers x (down/lowrank + up/lowrank + gate)
+        "ple": 32808960,  # key_proj + ple(-> hidden) + conv
+    }
+    actual = {
+        "gdn": _qwen4_exp_gdn_layer_n(config),
+        "qsa": _qwen4_exp_qsa_layer_n(config),
+        "moe": _qwen4_exp_moe_layer_n(config),
+        "hyper_connection": _qwen4_exp_hyper_connection_n(config),
+        "ple": _qwen4_exp_ple_layer_n(config),
+    }
+    assert actual == expected
+
+
+def test_flops_counter_mtp_num_layers_overrides_the_config():
+    """The MTP depth counted is the one trained, not the one the config declares.
+
+    The 4-layer checkpoint ships an MTP head, so a run with ``--mtp-num-layers 0``
+    would otherwise be credited for a head it never builds -- ~30% of this
+    model's FLOPs, and the same factor on its MFU.
+    """
+    config = Config(FLOPS_TEST_QWEN4_EXP_CONFIGS["qwen4_exp_4l"]["config"])
+    batch_seqlens = [512, 1024, 2048]
+
+    with_mtp, _ = FlopsCounter(config, mtp_num_layers=1).estimate(batch_seqlens, delta_time=1.0)
+    without_mtp, _ = FlopsCounter(config, mtp_num_layers=0).estimate(batch_seqlens, delta_time=1.0)
+    from_config, _ = FlopsCounter(config).estimate(batch_seqlens, delta_time=1.0)
+
+    # The config's own depth (one layer) is the default when the caller has no opinion.
+    assert from_config == with_mtp
+    assert without_mtp < with_mtp
+    # The difference is exactly the MTP term: 6 * N_mtp * tokens.
+    assert math.isclose(with_mtp - without_mtp, 6 * 775375360 * sum(batch_seqlens) / 1e12, rel_tol=1e-9)
+
+
+def test_count_hybrid_layer_types_treats_renamed_sparse_attention_as_full():
+    """A non-linear layer counts as full attention whatever it is called.
+
+    transformers' ``Qwen4ExpConfig`` rewrites the reference's
+    ``"full_attention"`` into ``"qwen_sparse_attention"``. Counting by exact
+    match silently reports zero full-attention layers and drops them from the
+    estimate -- 12 of 48 layers for the full model, and the MFU of a whole run
+    with it.
+    """
+    base = dict(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_conv_kernel_dim=2,
+    )
+    layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+    renamed = ["linear_attention", "linear_attention", "linear_attention", "qwen_sparse_attention"]
+
+    assert _count_hybrid_layer_types(Config({**base, "layer_types": layer_types})) == (1, 3)
+    assert _count_hybrid_layer_types(Config({**base, "layer_types": renamed})) == (1, 3)
+    # No layer_types at all: fall back to the 1-in-N interval, counted from the
+    # config's num_hidden_layers.
+    assert _count_hybrid_layer_types(Config({**base, "num_hidden_layers": 8})) == (2, 6)
 
 
 @pytest.mark.parametrize("config_name", list(FLOPS_TEST_OMNI_CONFIGS.keys()))

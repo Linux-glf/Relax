@@ -331,12 +331,17 @@ def _estimate_qwen3_vit_flop(images_seqlens, config):
     return dense_N_flops + attn_qkv_flops
 
 
-def _count_qwen3_5_layer_types(config):
+def _count_hybrid_layer_types(config):
+    """Split the decoder into (full-attention, linear-attention) layer counts.
+
+    Full attention is "everything not linear": transformers' Qwen4ExpConfig
+    renames it to ``qwen_sparse_attention``, so an exact match would miss all of
+    them.
+    """
     layer_types = getattr(config, "layer_types", None)
     if layer_types:
-        num_full_attn_layers = sum(layer_type == "full_attention" for layer_type in layer_types)
         num_linear_attn_layers = sum(layer_type == "linear_attention" for layer_type in layer_types)
-        return num_full_attn_layers, num_linear_attn_layers
+        return len(layer_types) - num_linear_attn_layers, num_linear_attn_layers
 
     full_attention_interval = getattr(config, "full_attention_interval", 4)
     num_full_attn_layers = sum(
@@ -355,7 +360,7 @@ def _compute_qwen3_5_hybrid_attn_params(config):
     k_size = num_key_value_heads * head_dim
     v_size = num_key_value_heads * head_dim
 
-    num_full_attn_layers, num_linear_attn_layers = _count_qwen3_5_layer_types(config)
+    num_full_attn_layers, num_linear_attn_layers = _count_hybrid_layer_types(config)
 
     full_attn_linear_N = hidden_size * (2 * q_size + k_size + v_size + q_size)
 
@@ -417,6 +422,153 @@ def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kar
         vit_flops = 0
 
     flops_all_token = dense_N_flops + attn_qkv_flops + gdn_recurrence_flops + vit_flops
+    return flops_all_token / delta_time / 1e12
+
+
+# ---------------------------------------------------------------------------
+# Qwen3.8-Flash-Next (qwen4_exp): 3:1 Gated DeltaNet / QSA hybrid + MoE + PLE.
+#
+# Counts what the qwen3.5 hybrid estimator does not: gated hyper-connections,
+# the PLE branch, the QSA indexer's bounded key selection, and the MTP head.
+# Linear terms are the module shapes the checkpoint stores; see
+# ``tests/utils/test_flops_counter.py`` for the reference-checkpoint checks.
+# ---------------------------------------------------------------------------
+
+
+def _qwen4_exp_head_dim(config):
+    return getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+
+def _qwen4_exp_gdn_layer_n(config):
+    """Per-token MACs of one Gated DeltaNet layer's projections and conv.
+
+    The delta-rule recurrence is counted separately in
+    ``_compute_qwen3_5_gdn_recurrence_flops``; this covers ``in_proj``,
+    the depthwise conv and ``out_proj``.
+    """
+    hidden = config.hidden_size
+    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+    value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+    in_proj = (2 * key_dim + 2 * value_dim + 2 * config.linear_num_value_heads) * hidden
+    conv = (2 * key_dim + value_dim) * config.linear_conv_kernel_dim
+    return in_proj + conv + value_dim * hidden
+
+
+def _qwen4_exp_qsa_layer_n(config):
+    """Per-token MACs of one QSA layer's projections, indexer projection included.
+
+    ``q_proj`` carries a per-head output gate, hence ``3 * q_dim + 2 * kv_dim``.
+    The indexer's selection cost is forward-only: see ``_qwen4_exp_indexer_flop``.
+    """
+    hidden = config.hidden_size
+    q_dim = config.num_attention_heads * _qwen4_exp_head_dim(config)
+    kv_dim = config.num_key_value_heads * _qwen4_exp_head_dim(config)
+    indexer_dim = (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim
+    return (3 * q_dim + 2 * kv_dim) * hidden + indexer_dim * hidden
+
+
+def _qwen4_exp_moe_layer_n(config):
+    """Per-token MACs of the MoE sub-block every layer has (there is no dense MLP)."""
+    hidden = config.hidden_size
+    experts = config.num_experts_per_tok * 3 * config.moe_intermediate_size * hidden
+    router = config.num_experts * hidden
+    shared = 3 * getattr(config, "shared_expert_intermediate_size", 0) * hidden + hidden
+    return experts + router + shared
+
+
+def _qwen4_exp_hyper_connection_n(config):
+    """Per-token MACs of one layer's two gated hyper-connection mixers."""
+    hc_hidden = config.hc_count * config.hidden_size
+    per_mixer = 2 * hc_hidden * config.hc_lowrank + hc_hidden * config.hc_count
+    return 2 * per_mixer
+
+
+def _qwen4_exp_ple_layer_n(config):
+    """Per-token MACs of one PLE layer, excluding the host-side n-gram gather."""
+    hidden = config.hidden_size
+    hc_hidden = config.hc_count * hidden
+    ple_dim = getattr(config, "ple_embed_dim", None) or hidden
+    return ple_dim * hc_hidden + ple_dim * hidden + hc_hidden * config.ple_conv_kernel_size
+
+
+def _qwen4_exp_selected_key_count(seq_len, compress_ratio, block_topk):
+    """(query, key) pairs one QSA layer scores: full causal below the block budget,
+    otherwise ``block_topk * compress_ratio`` keys per query.
+    """
+    if seq_len // compress_ratio <= block_topk:
+        return seq_len * (seq_len + 1) // 2
+    # R^2 * B * (B - 1) / 2 for the queries inside the budget; the rest see it whole.
+    budget = block_topk * compress_ratio
+    pairs = compress_ratio**2 * block_topk * (block_topk - 1) // 2
+    return pairs + (seq_len - budget) * budget
+
+
+def _qwen4_exp_indexer_flop(config, seq_len, num_layers):
+    """Forward-only FLOPs of QSA selection; zero when the budget does not bite."""
+    max_blocks = seq_len // config.indexer_compress_ratio
+    if max_blocks <= config.indexer_budget // config.indexer_compress_ratio:
+        return 0
+    return 2 * seq_len * max_blocks * config.indexer_n_heads * config.indexer_head_dim * num_layers
+
+
+def _estimate_qwen4_exp_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    """Qwen3.8-Flash-Next: GDN/QSA hybrid + MoE + PLE + hyper-connections.
+
+    Same 6N convention as above; attention scores are quadratic in the sequence
+    length, and the indexer is forward-only.
+    """
+    text_config = config.text_config if hasattr(config, "text_config") else config
+    hidden = text_config.hidden_size
+    # The per-layer hybrid pattern, spelled the same way qwen3.5 does.
+    num_full_attn_layers, num_linear_attn_layers = _count_hybrid_layer_types(text_config)
+    num_layers = num_full_attn_layers + num_linear_attn_layers
+
+    per_layer = _qwen4_exp_gdn_layer_n(text_config) * num_linear_attn_layers
+    per_layer += _qwen4_exp_qsa_layer_n(text_config) * num_full_attn_layers
+    # MoE and the hyper-connections are on every layer, whichever attention it has.
+    per_layer += (_qwen4_exp_moe_layer_n(text_config) + _qwen4_exp_hyper_connection_n(text_config)) * num_layers
+
+    # The model-level contraction from the hyper streams back to the residual
+    # width -- it replaces the final layernorm this architecture does not have.
+    contraction = 2 * text_config.hc_lowrank * text_config.hc_count * hidden
+    # PLE is on a subset of layers (`ple_layer_ids`), and an empty list means the
+    # branch is off entirely -- as it is for a checkpoint truncated without it.
+    ple_layers = len(getattr(text_config, "ple_layer_ids", None) or [])
+    ple = ple_layers * _qwen4_exp_ple_layer_n(text_config)
+
+    # MTP: one extra decoder layer per depth, its own contraction, the two H->H
+    # projections folding the embedding in, and one pass through the shared output
+    # layer. The depth is the run's (`mtp_num_layers`), not necessarily the config's.
+    mtp_depth = kargs.get("mtp_num_layers")
+    if mtp_depth is None:
+        mtp_depth = getattr(text_config, "mtp_num_hidden_layers", 0) or 0
+    mtp = 0
+    if mtp_depth:
+        mtp_layer = (
+            _qwen4_exp_qsa_layer_n(text_config)
+            + _qwen4_exp_moe_layer_n(text_config)
+            + _qwen4_exp_hyper_connection_n(text_config)
+        )
+        mtp = mtp_depth * (mtp_layer + contraction + text_config.vocab_size * hidden) + 2 * hidden**2
+
+    embeddings = text_config.vocab_size * hidden * 2
+    dense_N = per_layer + contraction + ple + mtp + embeddings
+    dense_N_flops = 6 * dense_N * tokens_sum
+
+    compress_ratio = text_config.indexer_compress_ratio
+    block_topk = text_config.indexer_budget // compress_ratio
+    seqlen_pairs = sum(_qwen4_exp_selected_key_count(s, compress_ratio, block_topk) for s in batch_seqlens)
+    # 12: QK^T + AV, each mul+add, fwd+bwd. The causal 1/2 is in the pair count.
+    attn_flops = 12 * seqlen_pairs * _qwen4_exp_head_dim(text_config) * text_config.num_attention_heads
+    attn_flops *= num_full_attn_layers
+    indexer_flops = sum(_qwen4_exp_indexer_flop(text_config, s, num_full_attn_layers) for s in batch_seqlens)
+    gdn_recurrence_flops = _compute_qwen3_5_gdn_recurrence_flops(text_config, tokens_sum, num_linear_attn_layers)
+
+    images_seqlens = kargs.get("images_seqlens", None)
+    vision_config = getattr(config, "vision_config", None)
+    vit_flops = _estimate_qwen3_vit_flop(images_seqlens, vision_config) if images_seqlens and vision_config else 0
+
+    flops_all_token = dense_N_flops + attn_flops + indexer_flops + gdn_recurrence_flops + vit_flops
     return flops_all_token / delta_time / 1e12
 
 
@@ -514,6 +666,8 @@ _ESTIMATE_FUNC = {
     "qwen2_moe": _estimate_qwen2_moe_flops,
     "qwen3_moe": _estimate_qwen2_moe_flops,
     "qwen3_5_moe": _estimate_qwen3_5_flops,
+    # GDN/QSA hybrid + MoE + PLE + hyper-connections (Qwen3.8-Flash-Next)
+    "qwen4_exp": _estimate_qwen4_exp_flops,
     "qwen3_next": _estimate_qwen2_moe_flops,
     "qwen3_omni_moe": _estimate_qwen3_omni_moe_flops,
     "glm4_moe": _estimate_qwen2_moe_flops,
@@ -540,7 +694,8 @@ class FlopsCounter:
         mfu = estimated_tflops / peak_tflops / world_size
     """
 
-    def __init__(self, config):
+    def __init__(self, config, mtp_num_layers=None):
+        """``mtp_num_layers`` is the depth the run trains; ``None`` reads it off ``config``."""
         if hasattr(config, "model_type") and config.model_type not in _ESTIMATE_FUNC:
             logger.warning(
                 "Unsupported model_type '%s' for FLOPS estimation — falling back to dense transformer formula. "
@@ -549,6 +704,7 @@ class FlopsCounter:
                 list(_ESTIMATE_FUNC.keys()),
             )
         self.config = config
+        self.mtp_num_layers = mtp_num_layers
 
     def estimate(self, batch_seqlens, delta_time, **kwargs):
         """Return (estimated_tflops, peak_device_tflops).
@@ -556,6 +712,7 @@ class FlopsCounter:
         ``estimated_tflops`` includes fwd+bwd (6N formula).
         """
         tokens_sum = sum(batch_seqlens)
+        kwargs.setdefault("mtp_num_layers", self.mtp_num_layers)
         model_type = getattr(self.config, "model_type", None)
         func = _ESTIMATE_FUNC.get(model_type, _estimate_fallback_flops)
         sig = inspect.signature(func)
