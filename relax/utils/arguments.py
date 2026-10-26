@@ -1817,6 +1817,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--save", type=str, default=None)
             reset_arg(parser, "--save-interval", type=int, default=None)
             reset_arg(parser, "--async-save", action="store_true")
+            # Megatron disables --async-save unless a persistent checkpoint worker is
+            # requested; this port's parser snapshot predates the flag, so add it here.
+            reset_arg(parser, "--use-persistent-ckpt-worker", action="store_true", default=False)
             parser.add_argument(
                 "--save-lora-only",
                 action="store_true",

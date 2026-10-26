@@ -36,7 +36,7 @@ venv/
 ENV/
 .vscode
 
-
+export_only_prof_dir/
 # custom .gitignore [add by cases]
 .coverage
 coverage.json

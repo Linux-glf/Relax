@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# ruff: noqa: I001  (megatron_adaptor must be imported before megatron.core)
 
 import logging
 import os
@@ -15,15 +16,14 @@ import requests
 import torch
 import torch.distributed as dist
 import transfer_queue as tq
-from megatron.core import mpu
-
 
 try:
-    # NPU patch
-    from mindspeed.megatron_adaptor import repatch
+    # Installs the NPU stand-ins; must run before a config Namespace is unpickled.
+    import megatron_adaptor  # noqa
 except ImportError:
-    repatch = None
+    pass
 
+from megatron.core import mpu
 from tensordict import TensorDict
 from transformers import AutoConfig, AutoTokenizer
 
@@ -386,8 +386,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.genrm_manager = None
 
-        if repatch is not None:
-            repatch(args)
         init(args)
         tq.init(args.tq_config)
         self.data_system_client = tq.get_client()

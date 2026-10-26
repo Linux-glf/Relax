@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import inspect
 import os
 import time
 import traceback
@@ -100,6 +101,23 @@ def _get_train_trace_dir(args):
     return os.path.join(_get_trace_base_dir(args), "train_trace")
 
 
+def _create_trace_handler(trace_dir, worker_name):
+    """Build a trace handler that works on CUDA and Ascend.
+
+    torch_npu's handler has no ``use_gzip`` and only raises when the schedule
+    fires, so decide from the signature up front.
+    """
+    handler = torch.profiler.tensorboard_trace_handler
+    try:
+        params = inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        params = {}
+    kwargs = {"worker_name": worker_name}
+    if not params or "use_gzip" in params:
+        kwargs["use_gzip"] = True
+    return handler(trace_dir, **kwargs)
+
+
 def _create_torch_profiler(args, name):
     trace_dir = _get_train_trace_dir(args)
     worker_name = f"{name}_{_get_rank_tag()}"
@@ -111,11 +129,7 @@ def _create_torch_profiler(args, name):
             active=args.profile_step_end - args.profile_step_start + 1,  # end is inclusive
             repeat=1,
         ),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            trace_dir,
-            worker_name=worker_name,
-            use_gzip=True,
-        ),
+        on_trace_ready=_create_trace_handler(trace_dir, worker_name),
         record_shapes=True,
         with_stack=args.profile_with_stack,
         profile_memory=args.profile_with_memory,

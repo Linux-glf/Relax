@@ -24,6 +24,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.global_vars import set_args
 
 from relax.utils.device import is_npu_available, make_current_torch_device
 from relax.utils.env import Envs
@@ -103,10 +104,17 @@ def _make_json_safe(value: Any, seen: set[int] | None = None) -> Any:
 def _dump_provider_config(provider: Any, save_path: str) -> None:
     os.makedirs(save_path, exist_ok=True)
 
+    # Best effort: this dump is a debugging artifact, never a training input. The NPU
+    # Bridge runtime replaces provider classes it re-exports into ``megatron.bridge``,
+    # so pickling can fail on class identity ("it's not the same object as ..."); the
+    # JSON snapshot below still carries the full config.
     pkl_path = os.path.join(save_path, "transformer_config.pkl")
-    with open(pkl_path, "wb") as f:
-        pickle.dump(provider, f)
-    logger.info(f"Provider config saved to {pkl_path}")
+    try:
+        with open(pkl_path, "wb") as f:
+            pickle.dump(provider, f)
+        logger.info(f"Provider config saved to {pkl_path}")
+    except Exception as e:
+        logger.warning(f"Skipped provider pickle dump to {pkl_path}: {type(e).__name__}: {e}")
 
     json_path = os.path.join(save_path, "transformer_config.json")
     with open(json_path, "w") as f:
@@ -418,6 +426,15 @@ def get_model_provider_func(
 
         _validate_linear_cp_mode(args, provider)
         provider.finalize()
+
+        # MindSpeed-Bridge activates itself lazily from the AutoBridge factory above and
+        # publishes its own feature-argument Namespace through
+        # ``megatron.training.global_vars.set_args``, which hides the training Namespace
+        # from every Megatron ``get_args()`` caller (e.g. ``get_model`` reading
+        # ``create_all_gather_group``). Re-publish our Namespace now that Bridge is done
+        # with the provider; Bridge features keep their own view through
+        # ``megatron_adaptor.utils.args_utils.get_full_args``.
+        set_args(args)
 
         # Pickle provider for offline inspection / reproducibility (only on rank 0)
         if not dist.is_initialized() or dist.get_rank() == 0:

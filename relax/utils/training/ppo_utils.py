@@ -528,7 +528,10 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         sum_softmax_times_logits = vocab_parallel_logits.new_empty((0,))
 
         def sum_softmax_logits(softmax: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-            if softmax.is_cuda:
+            # Test the device type, not ``is_cuda``: transfer_to_npu (imported by
+            # megatron_adaptor) answers True for NPU tensors, which would send
+            # Ascend down the CUDA branch below and pay a [N, 1, vocab] bmm.
+            if softmax.device.type == "cuda":
                 # Avoid materializing the full [seq_len, vocab] product buffer.
                 return torch.einsum("ij,ij->i", softmax, logits).unsqueeze(-1)
             return (softmax * logits).sum(dim=-1, keepdim=True)

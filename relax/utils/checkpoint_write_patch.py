@@ -46,6 +46,25 @@ logger = get_logger(__name__)
 _patched = False
 
 
+def _file_system_writer_async():
+    """``FileSystemWriterAsync``: ``nvidia_resiliency_ext`` first, vendored Megatron second."""
+    try:
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import FileSystemWriterAsync
+    except ImportError:
+        from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+    return FileSystemWriterAsync
+
+
+def _temporal_async_caller_types():
+    """``(TemporalAsyncCaller, _disable_gc)`` from the same two locations."""
+    try:
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import TemporalAsyncCaller
+        from nvidia_resiliency_ext.checkpointing.utils import _disable_gc
+    except ImportError:
+        from megatron.core.dist_checkpointing.strategies.async_utils import TemporalAsyncCaller, _disable_gc
+    return TemporalAsyncCaller, _disable_gc
+
+
 # ---------------------------------------------------------------------------
 # Thread wrapper that mimics mp.Process interface for TemporalAsyncCaller
 # ---------------------------------------------------------------------------
@@ -208,7 +227,7 @@ def patch_checkpoint_write():
 
     This function is idempotent — calling it multiple times is safe.
     """
-    from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+    FileSystemWriterAsync = _file_system_writer_async()
 
     global _patched
     # NOTE(wuhuan): the latest Megatron-LM of 20260506 use write_preloaded_data_multithread instead of
@@ -230,7 +249,7 @@ def patch_checkpoint_write():
 def _patch_write_preloaded_data_multiproc():
     """Patch ``write_preloaded_data_multiproc`` to use threaded parallel
     writes."""
-    from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+    FileSystemWriterAsync = _file_system_writer_async()
 
     # In Python 3, accessing a @staticmethod via the class returns the
     # underlying function directly (no descriptor wrapper), so we can
@@ -272,10 +291,7 @@ def _patch_write_preloaded_data_multiproc():
 
 def _patch_temporal_async_caller():
     """Patch ``TemporalAsyncCaller.schedule_async_call`` to use threads."""
-    from megatron.core.dist_checkpointing.strategies.async_utils import (
-        TemporalAsyncCaller,
-        _disable_gc,
-    )
+    TemporalAsyncCaller, _disable_gc = _temporal_async_caller_types()
 
     _original_schedule = TemporalAsyncCaller.schedule_async_call
 
