@@ -1563,6 +1563,7 @@ def train(
 
         mtp_losses = None
         mtp_loss_per_depth: list[float] = []
+        mtp_loss_token_weighted_per_depth: list[float] = []
         if args.enable_mtp_training:
             from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
@@ -1584,6 +1585,23 @@ def train(
                     torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
                 if tracker.get("avg_group") is not None:
                     torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
+            # Token-weighted metric, independent of the microbatch/DP/CP
+            # partition: sum the raw CE and valid-token counts over every
+            # microbatch and rank, then divide once. `train/mtp_loss` above
+            # remains the reference's mean-of-means.
+            loss_sums = tracker.get("_relax_mtp_loss_sum")
+            token_counts = tracker.get("_relax_mtp_token_count")
+            if loss_sums is not None and token_counts is not None:
+                packed = torch.cat((loss_sums, token_counts))
+                for group_key in ("reduce_group", "avg_group"):
+                    group = tracker.get(group_key)
+                    if group is not None:
+                        torch.distributed.all_reduce(packed, group=group)
+                loss_sums, token_counts = packed.chunk(2)
+                token_weighted = loss_sums / token_counts.clamp(min=1)
+                mtp_loss_token_weighted_per_depth = token_weighted.flatten().tolist()
+                tracker.pop("_relax_mtp_loss_sum", None)
+                tracker.pop("_relax_mtp_token_count", None)
             # The legacy payload is "values"; the renamed metrics tracker uses
             # "loss_values".
             mtp_values = tracker.get("values")
@@ -1627,6 +1645,11 @@ def train(
                 if len(mtp_loss_per_depth) > 1:
                     for _i, _v in enumerate(mtp_loss_per_depth, start=1):
                         log_dict[f"train/{role_tag}mtp_{_i}_loss"] = _v
+            if args.enable_mtp_training and mtp_loss_token_weighted_per_depth:
+                log_dict[f"train/{role_tag}mtp_loss_token_weighted"] = sum(mtp_loss_token_weighted_per_depth)
+                if len(mtp_loss_token_weighted_per_depth) > 1:
+                    for _i, _v in enumerate(mtp_loss_token_weighted_per_depth, start=1):
+                        log_dict[f"train/{role_tag}mtp_{_i}_loss_token_weighted"] = _v
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):

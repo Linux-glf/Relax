@@ -169,6 +169,19 @@ try:
                 config.mtp_num_layers,
                 avg_group=avg_group,
             )
+            # Raw numerator/denominator for the token-weighted metric that
+            # `model.py` logs next to the reference's mean-of-means. The
+            # accumulator is cleared there once per step.
+            tracker = MTPLossLoggingHelper.tracker
+            if "_relax_mtp_loss_sum" not in tracker:
+                tracker["_relax_mtp_loss_sum"] = torch.zeros(
+                    config.mtp_num_layers, device=mtp_loss.device, dtype=torch.float32
+                )
+                tracker["_relax_mtp_token_count"] = torch.zeros(
+                    config.mtp_num_layers, device=mtp_loss.device, dtype=torch.float32
+                )
+            tracker["_relax_mtp_loss_sum"][layer_number] += torch.sum(mtp_loss).detach().float()
+            tracker["_relax_mtp_token_count"][layer_number] += num_tokens.detach().float()
             return
         if _MTP_TRACKER_API == "none":
             return
