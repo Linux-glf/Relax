@@ -98,18 +98,21 @@ source "${MODEL_CONFIG_DIR}/qwen38-flash-next-8L.sh"
 # The n-gram table's switches (`ple.py`: QWEN4_EXP_PLE_TABLE_MODE, the DCP gate
 # QWEN4_EXP_PLE_TABLE_IN_DCP for the row-routed form, and the legacy offload switch
 # QWEN4_EXP_PLE_CPU_OFFLOAD that has to agree with it) are read in the worker that
-# builds the model, and the Ray workers do not inherit this shell. They have to
-# travel in RUNTIME_ENV_JSON's env_vars -- the same channel the 48L trainable recipe
-# uses for QWEN4_EXP_PLE_CPU_OFFLOAD. The entrypoint above has already built that
-# JSON; this merges into it rather than replacing it, so PYTHONPATH and the rest
-# survive. With none of the variables set nothing is rewritten, so a default run
-# (the A gate included) resolves exactly as before.
-if [ -n "${QWEN4_EXP_PLE_TABLE_MODE:-}" ] || [ -n "${QWEN4_EXP_PLE_TABLE_IN_DCP:-}" ] || [ -n "${QWEN4_EXP_PLE_CPU_OFFLOAD:-}" ]; then
+# builds the model, and the Ray workers do not inherit this shell. The MTP input
+# mask switch (QWEN4_EXP_MTP_INPUT_MASK) is read there too: off by default, which
+# keeps mtp_input_mask=None exactly as the GPU stack runs it; set it to 1 only to
+# re-enable the NPU-only image/video-placeholder exclusion. They have to travel in
+# RUNTIME_ENV_JSON's env_vars -- the same channel the 48L trainable recipe uses for
+# QWEN4_EXP_PLE_CPU_OFFLOAD. The entrypoint above has already built that JSON; this
+# merges into it rather than replacing it, so PYTHONPATH and the rest survive. With
+# none of the variables set nothing is rewritten; the bridge's mask default is off.
+if [ -n "${QWEN4_EXP_PLE_TABLE_MODE:-}" ] || [ -n "${QWEN4_EXP_PLE_TABLE_IN_DCP:-}" ] || [ -n "${QWEN4_EXP_PLE_CPU_OFFLOAD:-}" ] || [ -n "${QWEN4_EXP_MTP_INPUT_MASK:-}" ]; then
    RUNTIME_ENV_JSON="$(
       RELAX_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}" \
       RELAX_INJECT_TABLE_MODE="${QWEN4_EXP_PLE_TABLE_MODE:-}" \
       RELAX_INJECT_TABLE_IN_DCP="${QWEN4_EXP_PLE_TABLE_IN_DCP:-}" \
       RELAX_INJECT_OFFLOAD="${QWEN4_EXP_PLE_CPU_OFFLOAD:-}" \
+      RELAX_INJECT_MTP_MASK="${QWEN4_EXP_MTP_INPUT_MASK:-}" \
       python3 - <<'PY'
 import json
 import os
@@ -126,6 +129,9 @@ if table_in_dcp:
 offload = os.environ["RELAX_INJECT_OFFLOAD"]
 if offload:
     env_vars["QWEN4_EXP_PLE_CPU_OFFLOAD"] = offload
+mtp_mask = os.environ["RELAX_INJECT_MTP_MASK"]
+if mtp_mask:
+    env_vars["QWEN4_EXP_MTP_INPUT_MASK"] = mtp_mask
 config["env_vars"] = env_vars
 print(json.dumps(config))
 PY

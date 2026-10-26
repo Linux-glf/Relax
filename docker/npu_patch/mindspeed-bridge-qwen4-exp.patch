@@ -17040,10 +17040,10 @@ index 0000000..f754191
 +        param.requires_grad = not freeze
 diff --git a/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/vl_model.py b/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/vl_model.py
 new file mode 100644
-index 0000000..a587eb3
+index 0000000..126b4bf
 --- /dev/null
 +++ b/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/vl_model.py
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,453 @@
 +# Copyright (c) 2026, HUAWEI CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0.
@@ -17083,6 +17083,7 @@ index 0000000..a587eb3
 +
 +from __future__ import annotations
 +
++import os
 +from typing import Optional
 +
 +import torch
@@ -17329,18 +17330,25 @@ index 0000000..a587eb3
 +        #
 +        # `mtp_input_mask` marks the tokens that may serve as MTP conditioning inputs.
 +        # The image/video placeholder rows are not real tokens, so a depth whose
-+        # rolled-in conditioning token is one of them must not be supervised; the GPU
-+        # `feat/qwen4exp-cp-multimodal` branch builds the same mask. It is built from
-+        # the *local* `input_ids` (after the CP split) so it lines up with the token
-+        # ids and the loss mask this rank hands to the text tower, and it stays in the
-+        # input-id frame -- `process_mtp_loss` rolls it once per depth, unlike the
-+        # predictor-frame loss mask.
++        # rolled-in conditioning token is one of them is an easy/zero-CE position.
++        # The GPU stack neither builds nor passes this mask -- `process_mtp_loss`
++        # counts every position -- so it is off by default here to keep the two MTP
++        # losses comparable. Set QWEN4_EXP_MTP_INPUT_MASK=1 to re-enable it; the
++        # mask is built from the *local* `input_ids` (after the CP split) and stays
++        # in the input-id frame -- `process_mtp_loss` rolls it once per depth, unlike
++        # the predictor-frame loss mask.
 +        text_kwargs = {}
 +        if mtp_kwargs:
 +            text_kwargs["mtp_kwargs"] = mtp_kwargs
-+            text_kwargs["mtp_input_mask"] = (input_ids != self.image_token_id) & (
-+                input_ids != self.video_token_id
-+            )
++            if os.environ.get("QWEN4_EXP_MTP_INPUT_MASK", "0").strip().lower() not in (
++                "0",
++                "false",
++                "no",
++                "off",
++            ):
++                text_kwargs["mtp_input_mask"] = (input_ids != self.image_token_id) & (
++                    input_ids != self.video_token_id
++                )
 +
 +        return super().forward(
 +            input_ids=input_ids,
