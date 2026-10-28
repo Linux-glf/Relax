@@ -3199,10 +3199,10 @@ index 0000000..447a122
 +        return super()._postprocess(hidden_states, *args, **kwargs)
 diff --git a/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/mtp.py b/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/mtp.py
 new file mode 100644
-index 0000000..8be9a62
+index 0000000..7f8ff1b
 --- /dev/null
 +++ b/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/mtp.py
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,345 @@
 +# Copyright (c) 2026, HUAWEI CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0.
@@ -3250,7 +3250,10 @@ index 0000000..8be9a62
 +    Qwen4ExpTextGatedResidual,
 +)
 +from mindspeed_bridge.models.qwen4_exp.modelling_qwen4_exp.layer import Qwen4ExpLayer
-+from mindspeed_bridge.models.qwen4_exp.modelling_qwen4_exp.norms import Qwen4ExpTextRMSNorm
++from mindspeed_bridge.models.qwen4_exp.modelling_qwen4_exp.norms import (
++    Qwen4ExpTextGroupedRMSNorm,
++    Qwen4ExpTextRMSNorm,
++)
 +
 +
 +class Qwen4ExpMTPEmbeddingNorm(Qwen4ExpTextRMSNorm):
@@ -3264,18 +3267,20 @@ index 0000000..8be9a62
 +        super().__init__(hidden_size, eps=eps, dtype=config.params_dtype, sequence_parallel=config.sequence_parallel)
 +
 +
-+class Qwen4ExpMTPStreamNorm(Qwen4ExpTextRMSNorm):
-+    """``pre_fc_norm_hidden``: zero-centered RMSNorm over the whole multi-stream.
++class Qwen4ExpMTPStreamNorm(Qwen4ExpTextGroupedRMSNorm):
++    """``pre_fc_norm_hidden``: zero-centered RMSNorm, one group per ``H``-wide stream.
 +
-+    Unlike Megatron's mHC MTP, which normalizes each ``H``-wide stream on its own,
-+    Qwen3.8-Flash-Next normalizes the concatenated ``hc_count * hidden_size``
-+    features jointly (a single affine over all of them). The builder only knows
-+    ``hidden_size``, so the width is scaled here.
++    Normalizes each ``hidden_size`` stream independently, matching the GPU
++    stack's ``GatedResidualMTPHiddenNorm`` (the two are equivalent whenever the
++    streams are balanced; per-stream keeps both stacks on the same convention).
++    The builder only knows ``hidden_size``, so the width and group size are
++    derived here.
 +    """
 +
 +    def __init__(self, config, hidden_size: int, eps: float = 1e-6, **kwargs):
 +        super().__init__(
 +            config.hc_count * hidden_size,
++            group_size=hidden_size,
 +            eps=eps,
 +            dtype=config.params_dtype,
 +            sequence_parallel=config.sequence_parallel,
@@ -9524,10 +9529,10 @@ index 0000000..34ea1f1
 +    sys.exit(main())
 diff --git a/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/spec.py b/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/spec.py
 new file mode 100644
-index 0000000..f73458c
+index 0000000..0dbca61
 --- /dev/null
 +++ b/mindspeed_bridge/models/qwen4_exp/modelling_qwen4_exp/spec.py
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,284 @@
 +# Copyright (c) 2026, HUAWEI CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0.
@@ -9773,7 +9778,9 @@ index 0000000..f73458c
 +        submodules=MultiTokenPredictionLayerSubmodules(
 +            # `pre_fc_norm_embedding`: over the embedding width.
 +            enorm=Qwen4ExpMTPEmbeddingNorm,
-+            # `pre_fc_norm_hidden`: over the whole multi-stream (hc_count * H).
++            # `pre_fc_norm_hidden`: one group per H-wide stream
++            # (group_size=hidden_size), matching the GPU stack's
++            # GatedResidualMTPHiddenNorm.
 +            hnorm=Qwen4ExpMTPStreamNorm,
 +            eh_proj=IdentityOp,
 +            # `mtp_model_layer`, not `transformer_layer`: the latter is what this
