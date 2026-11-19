@@ -1,0 +1,14 @@
+diff --git a/hyper_multicore/modules/mega_moe/workspace.py b/hyper_multicore/modules/mega_moe/workspace.py
+index ba2bc62..d2d2708 100644
+--- a/hyper_multicore/modules/mega_moe/workspace.py
++++ b/hyper_multicore/modules/mega_moe/workspace.py
+@@ -381,6 +381,9 @@ class MegaMoeWorkspace:
+ 
+         # Initialize the persistent generation before any peer can signal it.
+         events[self.event_counter_bytes:].zero_()
++        # Finish local ready-state initialization before any peer can publish.
++        # A Host collective alone must not order asynchronous device clears.
++        torch.npu.current_stream(self.device).synchronize()
+         shmem.host_barrier()
+         if forward:
+             self.forward_ready_initialized = True
