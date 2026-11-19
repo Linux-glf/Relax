@@ -9,10 +9,10 @@ import torch
 
 @pytest.fixture
 def ple_converter(monkeypatch, request):
-    pytest.importorskip("megatron.bridge.models.qwen.qwen4_exp_bridge")
+    pytest.importorskip("mindspeed_bridge.models.qwen4_exp.qwen4_exp_bridge")
     from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
     from megatron.bridge.models.conversion.param_mapping import mpu
-    from megatron.bridge.models.qwen.qwen4_exp_bridge import PLENGramEmbeddingMapping
+    from mindspeed_bridge.models.qwen4_exp.qwen4_exp_bridge import PLENGramEmbeddingMapping
 
     from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter
 
