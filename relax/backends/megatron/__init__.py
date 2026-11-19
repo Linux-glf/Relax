@@ -30,6 +30,17 @@ try:
 except BaseException as e:
     print(f"failed to import relax.models, error={e}")
 
+try:
+    # core_v0.18 does not carry the 920 Megatron patch that dispatches
+    # process_mtp_loss into Relax's chunked implementation.  Install the same
+    # dispatch from the Relax side so Megatron-LM stays at the four required
+    # release patches.
+    from relax.models.common.chunked_mtp_loss import install_chunked_mtp_loss_patch
+
+    install_chunked_mtp_loss_patch()
+except BaseException as e:
+    print(f"failed to install chunked MTP loss dispatch, error={e}")
+
 # Extension hook (analogue of ``--custom-generate-function-path``): every
 # Megatron actor / driver loads this module, so any module names listed in
 # ``RELAX_EXTRA_MODULES`` (comma-separated) are imported here for their

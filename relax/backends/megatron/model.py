@@ -2051,8 +2051,20 @@ def train(
             # Mirrors upstream MTPLossLoggingHelper.track_mtp_metrics.
             mtp_losses = None
             reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
+            # core_v0.18 has reduce_loss_in_tracker but still uses the legacy
+            # per-microbatch-mean payload: its save_loss_to_tracker has no
+            # `num_tokens` parameter.  Gate the scale rule on the tracker API,
+            # not on the presence of the reduce helper, otherwise the logged
+            # MTP loss is summed over microbatches (3x too large).
+            save_loss_to_tracker = getattr(MTPLossLoggingHelper, "save_loss_to_tracker", None)
+            tracker_code = getattr(save_loss_to_tracker, "__code__", None)
+            tracker_parameters = (
+                set(tracker_code.co_varnames[: tracker_code.co_argcount + tracker_code.co_kwonlyargcount])
+                if tracker_code is not None
+                else set()
+            )
             mtp_loss_scale, raw_ce_scale = _mtp_metric_scales(
-                args, step_num_microbatches, token_tracker=reduce_in_tracker is not None
+                args, step_num_microbatches, token_tracker="num_tokens" in tracker_parameters
             )
             if reduce_in_tracker is not None:
                 reduce_in_tracker()

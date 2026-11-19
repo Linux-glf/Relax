@@ -2,6 +2,7 @@
 """Sequence-chunked MTP head and loss implementation, selected by the static
 MCore entry point."""
 
+import contextvars
 import inspect
 
 import torch
@@ -23,6 +24,10 @@ logger = get_logger(__name__)
 _ROLL_TENSOR_PARAMETERS = set(inspect.signature(roll_tensor).parameters)
 _MTP_TRACKER_PARAMETERS = set(inspect.signature(MTPLossLoggingHelper.save_loss_to_tracker).parameters)
 _COMPUTE_MTP_ACCEPTANCE_COUNTS = getattr(_mtp_mod, "_compute_mtp_acceptance_counts", None)
+# core_v0.18's process_mtp_loss has no input_ids argument, but SFT passes
+# labels=None and expects MTP labels to be derived from the token ids.  The
+# install hook records the current input ids here around GPTModel._postprocess.
+_RELAX_MTP_INPUT_IDS = contextvars.ContextVar("relax_mtp_input_ids", default=None)
 
 
 def _normalization_counts(num_tokens, original_num_tokens, cp_group):
@@ -348,12 +353,12 @@ def process_mtp_loss(
             return hidden_states
         if loss_mask is None:
             loss_mask = torch.ones_like(input_ids)
-        labels, loss_mask = roll_tensor(
-            [input_ids, loss_mask],
+        labels, loss_mask, _ = _roll_mtp_labels_and_mask(
+            input_ids,
+            loss_mask,
             cp_group=cp_group,
             packed_seq_params=packed_seq_params,
-            roll_context=sequence_roll_context,
-            sequence_fields=["input_ids", "loss_mask"],
+            sequence_roll_context=sequence_roll_context,
             roll_depth=0,
         )
     mtp_labels = labels.clone()
@@ -439,15 +444,24 @@ def process_mtp_loss(
 
         layer_loss_mask = loss_mask
         if mtp_input_mask is not None:
-            [mtp_input_mask] = roll_tensor(
-                [mtp_input_mask],
-                cp_group=cp_group,
-                packed_seq_params=packed_seq_params,
-                fill_values=[False],
-                roll_context=sequence_roll_context,
-                sequence_fields=["mtp_input_mask"],
-                roll_depth=mtp_layer_number,
-            )
+            if "tensors" in _ROLL_TENSOR_PARAMETERS:
+                [mtp_input_mask] = roll_tensor(
+                    [mtp_input_mask],
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                    fill_values=[False],
+                    roll_context=sequence_roll_context,
+                    sequence_fields=["mtp_input_mask"],
+                    roll_depth=mtp_layer_number,
+                )
+            else:
+                mtp_input_mask, _ = roll_tensor(
+                    mtp_input_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
             cumulative_mtp_input_mask = (
                 mtp_input_mask if cumulative_mtp_input_mask is None else cumulative_mtp_input_mask & mtp_input_mask
             )
@@ -505,3 +519,61 @@ def process_mtp_loss(
             )
 
     return hidden_states
+
+
+def install_chunked_mtp_loss_patch() -> None:
+    """Install the core_v0.18 ``process_mtp_loss`` dispatch hook.
+
+    The 920 image carried this dispatch in ``docker/patch/megatron`` (the
+    ``20260915`` patch), but the target stack keeps its Megatron-LM patch to the
+    four release-critical items.  Installing the hook from Relax keeps the
+    behaviour without touching the Megatron-LM checkout.
+    """
+    from megatron.core.models.gpt import gpt_model
+
+    original = gpt_model.process_mtp_loss
+    if getattr(original, "_relax_chunked_mtp", False):
+        return
+
+    chunked_impl = process_mtp_loss
+
+    def _process_mtp_loss_dispatch(*args, **kwargs):
+        config = kwargs.get("config")
+        if config is None and len(args) >= 9:
+            # core_v0.18 positional order ends with
+            # ..., is_training, compute_language_model_loss, config
+            config = args[8]
+        fused_linear = (
+            config is not None
+            and getattr(config, "cross_entropy_loss_fusion", False)
+            and getattr(config, "cross_entropy_fusion_impl", "") == "linear"
+        )
+        if _chunked_mtp_enabled() and not fused_linear:
+            labels = kwargs.get("labels")
+            if labels is None and len(args) > 1:
+                labels = args[1]
+            if labels is None:
+                input_ids = _RELAX_MTP_INPUT_IDS.get()
+                if input_ids is not None:
+                    kwargs = dict(kwargs)
+                    kwargs["input_ids"] = input_ids
+            return chunked_impl(*args, **kwargs)
+        return original(*args, **kwargs)
+
+    _process_mtp_loss_dispatch._relax_chunked_mtp = True
+    gpt_model.process_mtp_loss = _process_mtp_loss_dispatch
+
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    original_postprocess = GPTModel._postprocess
+    if not getattr(original_postprocess, "_relax_mtp_input_ids", False):
+
+        def _postprocess(self, hidden_states, input_ids, *args, **kwargs):
+            token = _RELAX_MTP_INPUT_IDS.set(input_ids)
+            try:
+                return original_postprocess(self, hidden_states, input_ids, *args, **kwargs)
+            finally:
+                _RELAX_MTP_INPUT_IDS.reset(token)
+
+        _postprocess._relax_mtp_input_ids = True
+        GPTModel._postprocess = _postprocess

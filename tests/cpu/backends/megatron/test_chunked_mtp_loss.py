@@ -603,7 +603,11 @@ def test_sequence_parallel_gathers_hidden_once(monkeypatch):
 
 
 def test_static_mcore_bindings_are_not_replaced():
+    """The core binding may carry Relax's dispatch wrapper, never the chunked
+    implementation itself."""
     from megatron.core.models.gpt import gpt_model as gpt_mod
 
+    _patch.install_chunked_mtp_loss_patch()
     assert _mtp_mod.process_mtp_loss is not _patch.process_mtp_loss
-    assert gpt_mod.process_mtp_loss is _mtp_mod.process_mtp_loss
+    assert gpt_mod.process_mtp_loss is not _patch.process_mtp_loss
+    assert getattr(gpt_mod.process_mtp_loss, "_relax_chunked_mtp", False)
