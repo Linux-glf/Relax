@@ -206,6 +206,17 @@ def _save_mtp_loss_to_tracker(
     """Log MTP loss across the legacy and token-aware tracker APIs."""
     avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
     denominator = num_tokens if global_num_tokens is None else global_num_tokens
+    # Token-weighted metric: keep the raw CE sum and the valid-token count per
+    # depth; the training loop reduces them once and divides at the end.
+    tracker = MTPLossLoggingHelper.tracker
+    for key in ("_relax_mtp_loss_sum", "_relax_mtp_token_count"):
+        if key not in tracker:
+            tracker[key] = torch.zeros(config.mtp_num_layers, device=mtp_loss.device, dtype=torch.float32)
+    # ``layer_number`` is 1-based in the tracker protocol but the chunked loop
+    # below uses 0-based indices; accept either without an out-of-range write.
+    layer_index = layer_number if 0 <= layer_number < config.mtp_num_layers else layer_number - 1
+    tracker["_relax_mtp_loss_sum"][layer_index] += mtp_loss.detach().float().sum()
+    tracker["_relax_mtp_token_count"][layer_index] += num_tokens.detach().float()
     # Preserve the Qwen3.8 baseline's mean of per-microbatch raw CEs,
     # independently of the new runtime's token-weighted objective tracker.
     if (

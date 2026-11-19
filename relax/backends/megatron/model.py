@@ -169,6 +169,14 @@ def _bypass_output_layer(
     deferred_weight = None
     main_head_deferred = False
 
+    # With SP on, the one-shot gather below is the only place the chunked head's
+    # input gradient can be reduced: `_chunked_call` disables the per-chunk
+    # ColumnParallelLinear dgrad all-reduce, and `tensor_parallel_output_grad=True`
+    # turns the gather's backward into ONE reduce-scatter per microbatch. Both
+    # halves must change together -- True alone double-counts (grad_norm x TP);
+    # disabling alone drops the reduction entirely.
+    chunk_dgrad_via_gather = sp_enabled and gather_passthrough
+
     if sp_enabled and gather_passthrough:
         from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
@@ -190,7 +198,7 @@ def _bypass_output_layer(
         main_head_deferred = True
         deferred_weight = weight
         if sp_enabled and gather_passthrough:
-            input_ = gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad=False, group=tp_group)
+            input_ = gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad=True, group=tp_group)
         return input_, None
 
     def _chunked_call(input_, weight=None, runtime_gather_output=None, *, labels=None):
@@ -229,10 +237,23 @@ def _bypass_output_layer(
                 logger.info("[chunked-head] checkpointed MTP0 head uses unfused wgrad; other layers unchanged")
                 output_layer._relax_chunked_head_wgrad_logged = True
         output_layer.sequence_parallel = False
+        prev_disable_grad_reduce = prev_allreduce_dgrad = None
+        if chunk_dgrad_via_gather:
+            # Input is the full sequence already gathered on every TP rank, and
+            # every rank owns just its vocab shard: the per-chunk dgrad all-reduce
+            # is redundant. Suppress it; the gather's backward reduce-scatter sums
+            # the partial (vocab-shard) gradients once per microbatch.
+            prev_disable_grad_reduce = getattr(output_layer, "disable_grad_reduce", False)
+            prev_allreduce_dgrad = getattr(output_layer, "allreduce_dgrad", False)
+            output_layer.disable_grad_reduce = True
+            output_layer.allreduce_dgrad = False
         try:
             return original_forward(input_, weight=call_weight, runtime_gather_output=runtime_gather_output)
         finally:
             output_layer.sequence_parallel = prev_sp
+            if chunk_dgrad_via_gather:
+                output_layer.disable_grad_reduce = prev_disable_grad_reduce
+                output_layer.allreduce_dgrad = prev_allreduce_dgrad
             if unfused_head_wgrad:
                 output_layer.gradient_accumulation_fusion = prev_fusion
 
@@ -1200,29 +1221,55 @@ def forward_only(
     return rollout_data
 
 
-def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
+def _reduce_loss_metrics(
+    losses_reduced: list[dict[str, object]],
+) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    """Sum the per-microbatch metric vectors and reduce them over DP+CP once.
+
+    The vector layout is ``[denominator, *metrics]``; under per-token loss the
+    denominator is the CP-local effective token count. The globally reduced
+    token count is appended to the same collective so the zero-token check does
+    not need a second DP+CP all-reduce.
+    """
+    keys = losses_reduced[0]["keys"]
+    values = losses_reduced[0]["values"]
+    for x in losses_reduced[1:]:
+        values += x["values"]
+    assert len(keys) + 1 == values.numel()
+    num_tokens = sum(x["num_tokens"] for x in losses_reduced).reshape(1)
+    reduce_buf = torch.cat((values, num_tokens.to(dtype=values.dtype)))
+    torch.distributed.all_reduce(reduce_buf, group=mpu.get_data_parallel_group(with_context_parallel=True))
+    return keys, reduce_buf[:-1], reduce_buf[-1]
+
+
+def _is_global_zero_token_step(num_tokens: torch.Tensor | list[dict[str, object]] | None) -> bool:
     """Return True when the whole step has zero effective loss tokens.
 
     An empty or fully-masked global batch connects a zero loss through
     ``0 * logits.sum()``, so gradients are exactly zero. Running the optimizer
     anyway would still move parameters through Adam momentum / weight decay and
     advance the LR scheduler, despite there being no training signal. This
-    computes the globally reduced token count on the last pipeline stage and
-    broadcasts the decision to every rank so they agree on skipping the
-    optimizer and scheduler updates. The decision stays on device until the
-    single host read that the Python-side skip branch requires.
+    broadcasts the already reduced token count from the last pipeline stage to
+    every rank so they agree on skipping the optimizer and scheduler updates.
+    The decision stays on device until the single host read that the
+    Python-side skip branch requires.
     """
     signal = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+    # ``train_one_step`` now passes the token count reduced alongside the loss
+    # metrics. Keep accepting the old list-of-microbatch payload for callers
+    # (and CPU tests) that predate that change.
+    legacy_losses = isinstance(num_tokens, (list, tuple))
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
-        # Sum the per-microbatch CP-local token counts, then reduce over DP+CP so
-        # every last-stage TP rank observes the same global count (mirrors the
-        # metric all-reduce below, which also uses the DP+CP group).
-        num_tokens_local = sum(x["num_tokens"] for x in losses_reduced)
-        torch.distributed.all_reduce(
-            num_tokens_local,
-            group=mpu.get_data_parallel_group(with_context_parallel=True),
-        )
-        signal.copy_((num_tokens_local == 0).reshape(1))
+        if legacy_losses:
+            num_tokens_local = sum(x["num_tokens"] for x in num_tokens)
+            torch.distributed.all_reduce(
+                num_tokens_local,
+                group=mpu.get_data_parallel_group(with_context_parallel=True),
+            )
+            signal.copy_((num_tokens_local == 0).reshape(1))
+        else:
+            assert num_tokens is not None
+            signal.copy_((num_tokens == 0).reshape(1))
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         # Non-last stages did not join the all-reduce; every pipeline stage
         # enters this broadcast so the last-stage decision reaches all ranks.
@@ -1603,6 +1650,19 @@ def train_one_step(
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
 
+    # Reduce the loss metrics once, immediately after backward, while ranks are
+    # still tightly synchronized. The previous flow ran this 2-element DP+CP
+    # all-reduce after optimizer.step(): the CPU optimizer has rank-dependent
+    # duration, so the collective (and the `.tolist()` that followed it) waited
+    # for the slowest rank and showed up as ~1 s stalls at step end. The
+    # effective token count rides in the same buffer, so the zero-token check
+    # below needs no separate collective.
+    metric_keys: list[str] | None = None
+    metric_values: torch.Tensor | None = None
+    global_num_tokens: torch.Tensor | None = None
+    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+        metric_keys, metric_values, global_num_tokens = _reduce_loss_metrics(losses_reduced)
+
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
     if args.ci_test and args.enable_mtp_training:
@@ -1631,7 +1691,7 @@ def train_one_step(
 
     valid_step = True
     skipped_nonfinite_grad = False
-    if _is_global_zero_token_step(losses_reduced):
+    if _is_global_zero_token_step(global_num_tokens):
         # No effective loss tokens anywhere in the global batch. Gradients are
         # exactly zero (the loss is zero-connected), so skip both the parameter
         # and LR scheduler updates; momentum / weight decay must not move the
@@ -1719,19 +1779,15 @@ def train_one_step(
         device_module.empty_cache()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
-        # Average loss across microbatches.
-        keys = losses_reduced[0]["keys"]
-        values = None
-        for x in losses_reduced:
-            if values is None:
-                values = x["values"]
-            else:
-                values += x["values"]
-        assert len(keys) + 1 == values.numel()
-        torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
-
-        loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
-        values = values.tolist()
+        # Average loss across microbatches. The DP+CP reduction already ran
+        # right after backward; this is now a host read of data that is long
+        # since resident, not a blocking collective at step end.
+        assert metric_keys is not None and metric_values is not None
+        keys = metric_keys
+        loss_reduced = packing_metrics.reduce(
+            mpu.get_data_parallel_group(with_context_parallel=True), metric_values.device
+        )
+        values = metric_values.tolist()
         is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
         num_samples_or_tokens = (
             values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
@@ -1973,6 +2029,7 @@ def train(
         mtp_legacy_per_depth = None
         mtp_acceptance = None
         mtp_loss_per_depth: list[float] = []
+        mtp_loss_token_weighted_per_depth: list[float] = []
         if args.enable_mtp_training:
             from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
@@ -2017,6 +2074,23 @@ def train(
                     total_count = float(total.sum())
                     if total_count > 0:
                         mtp_acceptance = float(correct.sum()) / total_count
+            # Token-weighted metric, independent of the microbatch/DP/CP
+            # partition: sum the raw CE and valid-token counts over every
+            # microbatch and rank, then divide once. `train/mtp_loss` remains
+            # the reference's mean-of-means.
+            loss_sums = tracker.get("_relax_mtp_loss_sum")
+            token_counts = tracker.get("_relax_mtp_token_count")
+            if loss_sums is not None and token_counts is not None:
+                packed = torch.cat((loss_sums, token_counts))
+                for group_key in ("reduce_group", "avg_group"):
+                    group = tracker.get(group_key)
+                    if group is not None:
+                        torch.distributed.all_reduce(packed, group=group)
+                loss_sums, token_counts = packed.chunk(2)
+                token_weighted = loss_sums / token_counts.clamp(min=1)
+                mtp_loss_token_weighted_per_depth = token_weighted.flatten().tolist()
+                tracker.pop("_relax_mtp_loss_sum", None)
+                tracker.pop("_relax_mtp_token_count", None)
             # "values" is the reduced payload on both old and new mcore;
             # "loss_values" is the compatibility slot used by older helpers.
             mtp_values = tracker.get("values")
@@ -2064,6 +2138,11 @@ def train(
                 if len(report_per_depth) > 1:
                     for _i, _v in enumerate(report_per_depth, start=1):
                         log_dict[f"train/{role_tag}mtp_{_i}_loss"] = _v
+            if args.enable_mtp_training and mtp_loss_token_weighted_per_depth:
+                log_dict[f"train/{role_tag}mtp_loss_token_weighted"] = sum(mtp_loss_token_weighted_per_depth)
+                if len(mtp_loss_token_weighted_per_depth) > 1:
+                    for _i, _v in enumerate(mtp_loss_token_weighted_per_depth, start=1):
+                        log_dict[f"train/{role_tag}mtp_{_i}_loss_token_weighted"] = _v
             if mtp_raw_ce is not None:
                 log_dict[f"train/{role_tag}mtp_raw_ce"] = mtp_raw_ce
             if mtp_acceptance is not None:
