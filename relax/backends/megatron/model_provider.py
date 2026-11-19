@@ -67,11 +67,18 @@ def configure_gdn_a_log_fp32(model: torch.nn.Module) -> None:
         # MCore and MindSpeed-Bridge both expose A_log on their GDN layers.
         if not any(cls.__name__ == "GatedDeltaNet" for cls in type(module).__mro__):
             continue
-        from megatron.core.transformer.module import mark_keep_in_fp32
+        try:
+            from megatron.core.transformer.module import mark_keep_in_fp32
+        except ImportError:
+            # core_v0.18.0 has no keep-in-fp32 marker; the fp32 data copy is
+            # still useful and the marker is only an optimization for the
+            # mixed-precision wrapper.
+            mark_keep_in_fp32 = None
 
         # Preserve Parameter identity and TP metadata before mixed precision wrapping.
         module.A_log.data = module.A_log.data.float()
-        mark_keep_in_fp32(module.A_log)
+        if mark_keep_in_fp32 is not None:
+            mark_keep_in_fp32(module.A_log)
 
 
 def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
