@@ -594,8 +594,6 @@ class BridgeConverter:
         The Bridge mapping owns the TP all-reduce for each shard. All TP ranks
         must consume this iterator in the same order.
         """
-        from megatron.bridge.models.qwen.qwen4_exp_bridge import PLENGramEmbeddingMapping
-
         self.init_tasks()
         global_name, task = self._lookup_task(_normalize_global_name(name))
         if task is None:
@@ -604,8 +602,15 @@ class BridgeConverter:
             global_name, mapping = self._lookup_mapping(global_name)
         else:
             mapping = task.mapping
-        if not isinstance(mapping, PLENGramEmbeddingMapping):
-            raise ValueError(f"No Qwen4Exp PLE shard mapping for {global_name}")
+        # Qwen4Exp lives in MindSpeed-Bridge on the NPU stack; do not import the
+        # GPU-side Megatron-Bridge class.  The PLE mapping protocol is small:
+        # ``assemble_shard`` for lazy per-shard assembly and ``num_shards``/``pp_group``
+        # for the geometry and pipeline broadcast.
+        if not (hasattr(mapping, "assemble_shard") and hasattr(mapping, "num_shards") and hasattr(mapping, "pp_group")):
+            raise ValueError(
+                f"No Qwen4Exp PLE shard mapping for {global_name} "
+                f"(mapping={type(mapping).__name__})"
+            )
 
         # Relax has already broadcast this TP-local tensor over PP/EP. Preserve
         # Bridge's TP group so _PLEShardExport.gather_shard can all-reduce rows.

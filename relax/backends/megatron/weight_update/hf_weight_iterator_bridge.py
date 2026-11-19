@@ -62,7 +62,11 @@ _FUSED_PAIR_FRAGMENTS = (
     (".compressor.wkv.", ".compressor.wgate."),
 )
 _PAIR_SENTINEL = "\x00"
-_QWEN4EXP_PLE_TABLE_SUFFIX = ".per_layer_embedding.ple_embedding.ngram_embedding.weight"
+_QWEN4EXP_PLE_TABLE_SUFFIX = (
+    ".per_layer_embedding.ple_embedding.ngram_embedding.weight",
+    ".ple.ple_embedding.weight",
+)
+
 
 
 def _fused_pair_key(name: str) -> str | None:
