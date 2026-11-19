@@ -589,6 +589,16 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
+    # MegaMoE is an opt-in MSB feature.  Apply its model hook here as well as
+    # through the feature manager: the target Relax imports get_model before
+    # the AutoBridge lazy feature activation runs, so the feature patch may
+    # otherwise be attached to the module attribute after this local binding.
+    try:
+        from mindspeed_bridge.features.megatron.common.megamoe import maybe_install_megamoe
+
+        maybe_install_megamoe(model)
+    except ImportError:
+        pass
     finalize_lora_models([_unwrap_module(chunk) for chunk in model], args)
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
