@@ -2,6 +2,7 @@
 
 import asyncio
 import gzip
+import inspect
 import os
 import shutil
 import tempfile
@@ -135,7 +136,15 @@ def _get_train_trace_dir(args):
 def _create_train_trace_handler(trace_dir: str, worker_name: str) -> Callable[[torch.profiler.profile], None]:
     compression = Envs.RELAX_PROFILE_GZIP_LEVEL
     if compression is None:
-        return torch.profiler.tensorboard_trace_handler(trace_dir, worker_name=worker_name, use_gzip=True)
+        handler = torch.profiler.tensorboard_trace_handler
+        try:
+            params = inspect.signature(handler).parameters
+        except (TypeError, ValueError):
+            params = {}
+        kwargs = {"worker_name": worker_name}
+        if not params or "use_gzip" in params:
+            kwargs["use_gzip"] = True
+        return handler(trace_dir, **kwargs)
     level = int(compression)
     if not 0 <= level <= 9:
         raise ValueError("RELAX_PROFILE_GZIP_LEVEL must be an integer from 0 through 9")

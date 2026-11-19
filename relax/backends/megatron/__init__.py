@@ -7,7 +7,21 @@ from relax.utils.env import Envs
 
 
 try:
-    import mindspeed.megatron_adaptor  # noqa
+    # torch_npu aliases torch.cuda onto the NPU, so after the Megatron adaptor
+    # is imported triton 3.6 reports both its CUDA and Ascend drivers as active
+    # and `driver.active` raises instead of picking one. Pin Ascend first --
+    # fla caches the backend it sees at import time, and the adaptor imports it.
+    import torch_npu  # noqa: F401
+    import triton
+    from triton.backends.ascend.driver import NPUDriver
+
+    triton.runtime.driver.set_active(NPUDriver())
+except ImportError:
+    pass
+
+try:
+    # Installs the NPU stand-ins; must run before a config Namespace is unpickled.
+    import megatron_adaptor  # noqa
 except ImportError:
     pass
 
