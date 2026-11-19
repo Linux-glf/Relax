@@ -657,6 +657,30 @@ def _checkpoint_load_state(load_path: str, args: Namespace, load_optimizer: bool
     }
 
 
+def _refill_frozen_ple_tables(model) -> None:
+    """Refill a frozen PLE table that the distributed checkpoint does not carry.
+
+    A Megatron resume loads the DCP and skips the HF conversion, which is the
+    only other path that fills the qwen4_exp n-gram table. With
+    ``QWEN4_EXP_PLE_TABLE_IN_DCP=0`` the table is not in the DCP; a frozen table
+    is constant, so refilling it from its own ``ple_table_dir`` restores the
+    state the run had. A trainable table is left unloaded on purpose: its first
+    forward raises instead of silently training against the original HF table.
+    """
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        for module in chunk.modules():
+            load_table = getattr(module, "load_table", None)
+            if load_table is None or getattr(module, "_table_loaded", True):
+                continue
+            weight = getattr(module, "weight", None)
+            table_path = getattr(module, "table_path", None)
+            if weight is None or table_path is None or weight.requires_grad:
+                continue
+            logger.info(f"Resuming: refilling the frozen PLE table from {table_path}")
+            load_table()
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
@@ -732,13 +756,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     else nullcontext()
                 )
                 with step_context:
-                    return _load_checkpoint_megatron(
+                    result = _load_checkpoint_megatron(
                         ddp_model=ddp_model,
                         optimizer=optimizer,
                         opt_param_scheduler=opt_param_scheduler,
                         checkpointing_context=checkpointing_context,
                         skip_load_to_model_and_opt=skip_load_to_model_and_opt,
                     )
+                    if not skip_load_to_model_and_opt:
+                        _refill_frozen_ple_tables(ddp_model)
+                    return result
 
             _validate_lora_checkpoint_metadata(args, ddp_model, lora_metadata)
             if not skip_load_to_model_and_opt:
@@ -754,7 +781,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                 _preserve_hybrid_optimizer_steps_on_load(),
                 _validate_lora_model_state_load(ddp_model),
             ):
-                return _load_checkpoint_megatron(
+                result = _load_checkpoint_megatron(
                     ddp_model=ddp_model,
                     optimizer=optimizer,
                     opt_param_scheduler=opt_param_scheduler,
@@ -762,6 +789,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     skip_load_to_model_and_opt=skip_load_to_model_and_opt,
                     strict=True,
                 )
+                if not skip_load_to_model_and_opt:
+                    _refill_frozen_ple_tables(ddp_model)
+                return result
         except AssertionError as e:
             if "OptimizerParamScheduler" in str(e):
                 raise RuntimeError(_format_opt_param_scheduler_error(args, e)) from e
