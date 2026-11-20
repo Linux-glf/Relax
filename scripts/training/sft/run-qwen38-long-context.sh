@@ -249,7 +249,7 @@ SFT_ARGS=(
     --sft-train-data-prefetch
     --freeze-vision-model
     --freeze-vision-projection
-    --freeze-params-name-list '(^|\.)per_layer_embedding\.|self_attention\.indexer\.'
+    --freeze-params-name-list '(^|\.)per_layer_embedding\.|self_attention\.indexer\.' ple.ple_embedding.weight
     --enable-mtp-training
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1

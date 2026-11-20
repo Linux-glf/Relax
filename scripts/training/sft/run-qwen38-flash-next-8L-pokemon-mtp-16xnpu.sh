@@ -115,23 +115,18 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen38-flash-next-8L.sh"
 
-# The n-gram table's switches (`ple.py`: QWEN4_EXP_PLE_TABLE_MODE, the DCP gate
-# QWEN4_EXP_PLE_TABLE_IN_DCP for the row-routed form, and the legacy offload switch
-# QWEN4_EXP_PLE_CPU_OFFLOAD that has to agree with it) are read in the worker that
-# builds the model, and the Ray workers do not inherit this shell. The MTP input
-# mask switch (QWEN4_EXP_MTP_INPUT_MASK) is read there too: off by default, which
+# The PLE table is always the device-ep form; its DCP gate
+# QWEN4_EXP_PLE_TABLE_IN_DCP and the MTP input-mask switch
+# QWEN4_EXP_MTP_INPUT_MASK are read in the worker that builds the model, and the
+# Ray workers do not inherit this shell. The MTP mask is off by default, which
 # keeps mtp_input_mask=None exactly as the GPU stack runs it; set it to 1 only to
 # re-enable the NPU-only image/video-placeholder exclusion. They have to travel in
-# RUNTIME_ENV_JSON's env_vars -- the same channel the 48L trainable recipe uses for
-# QWEN4_EXP_PLE_CPU_OFFLOAD. The entrypoint above has already built that JSON; this
-# merges into it rather than replacing it, so PYTHONPATH and the rest survive. With
-# none of the variables set nothing is rewritten; the bridge's mask default is off.
-if [ -n "${QWEN4_EXP_PLE_TABLE_MODE:-}" ] || [ -n "${QWEN4_EXP_PLE_TABLE_IN_DCP:-}" ] || [ -n "${QWEN4_EXP_PLE_CPU_OFFLOAD:-}" ] || [ -n "${QWEN4_EXP_MTP_INPUT_MASK:-}" ]; then
+# RUNTIME_ENV_JSON's env_vars. The entrypoint above has already built that JSON;
+# this merges into it rather than replacing it, so PYTHONPATH and the rest survive.
+if [ -n "${QWEN4_EXP_PLE_TABLE_IN_DCP:-}" ] || [ -n "${QWEN4_EXP_MTP_INPUT_MASK:-}" ]; then
    RUNTIME_ENV_JSON="$(
       RELAX_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}" \
-      RELAX_INJECT_TABLE_MODE="${QWEN4_EXP_PLE_TABLE_MODE:-}" \
       RELAX_INJECT_TABLE_IN_DCP="${QWEN4_EXP_PLE_TABLE_IN_DCP:-}" \
-      RELAX_INJECT_OFFLOAD="${QWEN4_EXP_PLE_CPU_OFFLOAD:-}" \
       RELAX_INJECT_MTP_MASK="${QWEN4_EXP_MTP_INPUT_MASK:-}" \
       python3 - <<'PY'
 import json
@@ -140,15 +135,9 @@ import os
 raw = os.environ.get("RELAX_RUNTIME_ENV_JSON", "").strip()
 config = json.loads(raw) if raw else {}
 env_vars = config.get("env_vars", {})
-table_mode = os.environ["RELAX_INJECT_TABLE_MODE"]
-if table_mode:
-    env_vars["QWEN4_EXP_PLE_TABLE_MODE"] = table_mode
 table_in_dcp = os.environ["RELAX_INJECT_TABLE_IN_DCP"]
 if table_in_dcp:
     env_vars["QWEN4_EXP_PLE_TABLE_IN_DCP"] = table_in_dcp
-offload = os.environ["RELAX_INJECT_OFFLOAD"]
-if offload:
-    env_vars["QWEN4_EXP_PLE_CPU_OFFLOAD"] = offload
 mtp_mask = os.environ["RELAX_INJECT_MTP_MASK"]
 if mtp_mask:
     env_vars["QWEN4_EXP_MTP_INPUT_MASK"] = mtp_mask
@@ -522,10 +511,12 @@ fi
 #   Note the tower is built only on the stage that owns the embedding, so under
 #   PP=2 it exists on PP rank 0 alone.
 #
-#   `per_layer_embedding` does not exist on this path at all: the PLE table is
-#   host-mmap'd and explicitly "nothing here is a nn.Parameter"
-#   (modelling_qwen4_exp/ple.py:18), so it is absent from the optimizer and the
-#   checkpoint. The reference freezes it on the GPU tree, where it is a module.
+#   `per_layer_embedding` does not exist on this path at all.  The PLE table is
+#   a device `nn.Parameter` row-sharded over the expert-parallel group
+#   (modelling_qwen4_exp/ple.py), and this recipe freezes it by name through
+#   `--freeze-params-name-list ple.ple_embedding.weight`, matching the reference's
+#   `per_layer_embedding` freeze; the six small PLE projections stay separate
+#   unless FREEZE_PLE=1.
 #
 # What remains aligned is the indexer, whose attribute path is identical
 # (`self_attention.indexer`, modelling_qwen4_exp/layer.py:119).
@@ -542,15 +533,12 @@ fi
 # only model.visual.* (333 tensors) and `indexer` only *.self_attn.indexer.*
 # (9 tensors), zero hits outside those components.
 #
-# The reference GPU script also freezes `per_layer_embedding`. On the GPU tree
-# that name is the whole module, so it takes the six weights *around* the n-gram
-# table with it -- `key_proj`, `value_proj`, the three grouped norms and the
-# dilated depthwise conv. Those six are nn.Parameters here too (the bridge maps
-# exactly them, qwen4_exp_bridge.py:315-325) and they currently train; only the
-# 95 GiB table is really unfreezable, being host-mmap'd and never a Parameter
-# (models/qwen4_exp/modelling_qwen4_exp/ple.py:18). FREEZE_PLE=1 completes the
-# reference's freeze set; without it the baseline keeps the set this script has
-# always had.
+# The PLE table is a device parameter in this stack.  The default recipe
+# freezes it through the normal `--freeze-params-name-list` mechanism; remove
+# `ple.ple_embedding.weight` from that list to train the table.  The six small
+# weights around it (`key_proj`, `value_proj`, the three grouped norms and the
+# dilated depthwise conv) stay trainable unless FREEZE_PLE=1, which completes
+# the reference GPU script's `per_layer_embedding` freeze set.
 #
 # Spelled as the six full weight names rather than a bare `ple` for two reasons:
 # `ray job submit` space-joins the argv into `/bin/sh -c` (see above), so a
@@ -559,9 +547,10 @@ fi
 # metacharacters, so the full names come through untouched.
 # The QSA indexer is trained by its auxiliary block-KL loss (enabled below with
 # RELAX_QSA_INDEXER_LOSS_COEFF); leaving `indexer` in the freeze list would zero
-# that gradient path, so only the vision tower stays frozen here.
+# that gradient path, so only the vision tower and the PLE table are frozen here
+# by default.
 TRAINABLE_ARGS=(
-   --freeze-params-name-list visual
+   --freeze-params-name-list visual ple.ple_embedding.weight
 )
 if [ "${FREEZE_PLE:-0}" = "1" ]; then
    TRAINABLE_ARGS+=(
@@ -569,18 +558,6 @@ if [ "${FREEZE_PLE:-0}" = "1" ]; then
       ple.norm_key.weight ple.norm_query.weight ple.norm_conv.weight
       ple.conv1d.weight
    )
-fi
-# The reference GPU script freezes `per_layer_embedding`, i.e. the whole PLE
-# module *including* the table.  On this tree the table is only a Parameter in
-# the `device-ep` form (qwen4_exp_bridge.py:857 maps it to
-# `decoder.layers.*.ple.ple_embedding.weight`); in every other mode it is a
-# host-mmap'd buffer and cannot be frozen.  Freezing it removes its fp32
-# master and Adam m/v from the CPU-offload optimizer -- 3.2B parameters per
-# rank at EP16, i.e. 38.4 GB/rank of anonymous host state plus the matching
-# pinned staging -- which is what makes a 16L checkpoint fit the host at all
-# (the 8L shard fits with it trainable; 16L does not).
-if [ "${FREEZE_TABLE:-0}" = "1" ]; then
-   TRAINABLE_ARGS+=(ple.ple_embedding.weight)
 fi
 
 WANDB_ARGS=(

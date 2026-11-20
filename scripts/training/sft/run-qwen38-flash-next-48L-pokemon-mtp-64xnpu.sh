@@ -4,8 +4,9 @@
 #
 # Qwen3.8-Flash-Next (qwen4_exp) FULL 48-layer VL MTP SFT on
 # pokemon-gpt4o-captions, 64 dies = 4 nodes x 16 NPUs, ray-submit launch.
-# **The n-gram table is the released one and stays frozen**: it is the model's
-# PLE weight, host-pinned, never a parameter and never in the optimizer.
+# **The n-gram table is the released one and stays frozen by default**: it is the
+# model's PLE weight, a device parameter row-sharded over the expert-parallel group,
+# and is excluded from training by --freeze-params-name-list (the `ple.` pattern).
 #
 # This is the NPU counterpart of the reference 64xH800 full-48L script. The
 # numerically relevant knobs are aligned to it -- GBS 32, 32K packed, mbs 1,
@@ -489,14 +490,13 @@ fi
 #   (modelling_qwen4_exp/vl_model.py:114-123) and is frozen by the regex below.
 #   At PP=1 the tower (0.449e9 parameters) is built on every rank.
 #
-#   `per_layer_embedding` does not exist on this path at all: the PLE table is
-#   host-pinned and never a nn.Parameter (modelling_qwen4_exp/ple.py), so it is
-#   absent from the optimizer and from the DCP checkpoint. That is exactly what
-#   this script wants -- the released 95.37 GiB table is not trainable at any
-#   legal TP: at TP=8 its row shard is 12.8 GB of parameters and 4 bytes per
-#   element of grad on top. The six PLE projections around the table are named
-#   `ple.*` and are frozen by the `ple.` pattern, which matches the reference's
-#   `per_layer_embedding` freeze.
+#   `per_layer_embedding` does not exist on this path at all.  The PLE table is
+#   a device parameter row-sharded over the expert-parallel group
+#   (modelling_qwen4_exp/ple.py); the `ple.` pattern freezes both the table and
+#   the six small PLE projections, matching the reference's
+#   `per_layer_embedding` freeze.  This keeps the released 95.37 GiB table out
+#   of the optimizer: at EP64 its row shard is 0.8e9 elements (1.6 GB bf16),
+#   and no fp32 master/Adam state is allocated for it while frozen.
 #
 # `--freeze-params-name-list` is nargs="*" (relax/utils/arguments.py:553-571), so it
 # takes a *list* of independent re.search patterns. That is what lets this script
