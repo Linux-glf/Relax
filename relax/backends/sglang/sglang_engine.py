@@ -20,8 +20,15 @@ import requests
 import sglang_router
 from packaging.version import parse
 from requests.exceptions import ConnectTimeout
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
+
+
+# Importing the NPU stack can initialize multiprocessing with a forkserver
+# context. SGLang's scheduler/tokenizer children require spawn semantics, so
+# pin the method before sglang imports torch_npu in this process.
+multiprocessing.set_start_method("spawn", force=True)
+
+from sglang.srt.server_args import ServerArgs  # noqa: E402
+from sglang.srt.utils import kill_process_tree  # noqa: E402
 
 
 try:
@@ -31,23 +38,23 @@ except ImportError:
     # imports working, but fail closed if S3 streaming is requested.
     _SGLANG_LOAD_FORMAT_CHOICES = None
 
-from relax.distributed.checkpoint_service.client.engine import create_client
-from relax.distributed.ray.ray_actor import RayActor
-from relax.utils import device as device_utils
-from relax.utils import scale_utils
-from relax.utils.async_utils import run
-from relax.utils.env import Envs
-from relax.utils.http_utils import get_host_info, router_worker_base_url
-from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import convert_megatron_to_sglang_target_modules, is_lora_enabled
-from relax.utils.model_source import ModelSource, SGLangLoadPlan
-from relax.utils.s3_model_loader import (
+from relax.distributed.checkpoint_service.client.engine import create_client  # noqa: E402
+from relax.distributed.ray.ray_actor import RayActor  # noqa: E402
+from relax.utils import device as device_utils  # noqa: E402
+from relax.utils import scale_utils  # noqa: E402
+from relax.utils.async_utils import run  # noqa: E402
+from relax.utils.env import Envs  # noqa: E402
+from relax.utils.http_utils import get_host_info, router_worker_base_url  # noqa: E402
+from relax.utils.logging_utils import get_logger  # noqa: E402
+from relax.utils.megatron_peft_utils import convert_megatron_to_sglang_target_modules, is_lora_enabled  # noqa: E402
+from relax.utils.model_source import ModelSource, SGLangLoadPlan  # noqa: E402
+from relax.utils.s3_model_loader import (  # noqa: E402
     get_s3_model_cached_path,
     is_s3_uri,
     maybe_resolve_s3_model_to_shm,
     resolve_s3_model_metadata_to_shm,
 )
-from relax.utils.scale_utils import PrecheckProbeCategory
+from relax.utils.scale_utils import PrecheckProbeCategory  # noqa: E402
 
 
 logger = get_logger(__name__)
@@ -339,6 +346,10 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
       installs ``_patched_run_scheduler_process``, which applies the
       routing-replay patch unconditionally.
     """
+    # Some NPU stacks set a forkserver context while importing torch_npu.
+    # SGLang's scheduler children rely on spawn semantics; pin the method in
+    # this launcher process before SGLang starts them.
+    multiprocessing.set_start_method("spawn", force=True)
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 

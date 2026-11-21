@@ -14,7 +14,6 @@
 #   docker build -f Dockerfile.npu -t relax:npu-26.2.0-qwen4 .
 #
 # Runtime-only dependencies that are intentionally NOT baked in:
-#   * TransferQueue: the entrypoints expect a source checkout on PYTHONPATH.
 #   * The 3.8-Flash-Next checkpoints / PLE tables: mounted under MODEL_DIR.
 
 ARG HTTP_PROXY
@@ -132,6 +131,14 @@ RUN pip install triton==3.6.0 && \
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
     pip_install tensordict==0.10.0 pyvers==0.1.0 --no-deps
 
+# TransferQueue is installed from a pinned source checkout because the
+# entrypoints import it before any training job starts.
+RUN git clone https://github.com/redai-studio/TransferQueue.git /root/TransferQueue && \
+    cd /root/TransferQueue && \
+    git checkout 9784ad0d8a5f0db93ff8326379ab2a6d06e640a0 && \
+    pip install /root/TransferQueue --no-deps --no-build-isolation && \
+    cd /root && \
+    rm -rf /root/TransferQueue
 # Install the two native operator packages produced above (official QUICKSTART
 # install: the run package installs into ${ASCEND_HOME_PATH}/opp/vendors).
 COPY --from=qwen38_qsa_ops /root/ops-transformer/build_out/cann-ops-transformer-qwen38_qsa_linux-aarch64.run /tmp/
@@ -169,7 +176,7 @@ ARG MINDSPEED_COMMIT=d0d5955ba445e8dc3ed8b6aa4a76c053364fba7a
 ARG MINDSPEED_OPS_COMMIT=b1ef3adcfc2f0a2932d6b2eb831f275fe1daacfb
 ARG MINDSPEED_BRIDGE_COMMIT=c2a6ba524b6d201310da58ee3f3c4014c0399b7b
 ARG HYPER_MULTICORE_REPO=https://github.com/zongshuai1/hyper-multicore.git
-ARG HYPER_MULTICORE_COMMIT=623627515705c07d443997012d0979bbbe6e49bb
+ARG HYPER_MULTICORE_COMMIT=530be72697c1cf9a3d12d6cccc1da9da32a45963
 
 # Install the MindSpeed/Megatron stack.
 RUN git clone https://gitcode.com/Ascend/MegatronAdaptor.git /root/MegatronAdaptor && \
@@ -213,8 +220,9 @@ RUN cd /root/Megatron-Bridge && \
     git add . && git commit -m "adapt for Relax"
 
 # hyper-multicore: native MegaMoE kernels behind the opt-in RELAX_MEGA_MOE path.
-# Cloned from the pinned fork and checked out at commit 6236275. The ready-init
-# patch serializes the device-side event reset with the SHMEM host barrier.
+# Cloned from the pinned fork's `moonep` branch (PR #7 head) and checked out at
+# commit 530be72. The ready-init patch serializes the device-side event reset
+# with the SHMEM host barrier.
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh && \
@@ -241,13 +249,11 @@ RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org
     echo "torch==2.10.0" > /tmp/constraint.txt && \
     pip install -e "python[srt_npu]" --constraint /tmp/constraint.txt && \
     git add . && git commit -m "install info" && \
-    git fetch && \
-    git cherry-pick ece02ffc9cc32e94382d4f1b553b2c755f83f722 && \
     git am /root/Relax/docker/npu_patch/sglang-npu.patch
 
 # The NPU editable install resolves ``sglang.srt`` through the path finder; a
 # missing package __init__ makes it raise KeyError('sglang') on the first
-# `import sglang.srt.*`. Upstream v0.5.15 does not ship this file.
+# `import sglang.srt.*`. Upstream SGLang does not ship this file.
 RUN touch /root/sglang/python/sglang/srt/__init__.py
 
 # Install SGLang NPU kernels.

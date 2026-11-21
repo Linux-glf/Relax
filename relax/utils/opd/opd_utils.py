@@ -117,7 +117,16 @@ def _mirror_teacher_sglang_server_args(parser: Any) -> None:
                 final_kwargs["dest"] = f"{TEACHER_SGLANG_PREFIX}{original_dest}"
         final_kwargs["default"] = argparse.SUPPRESS
 
-        old_add_argument(*final_name_or_flags, **final_kwargs)
+        try:
+            old_add_argument(*final_name_or_flags, **final_kwargs)
+        except TypeError as exc:
+            # SGLang's deprecated-action classes set their own
+            # default=SUPPRESS inside __init__; forwarding another default
+            # raises "multiple values for keyword argument 'default'".
+            if "multiple values for keyword argument 'default'" not in str(exc):
+                raise
+            final_kwargs.pop("default", None)
+            old_add_argument(*final_name_or_flags, **final_kwargs)
 
     parser.add_argument = new_add_argument_wrapper
     try:

@@ -103,6 +103,8 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         self._cache_window_by_key: dict[tuple[str, str, int, int], int] = {}
         self._window_buckets: dict[tuple[str, str, int], dict[int, list[int]]] = {}
         self._window_resolved_lengths: dict[tuple[str, str, int], dict[int, int]] = {}
+        self._dispatched: dict[tuple[str, str], dict[int, int]] = {}
+        self._dummy_rounds: dict[tuple[str, str], set[tuple[int, int]]] = {}
 
     def _cached_result(
         self,
