@@ -8,7 +8,7 @@
 #   Megatron-LM core_v0.18.0 · Megatron-Bridge v0.5.0
 #   MegatronAdaptor 26.2.0_core_r0.18.0 · TransformerEngineNPU 26.2.0_release_v2.17
 #   MindSpeed 26.2.0_core_r0.18.0 · MindSpeed-Ops 26.2.0
-#   MindSpeed-Bridge 26.2.0_v0.5.0 + qwen4_exp_npu branch (Qwen4Exp features)
+#   MindSpeed-Bridge 26.2.0_v0.5.0 + qwen4_exp_lazy branch (Qwen4Exp features)
 #
 # Build from the repository root (the COPY paths are context-relative):
 #   docker build -f Dockerfile.npu -t relax:npu-26.2.0-qwen4 .
@@ -75,35 +75,29 @@ RUN pip config set global.index-url ${PIP_INDEX_URL} && \
 WORKDIR /root
 
 # ---------------------------------------------------------------------------
-# Qwen4Exp custom operators (official ops-transformer QUICKSTART method):
-# build the QSA and mHC operator groups as two separate vendor packages.
+# Build Union QSA and fused HC from one ops-transformer checkout.
 # ---------------------------------------------------------------------------
 ARG OPS_TRANSFORMER_REPO=https://gitcode.com/hw-pbclouds/ops-transformer.git
-ARG OPS_TRANSFORMER_COMMIT=380a837b24b81ff87a5d808cdd438f9c769c0b4a
+ARG OPS_TRANSFORMER_COMMIT=9024c3735c593f9fae37f926c2cb4356ee4f07bb
 
-FROM base AS qwen38_qsa_ops
+FROM base AS qwen38_train_ops
 ARG OPS_TRANSFORMER_REPO
 ARG OPS_TRANSFORMER_COMMIT
+RUN python3 -m pip install --no-cache-dir build setuptools==80.10.2 wheel
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    git clone --depth=1 --branch feature/qwen4_exp ${OPS_TRANSFORMER_REPO} /root/ops-transformer && \
-    cd /root/ops-transformer && git checkout ${OPS_TRANSFORMER_COMMIT} && \
-    bash build.sh --pkg --soc=ascend910_93 --vendor_name=qwen38_qsa \
-        --ops=qsa_group_plan,qsa_grouped_attention_metadata,qsa_grouped_attention,qsa_grouped_attention_grad -j32 && \
-    test -f /root/ops-transformer/build_out/cann-ops-transformer-qwen38_qsa_linux-aarch64.run
-
-FROM base AS qwen38_mhc_ops
-ARG OPS_TRANSFORMER_REPO
-ARG OPS_TRANSFORMER_COMMIT
-RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    git clone --depth=1 --branch feature/qwen4_exp ${OPS_TRANSFORMER_REPO} /root/ops-transformer && \
-    cd /root/ops-transformer && git checkout ${OPS_TRANSFORMER_COMMIT} && \
-    bash build.sh --pkg --soc=ascend910_93 --vendor_name=mhc_tgr \
-        --ops=text_gated_residual,text_gated_residual_grad -j32 && \
-    test -f /root/ops-transformer/build_out/cann-ops-transformer-mhc_tgr_linux-aarch64.run
+    git init /root/ops-transformer && \
+    cd /root/ops-transformer && \
+    git fetch --depth=1 "${OPS_TRANSFORMER_REPO}" "${OPS_TRANSFORMER_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    qwen38_ops=qsa_group_plan,qsa_grouped_attention,qsa_grouped_attention_grad,text_gated_residual,text_gated_residual_grad && \
+    bash build.sh --pkg --soc=ascend910_93 --vendor_name=qwen38_qsa_hc \
+        --ops="${qwen38_ops},qsa_grouped_attention_metadata" -j32 && \
+    mkdir -p /root/qwen38-ops-dist && \
+    install -m 755 build_out/cann-ops-transformer-qwen38_qsa_hc_linux-*.run /root/qwen38-ops-dist/qwen38-qsa-hc.run && \
+    bash build.sh --torch_extension --vendor_name=qwen38_qsa_hc --ops="${qwen38_ops}" && \
+    cp build_out/cann_ops_transformer_qwen38_qsa_hc-*.whl /root/qwen38-ops-dist/
 
 FROM base as train
-ARG OPS_TRANSFORMER_REPO
-ARG OPS_TRANSFORMER_COMMIT
 
 # Ascend chip target, defaulting to 910C.
 ENV SOC_VERSION=ascend910_9391
@@ -139,44 +133,29 @@ RUN git clone https://github.com/redai-studio/TransferQueue.git /root/TransferQu
     pip install /root/TransferQueue --no-deps --no-build-isolation && \
     cd /root && \
     rm -rf /root/TransferQueue
-# Install the two native operator packages produced above (official QUICKSTART
-# install: the run package installs into ${ASCEND_HOME_PATH}/opp/vendors).
-COPY --from=qwen38_qsa_ops /root/ops-transformer/build_out/cann-ops-transformer-qwen38_qsa_linux-aarch64.run /tmp/
-COPY --from=qwen38_mhc_ops /root/ops-transformer/build_out/cann-ops-transformer-mhc_tgr_linux-aarch64.run /tmp/
+# Install the shared native vendor package and its cann_ops_transformer.ops bindings.
+COPY --from=qwen38_train_ops /root/qwen38-ops-dist/ /tmp/qwen38-ops-dist/
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    /tmp/cann-ops-transformer-qwen38_qsa_linux-aarch64.run --quiet --install-for-all && \
-    /tmp/cann-ops-transformer-mhc_tgr_linux-aarch64.run --quiet --install-for-all && \
-    rm -f /tmp/cann-ops-transformer-*.run
-ENV ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/cann-9.2.0/opp/vendors/qwen38_qsa_transformer:/usr/local/Ascend/cann-9.2.0/opp/vendors/mhc_tgr_transformer:${ASCEND_CUSTOM_OPP_PATH}
-ENV LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.2.0/opp/vendors/qwen38_qsa_transformer/op_api/lib:/usr/local/Ascend/cann-9.2.0/opp/vendors/mhc_tgr_transformer/op_api/lib:${LD_LIBRARY_PATH}
-ENV QWEN38_FUSED_TRAIN_OPP_PATH=/usr/local/Ascend/cann-9.2.0/opp/vendors/qwen38_qsa_transformer
-
-# Python bindings for the two operator families. Build a wheel only; the native
-# packages are the two separately built .run packages above.
-RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    git clone --depth=1 --branch feature/qwen4_exp ${OPS_TRANSFORMER_REPO} /root/ops-transformer-wheel && \
-    cd /root/ops-transformer-wheel && git checkout ${OPS_TRANSFORMER_COMMIT} && \
-    cd torch_extension/qwen38_fused_train_ops && \
-    cp ../cann_ops_transformer/common/aclnn_common.h csrc/ && \
-    mkdir -p qwen38_fused_train_ops/_native && \
-    python setup.py bdist_wheel --dist-dir /tmp/qwen38-wheel && \
-    cd /root && rm -rf /root/ops-transformer-wheel && \
-    pip install --no-index --no-deps /tmp/qwen38-wheel/qwen38_fused_train_ops-*.whl && \
-    rm -rf /tmp/qwen38-wheel
+    /tmp/qwen38-ops-dist/qwen38-qsa-hc.run --quiet --install-for-all && \
+    pip install --no-index --no-deps /tmp/qwen38-ops-dist/cann_ops_transformer_qwen38_qsa_hc-*.whl && \
+    rm -rf /tmp/qwen38-ops-dist
+ENV QWEN38_FUSED_TRAIN_OPP_PATH=/usr/local/Ascend/cann-9.2.0/opp/vendors/qwen38_qsa_hc_transformer
+ENV ASCEND_CUSTOM_OPP_PATH=${QWEN38_FUSED_TRAIN_OPP_PATH}:${ASCEND_CUSTOM_OPP_PATH}
+ENV LD_LIBRARY_PATH=${QWEN38_FUSED_TRAIN_OPP_PATH}/op_api/lib:${LD_LIBRARY_PATH}
 
 # Upstream commits the patch bundle applies on top of. Keep these in sync with
 # the patch files under docker/npu_patch; every patch is checked with
 # `git apply --check` against these commits. MindSpeed-Bridge carries the
-# Qwen4Exp feature series on its qwen4_exp_npu branch and is pinned directly.
+# Qwen4Exp feature series on its qwen4_exp_lazy branch and is pinned directly.
 ARG MEGATRON_BRIDGE_COMMIT=fcbb6031103d0ca845c1a54d4fee55ecfcca17b6
 ARG MEGATRON_COMMIT=ba7b5ebce12af60627a80985792a1449ce45f46c
 ARG MEGATRON_ADAPTOR_COMMIT=011b80f9a14c935d7a6d85b710f8b577f4704608
 ARG TRANSFORMER_ENGINE_NPU_COMMIT=e4139353c7f698c780d08f65077b6fa6c51a8a49
 ARG MINDSPEED_COMMIT=d0d5955ba445e8dc3ed8b6aa4a76c053364fba7a
 ARG MINDSPEED_OPS_COMMIT=b1ef3adcfc2f0a2932d6b2eb831f275fe1daacfb
-ARG MINDSPEED_BRIDGE_COMMIT=c2a6ba524b6d201310da58ee3f3c4014c0399b7b
-ARG HYPER_MULTICORE_REPO=https://github.com/zongshuai1/hyper-multicore.git
-ARG HYPER_MULTICORE_COMMIT=530be72697c1cf9a3d12d6cccc1da9da32a45963
+ARG MINDSPEED_BRIDGE_COMMIT=1da5bf7c8d69ca8d09cf97c212da431a6ce47a2c
+ARG HYPER_MULTICORE_REPO=https://github.com/mindspore-ai/hyper-multicore.git
+ARG HYPER_MULTICORE_COMMIT=1065f23ed66929b45baa8c2de3168cd825862b35
 
 # Install the MindSpeed/Megatron stack.
 RUN git clone https://gitcode.com/Ascend/MegatronAdaptor.git /root/MegatronAdaptor && \
@@ -220,9 +199,7 @@ RUN cd /root/Megatron-Bridge && \
     git add . && git commit -m "adapt for Relax"
 
 # hyper-multicore: native MegaMoE kernels behind the opt-in RELAX_MEGA_MOE path.
-# Cloned from the pinned fork's `moonep` branch (PR #7 head) and checked out at
-# commit 530be72. The ready-init patch serializes the device-side event reset
-# with the SHMEM host barrier.
+# The ready-init patch orders the device-side event reset before the SHMEM host barrier.
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh && \
