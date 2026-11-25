@@ -76,6 +76,7 @@ WORKDIR /root
 
 # ---------------------------------------------------------------------------
 # Build Union QSA and fused HC from one ops-transformer checkout.
+# Keep documentation images as Git LFS pointers during checkout.
 # ---------------------------------------------------------------------------
 FROM base AS qwen38_train_ops
 ARG OPS_TRANSFORMER_REPO=https://gitcode.com/hw-pbclouds/ops-transformer.git
@@ -84,10 +85,9 @@ RUN python3 -m pip install --no-cache-dir build setuptools==80.10.2 wheel
 RUN : "${OPS_TRANSFORMER_REPO:?OPS_TRANSFORMER_REPO must not be empty}" \
       "${OPS_TRANSFORMER_COMMIT:?OPS_TRANSFORMER_COMMIT must not be empty}" && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    git init /root/ops-transformer && \
+    git clone --no-checkout "${OPS_TRANSFORMER_REPO}" /root/ops-transformer && \
     cd /root/ops-transformer && \
-    git fetch --depth=1 "${OPS_TRANSFORMER_REPO}" "${OPS_TRANSFORMER_COMMIT}" && \
-    git checkout --detach FETCH_HEAD && \
+    GIT_LFS_SKIP_SMUDGE=1 git checkout --detach "${OPS_TRANSFORMER_COMMIT}" && \
     qwen38_ops=qsa_group_plan,qsa_grouped_attention,qsa_grouped_attention_grad,text_gated_residual,text_gated_residual_grad && \
     bash build.sh --pkg --soc=ascend910_93 --vendor_name=qwen38_qsa_hc \
         --ops="${qwen38_ops},qsa_grouped_attention_metadata" -j32 && \
@@ -199,13 +199,14 @@ RUN cd /root/Megatron-Bridge && \
 
 # hyper-multicore: native MegaMoE kernels behind the opt-in RELAX_MEGA_MOE path.
 # The ready-init patch orders the device-side event reset before the SHMEM host barrier.
+# Keep Git LFS pointers in the locked native dependency archives.
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh && \
     git clone ${HYPER_MULTICORE_REPO} /root/hyper-multicore && \
     cd /root/hyper-multicore && git checkout ${HYPER_MULTICORE_COMMIT} && \
     patch -p1 < /root/Relax/docker/npu_patch/hyper-multicore-ready-init.patch && \
-    bash build.sh --soc-list ascend910_93 --jobs 32 && \
+    GIT_LFS_SKIP_SMUDGE=1 bash build.sh --soc-list ascend910_93 --jobs 32 && \
     pip install --no-deps --force-reinstall dist/hyper_multicore-*.whl && \
     cd /root && rm -rf /root/hyper-multicore && \
     ln -sfn "$(python3 -c 'import hyper_multicore, pathlib; print(pathlib.Path(hyper_multicore.__file__).resolve().parent)')" /usr/local/hyper-multicore
