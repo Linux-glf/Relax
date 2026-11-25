@@ -77,14 +77,13 @@ WORKDIR /root
 # ---------------------------------------------------------------------------
 # Build Union QSA and fused HC from one ops-transformer checkout.
 # ---------------------------------------------------------------------------
+FROM base AS qwen38_train_ops
 ARG OPS_TRANSFORMER_REPO=https://gitcode.com/hw-pbclouds/ops-transformer.git
 ARG OPS_TRANSFORMER_COMMIT=9024c3735c593f9fae37f926c2cb4356ee4f07bb
-
-FROM base AS qwen38_train_ops
-ARG OPS_TRANSFORMER_REPO
-ARG OPS_TRANSFORMER_COMMIT
 RUN python3 -m pip install --no-cache-dir build setuptools==80.10.2 wheel
-RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+RUN : "${OPS_TRANSFORMER_REPO:?OPS_TRANSFORMER_REPO must not be empty}" \
+      "${OPS_TRANSFORMER_COMMIT:?OPS_TRANSFORMER_COMMIT must not be empty}" && \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     git init /root/ops-transformer && \
     cd /root/ops-transformer && \
     git fetch --depth=1 "${OPS_TRANSFORMER_REPO}" "${OPS_TRANSFORMER_COMMIT}" && \
