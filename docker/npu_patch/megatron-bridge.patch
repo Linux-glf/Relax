@@ -51,3 +51,23 @@ index 811d0b605..c9cefa195 100644
 +AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
 +AutoModel.register(Qwen3ASRConfig, Qwen3ASRForConditionalGeneration, exist_ok=True)
 +AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor, exist_ok=True)
+diff --git a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+index 70839bafc..14497209a 100644
+--- a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
++++ b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+@@ -120,6 +120,7 @@ class Qwen3VLGPTModel(GPTModel):
+         *,
+         inference_params: Optional[BaseInferenceContext] = None,
+         loss_mask: Optional[Tensor] = None,
++        mtp_kwargs: Optional[dict] = None,
+         # args for deepstack
+         visual_pos_masks: Optional[torch.Tensor] = None,
+         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+@@ -210,6 +211,7 @@ class Qwen3VLGPTModel(GPTModel):
+             runtime_gather_output=runtime_gather_output,
+             extra_block_kwargs=extra_block_kwargs,
+             inference_context=inference_context,
++            mtp_kwargs=mtp_kwargs,
+         )
+
+         if _shadow_embedding:
