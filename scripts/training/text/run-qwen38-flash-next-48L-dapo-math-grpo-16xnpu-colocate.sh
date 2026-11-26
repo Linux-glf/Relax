@@ -244,7 +244,8 @@ MISC_ARGS=(
     --moe-aux-loss-coeff 0.0
     --no-check-for-nan-in-loss-and-grad
 )
-if [ "${FP32_GRADS:-0}" != "0" ]; then
+FP32_GRADS="${FP32_GRADS:-1}"
+if [ "${FP32_GRADS}" != "0" ]; then
     MISC_ARGS+=(
         --accumulate-allreduce-grads-in-fp32
     )
@@ -289,11 +290,32 @@ NPU_COUNT="$(awk -F, '{print NF}' <<< "${ASCEND_RT_VISIBLE_DEVICES}")"
 
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 
+# Set the Qwen3.8 training defaults and apply launch overrides.
+TRAIN_ENV_JSON="$(FP32_GRADS="${FP32_GRADS}" python3 - "${RUNTIME_ENV_JSON:-}" <<'PY'
+import json
+import os
+import sys
+
+job_env = json.loads(sys.argv[1] or "{}").get("env_vars") or {}
+defaults = {
+    "QWEN38_MEGA_MOE": "1",
+    "QWEN38_HC_IMPL": "npu",
+    "QWEN38_QSA_GROUP": "1",
+    "QWEN38_QSA_INDEXER_IMPL": "auto",
+}
+train_env = {name: os.environ.get(name) or job_env.get(name) or value for name, value in defaults.items()}
+if os.environ["FP32_GRADS"] == "0" and train_env["QWEN38_MEGA_MOE"].strip().lower() in {"1", "true", "yes", "on"}:
+    raise SystemExit("FP32_GRADS=0 requires QWEN38_MEGA_MOE=0. Packed MegaMoE needs FP32 main gradients.")
+print(json.dumps(train_env))
+PY
+)"
+
 ray job submit ${RAY_NO_WAIT:+--no-wait} \
     --address="http://${MASTER_ADDR:-127.0.0.1}:${RAY_DASHBOARD_PORT:-8265}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
-    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+    --runtime-env-json="${RUNTIME_ENV_JSON:-"{}"}" \
     -- python3 -m relax.entrypoints.train \
+    --train-env-vars "${TRAIN_ENV_JSON}" \
     --resource "{\"actor\": [1, ${NPU_COUNT}], \"rollout\": [1, ${NPU_COUNT}]}" \
     --max-staleness 0 \
     --num-data-storage-units 1 \

@@ -153,7 +153,7 @@ ARG MEGATRON_ADAPTOR_COMMIT=011b80f9a14c935d7a6d85b710f8b577f4704608
 ARG TRANSFORMER_ENGINE_NPU_COMMIT=e4139353c7f698c780d08f65077b6fa6c51a8a49
 ARG MINDSPEED_COMMIT=d0d5955ba445e8dc3ed8b6aa4a76c053364fba7a
 ARG MINDSPEED_OPS_COMMIT=b1ef3adcfc2f0a2932d6b2eb831f275fe1daacfb
-ARG MINDSPEED_BRIDGE_COMMIT=1da5bf7c8d69ca8d09cf97c212da431a6ce47a2c
+ARG MINDSPEED_BRIDGE_COMMIT=e472e9c6c180bb2fffa4c93c3aa132ca868767fc
 ARG HYPER_MULTICORE_REPO=https://github.com/mindspore-ai/hyper-multicore.git
 ARG HYPER_MULTICORE_COMMIT=1065f23ed66929b45baa8c2de3168cd825862b35
 
@@ -198,7 +198,7 @@ RUN cd /root/Megatron-Bridge && \
     patch -p1 < /root/Relax/docker/npu_patch/transformer-engine-npu.patch && \
     git add . && git commit -m "adapt for Relax"
 
-# hyper-multicore: native MegaMoE kernels behind the opt-in RELAX_MEGA_MOE path.
+# HyperMulticore provides the native MegaMoE kernels for training.
 # The ready-init patch orders the device-side event reset before the SHMEM host barrier.
 # Keep Git LFS pointers in the locked native dependency archives.
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
