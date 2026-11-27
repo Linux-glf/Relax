@@ -222,3 +222,370 @@ index 99853939f..e69470f44 100644
                      loss_mask=loss_mask,
                      output_layer=self.output_layer,
                      output_weight=output_weight,
+
+diff --git a/megatron/core/ssm/gated_delta_net.py b/megatron/core/ssm/gated_delta_net.py
+index 1dbaf161e..51eb9e177 100644
+--- a/megatron/core/ssm/gated_delta_net.py
++++ b/megatron/core/ssm/gated_delta_net.py
+@@ -7,6 +7,7 @@
+ 
+ import logging
+ from dataclasses import dataclass, replace
++from functools import lru_cache
+ from typing import List, Optional, Tuple, Union
+ 
+ import torch
+@@ -308,7 +309,8 @@ class GatedDeltaNet(MegatronModule):
+                 not self.config.deterministic_mode
+             ), "Packed sequence does not support deterministic mode."
+ 
+-            # Resolve cu_seqlens with alignment padding handling.
++            # Resolve cu_seqlens with alignment padding handling. Only the q
++            # side is resolved (one device->host sync per microbatch); kv must match.
+             cu_seqlens_q = self._resolve_cu_seqlens(
+                 packed_seq_params.cu_seqlens_q_padded,
+                 packed_seq_params.cu_seqlens_q,
+@@ -316,14 +318,12 @@ class GatedDeltaNet(MegatronModule):
+                 "cu_seqlens_q",
+                 cp_size=self.cp_size,
+             )
+-            cu_seqlens_kv = self._resolve_cu_seqlens(
+-                packed_seq_params.cu_seqlens_kv_padded,
+-                packed_seq_params.cu_seqlens_kv,
+-                seq_len,
+-                "cu_seqlens_kv",
+-                cp_size=self.cp_size,
++            cu_seqlens_kv = (
++                packed_seq_params.cu_seqlens_kv_padded
++                if packed_seq_params.cu_seqlens_kv_padded is not None
++                else packed_seq_params.cu_seqlens_kv
+             )
+-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
++            assert _packed_cu_seqlens_equal(packed_seq_params, cu_seqlens_q, cu_seqlens_kv), (
+                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+             )
+@@ -342,40 +342,41 @@ class GatedDeltaNet(MegatronModule):
+         nvtx_range_pop(suffix="in_proj")
+ 
+         # CP All to All: CP to HP
+-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
+-            outputs = []
+-            for qkvzba_i in unpacked_qkvzba:
+-                qkvzba_i = tensor_a2a_cp2hp(
+-                    qkvzba_i,
+-                    seq_dim=0,
+-                    head_dim=-1,
+-                    cp_group=self.pg_collection.cp,
+-                    split_sections=[
+-                        self.qk_dim_local_tp,
+-                        self.qk_dim_local_tp,
+-                        self.v_dim_local_tp,
+-                        self.v_dim_local_tp,
+-                        self.num_value_heads // self.tp_size,
+-                        self.num_value_heads // self.tp_size,
+-                    ],
+-                )
+-                outputs.append(qkvzba_i)
+-            qkvzba = torch.cat(outputs, dim=0)
+-        else:
+-            qkvzba = tensor_a2a_cp2hp(
++        if self.cp_size > 1:
++            # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
++            # The permutation is built once per shape; its inverse gives a cheap backward that
++            # avoids NPU's slow last-dim index_select scatter.
++            qkvzba = _permute_head_for_split_sections(
+                 qkvzba,
+-                seq_dim=0,
+-                head_dim=-1,
+-                cp_group=self.pg_collection.cp,
+-                split_sections=[
++                (
+                     self.qk_dim_local_tp,
+                     self.qk_dim_local_tp,
+                     self.v_dim_local_tp,
+                     self.v_dim_local_tp,
+                     self.num_value_heads // self.tp_size,
+                     self.num_value_heads // self.tp_size,
+-                ],
++                ),
++                self.cp_size,
++            )
++        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
++            qkvzba = tensor_a2a_cp2hp(
++                qkvzba,
++                seq_dim=0,
++                head_dim=-1,
++                cp_group=self.pg_collection.cp,
++                undo_attention_load_balancing=False,
++            )
++            if self.cp_size > 1:
++                # Permute at the seq dim so that a single unsectioned a2a
++                # is equivalent to per-sequence a2a.
++                # This also folds the ``_undo_attention_load_balancing`` step.
++                thd_cp_a2a_idx, thd_cp_a2a_inv = _get_thd_cp_a2a_perm(
++                    packed_seq_params, cu_seqlens_q, self.cp_size, seq_len
++                )
++                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
++        else:
++            qkvzba = tensor_a2a_cp2hp(
++                qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+             )
+ 
+         # Transpose: s b x --> b s x
+@@ -489,14 +490,15 @@ class GatedDeltaNet(MegatronModule):
+ 
+         # CP all to all: HP to CP
+         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+-            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
+-            outputs = []
+-            for norm_out_i in unpacked_norm_out:
+-                norm_out_i = tensor_a2a_hp2cp(
+-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+-                )
+-                outputs.append(norm_out_i)
+-            norm_out = torch.cat(outputs, dim=0)
++            if self.cp_size > 1:
++                norm_out = norm_out.index_select(0, thd_cp_a2a_inv)
++            norm_out = tensor_a2a_hp2cp(
++                norm_out,
++                seq_dim=0,
++                head_dim=-1,
++                cp_group=self.pg_collection.cp,
++                redo_attention_load_balancing=False,
++            )
+         else:
+             norm_out = tensor_a2a_hp2cp(
+                 norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+@@ -573,15 +575,25 @@ class GatedDeltaNet(MegatronModule):
+         return g, beta
+ 
+     def _resolve_cu_seqlens(
+-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
++        self,
++        cu_seqlens_padded,
++        cu_seqlens_actual,
++        total_seq_len,
++        name,
++        cp_size: int = 1,
+     ):
+-        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
++        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding.
++
++        Relax's ``_patch_gdn_cu_seqlens_validation`` memoizes this method per
++        microbatch, so this body runs once per packed sequence/layer group.
++        """
+         if cu_seqlens_padded is not None:
+             cu_seqlens = cu_seqlens_padded
+         else:
+             cu_seqlens = cu_seqlens_actual
+ 
+-        total_cu = cu_seqlens[-1].cpu().item()
++        cu_seqlens_cpu = cu_seqlens.cpu()  # one sync per microbatch via Relax memoization
++        total_cu = cu_seqlens_cpu[-1].item()
+         if total_cu != total_seq_len:
+             raise ValueError(
+                 f"GDN: {name}[-1]={total_cu} does not match "
+@@ -589,7 +601,7 @@ class GatedDeltaNet(MegatronModule):
+                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+             )
+ 
+-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
++        seq_lengths = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
+         if (seq_lengths % cp_size != 0).any():
+             raise ValueError(
+                 f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
+@@ -708,6 +720,133 @@ def _unpack_sequence(x, cu_seqlens, dim=1):
+     return unpacked_x
+ 
+ 
++def _build_thd_cp_a2a_perm(
++    cu_seqlens: torch.Tensor, cp_size: int, t_global: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    cu = cu_seqlens.to(dtype=torch.long)
++    t_local = t_global // cp_size
++
++    positions = torch.arange(t_global, device=cu.device)
++    seq_idx = torch.bucketize(positions, cu[1:], right=True)
++    seq_lens = torch.diff(cu)
++    halves = seq_lens // (2 * cp_size)  # per-sequence half-chunk size
++    local_starts = cu[:-1] // cp_size
++    global_starts = cu[:-1]
++
++    half_i = halves[seq_idx]
++    pos_in_seq = positions - global_starts[seq_idx]
++
++    natural_chunk = pos_in_seq // half_i  # in [0, 2*cp)
++    offset = pos_in_seq - natural_chunk * half_i
++
++    # Invert the ordering produced by `_undo_attention_load_balancing`:
++    #   natural_chunk < cp:   load_balanced = 2 * natural_chunk
++    #   natural_chunk >= cp:  load_balanced = 4*cp - 2*natural_chunk - 1
++    lb_chunk = torch.where(
++        natural_chunk < cp_size, 2 * natural_chunk, 4 * cp_size - 2 * natural_chunk - 1
++    )
++
++    # In the per-sequence load-balanced layout each rank owns load-balanced
++    # chunks (2r) and (2r+1), in that order, of every sequence.
++    rank = lb_chunk // 2
++    half_within_rank = lb_chunk - 2 * rank
++    k = half_within_rank * half_i + offset
++
++    idx = rank * t_local + local_starts[seq_idx] + k
++
++    inv = torch.empty_like(idx)
++    inv[idx] = positions
++
++    return idx, inv
++
++
++class _PermuteLastDim(torch.autograd.Function):
++    """Apply a precomputed last-dim permutation with a cheap inverse backward.
++
++    The stock NPU autograd for ``index_select`` along the last dim uses a slow
++    scatter; because the index is a complete permutation, its backward is just
++    another ``index_select`` with the inverse permutation.
++    """
++
++    @staticmethod
++    def forward(ctx, tensor, perm, inv):
++        ctx.inv = inv
++        return tensor.index_select(-1, perm)
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        return grad_output.index_select(-1, ctx.inv), None, None
++
++
++@lru_cache(maxsize=32)
++def _build_head_perm_for_split_sections(
++    split_sections: tuple[int, ...], cp_size: int, device: torch.device
++):
++    """Build (perm, inverse_perm) for the fused-section all-to-all layout."""
++    assert all(
++        s % cp_size == 0 for s in split_sections
++    ), f"split_sections {split_sections} must be divisible by cp_size {cp_size} for GDN"
++    offset = 0
++    parts = []
++    for s in split_sections:
++        parts.append(torch.arange(offset, offset + s, device=device, dtype=torch.long).view(cp_size, -1))
++        offset += s
++    perm = torch.cat(parts, dim=-1).view(-1)
++    inv = torch.empty_like(perm)
++    inv[perm] = torch.arange(perm.numel(), device=device, dtype=torch.long)
++    return perm, inv
++
++
++def _permute_head_for_split_sections(
++    tensor: torch.Tensor, split_sections: tuple[int, ...], cp_size: int
++) -> torch.Tensor:
++    perm, inv = _build_head_perm_for_split_sections(split_sections, cp_size, tensor.device)
++    return _PermuteLastDim.apply(tensor, perm, inv)
++
++
++def _tensor_version(tensor) -> Optional[int]:
++    """Return the tensor version, or None for inference tensors without one."""
++    try:
++        return tensor._version
++    except (AttributeError, RuntimeError):
++        return None
++
++
++def _packed_cu_seqlens_equal(packed_seq_params, cu_seqlens_q, cu_seqlens_kv) -> bool:
++    """Cache the per-layer cu_seqlens equality check per microbatch."""
++    key = (
++        id(cu_seqlens_q),
++        cu_seqlens_q.data_ptr(),
++        _tensor_version(cu_seqlens_q),
++        id(cu_seqlens_kv),
++        cu_seqlens_kv.data_ptr(),
++        _tensor_version(cu_seqlens_kv),
++    )
++    cached = getattr(packed_seq_params, "_gdn_cu_seqlens_equal_cache", None)
++    if cached is not None and cached[0] == key:
++        return cached[1]
++    equal = torch.equal(cu_seqlens_q, cu_seqlens_kv)
++    packed_seq_params._gdn_cu_seqlens_equal_cache = (key, equal)
++    return equal
++
++
++def _get_thd_cp_a2a_perm(packed_seq_params, cu_seqlens, cp_size, t_global):
++    """Return the cached seq permutation for this microbatch."""
++    key = (
++        id(cu_seqlens),
++        cu_seqlens.data_ptr(),
++        _tensor_version(cu_seqlens),
++        cp_size,
++        t_global,
++    )
++    cached = getattr(packed_seq_params, "_gdn_thd_cp_a2a_perm_cache", None)
++    if cached is not None and cached[0] == key:
++        return cached[1], cached[2]
++    idx, inv = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, t_global)
++    packed_seq_params._gdn_thd_cp_a2a_perm_cache = (key, idx, inv)
++    return idx, inv
++
++
+ ####################
+ # Sharded state dict utilities
+ ####################
+diff --git a/megatron/core/ssm/mamba_context_parallel.py b/megatron/core/ssm/mamba_context_parallel.py
+index 3925f8bd8..9dc45bbd9 100644
+--- a/megatron/core/ssm/mamba_context_parallel.py
++++ b/megatron/core/ssm/mamba_context_parallel.py
+@@ -7,7 +7,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+ from megatron.core.packed_seq_params import PackedSeqParams
+-from megatron.core.tensor_parallel import all_to_all
++from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
+ from megatron.core.utils import is_te_min_version
+ 
+ try:
+@@ -322,20 +322,9 @@ def _all_to_all_cp2hp(
+     """
+     assert input_.dim() == 3, "all_to_all_cp2hp assumes 3-d input shape."
+     s_in, b_in, h_in = input_.shape
+-    # Squash the first two dimensions -> [s*b, h]
+-    input_ = input_.reshape(-1, h_in)
+-    # Split into world_size chunks along the h dimension
+-    world_size = cp_group.size()
+-    h_out = h_in // world_size
+-    split_tensors = torch.split(input_, split_size_or_sections=h_out, dim=1)
+-    # Concat the chunks along the s*b dimension
+-    concat_tensor = torch.cat(split_tensors, dim=0)
+-    # TODO(duncan): Can the following be optimized by using the non-single (tensor list) version of
+-    # all-to-all?
+-    # Swap chunks of dim0 across the cp ranks
+-    output = all_to_all(cp_group, concat_tensor)
+-    # Recover the s and b dimensions
+-    output = output.reshape(s_in * world_size, b_in, h_out)
++    s_out, h_out = s_in * cp_group.size(), h_in // cp_group.size()
++    output = all_to_all_sp2hp(input_, group=cp_group)
++    output = output.reshape(s_out, b_in, h_out)
+     return output
+ 
+ 
+@@ -361,18 +350,9 @@ def _all_to_all_hp2cp(
+     """
+     assert input_.dim() == 3, "all_to_all_hp2cp assumes 3-d input shape."
+     s_in, b_in, h_in = input_.shape
+-    # Squash the first two dimensions -> [s*b, h]
+-    input_ = input_.reshape(-1, h_in)
+-    # Swap chunks of dim0 across the cp ranks
+-    input_exchanged = all_to_all(cp_group, input_)
+-    # Split into world_size chunks along the s*b dimension
+-    world_size = cp_group.size()
+-    s_out = s_in // world_size
+-    split_tensors = torch.split(input_exchanged, split_size_or_sections=s_out * b_in, dim=0)
+-    # Concat the chunks along the h dimension
+-    output = torch.cat(split_tensors, dim=-1)
+-    # Recover the s and b dimensions
+-    output = output.reshape(s_out, b_in, h_in * world_size)
++    s_out, h_out = s_in // cp_group.size(), h_in * cp_group.size()
++    output = all_to_all_hp2sp(input_, group=cp_group)
++    output = output.reshape(s_out, b_in, h_out)
+     return output
+ 
+ 

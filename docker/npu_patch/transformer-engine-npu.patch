@@ -58,4 +58,148 @@ index 7dbeb58..6194e38 100644
 +        ).view(-1, n, 8)
  
      return [attn_out, softmax_max, softmax_sum, rng_states]
+
+diff --git a/transformer_engine/pytorch/attention/dot_product_attention/ulysses_context_parallel.py b/transformer_engine/pytorch/attention/dot_product_attention/ulysses_context_parallel.py
+index 17e07fa..6d4a05d 100644
+--- a/transformer_engine/pytorch/attention/dot_product_attention/ulysses_context_parallel.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/ulysses_context_parallel.py
+@@ -7,7 +7,6 @@ from typing import Optional, List
+ import torch
+ import torch_npu
+ import torch.distributed as dist
+-from einops import rearrange
+ 
+ from .backends import get_fa_config
+ from .utils import prepare_sbhd_format, prepare_thd_format
+@@ -25,6 +24,72 @@ PERMUTE_DIMS2 = {
+ }
+ 
+ 
++def _reorder_thd_blocks(tensor, cu_seqlens, cp_size: int, reverse: bool = False):
++    """Reorder packed THD chunks between Ulysses gathered and natural order.
++
++    ``slice_with_cp`` stores, for every sample, chunk ``rank`` followed by
++    chunk ``2 * cp_size - 1 - rank`` on rank ``rank``.  Ulysses gathers the
++    rank-local tensors in rank order, with every sample nested inside each
++    rank; that is not the natural packed order.  ``reverse=False`` maps the
++    gathered layout to natural order before FlashAttention, and
++    ``reverse=True`` maps the natural-order attention output back to the
++    gathered layout expected by the output all-to-all.
++    """
++    if cp_size <= 1 or tensor.shape[0] == 0:
++        return tensor
++    if not isinstance(cu_seqlens, (list, tuple)):
++        cu_seqlens = cu_seqlens.tolist()
++    if tensor.shape[0] % cp_size:
++        raise ValueError(f"THD token count {tensor.shape[0]} is not divisible by cp_size={cp_size}")
++
++    local_cu = [boundary // cp_size for boundary in cu_seqlens]
++    rank_stride = tensor.shape[0] // cp_size
++    indices = []
++
++    if not reverse:
++        # Natural order (sample, chunk) -> position in the rank-major gathered tensor.
++        for sample in range(len(cu_seqlens) - 1):
++            seq_len = cu_seqlens[sample + 1] - cu_seqlens[sample]
++            if seq_len == 0:
++                continue
++            chunk_size = seq_len // (2 * cp_size)
++            if chunk_size * 2 * cp_size != seq_len:
++                raise ValueError(
++                    f"THD sequence length {seq_len} is not divisible by 2 * cp_size = {2 * cp_size}"
++                )
++            local_start = local_cu[sample]
++            for chunk_id in range(2 * cp_size):
++                if chunk_id < cp_size:
++                    rank, part = chunk_id, 0
++                else:
++                    rank, part = 2 * cp_size - 1 - chunk_id, 1
++                source = rank * rank_stride + local_start + part * chunk_size
++                indices.extend(range(source, source + chunk_size))
++    else:
++        # Rank-major gathered order -> position in the natural-order attention output.
++        for rank in range(cp_size):
++            for sample in range(len(cu_seqlens) - 1):
++                seq_len = cu_seqlens[sample + 1] - cu_seqlens[sample]
++                if seq_len == 0:
++                    continue
++                chunk_size = seq_len // (2 * cp_size)
++                if chunk_size * 2 * cp_size != seq_len:
++                    raise ValueError(
++                        f"THD sequence length {seq_len} is not divisible by 2 * cp_size = {2 * cp_size}"
++                    )
++                natural_start = cu_seqlens[sample]
++                for chunk_id in (rank, 2 * cp_size - 1 - rank):
++                    source = natural_start + chunk_id * chunk_size
++                    indices.extend(range(source, source + chunk_size))
++
++    if len(indices) != tensor.shape[0]:
++        raise ValueError(
++            f"THD reorder length mismatch: {len(indices)} indices for {tensor.shape[0]} tokens"
++        )
++    index = torch.tensor(indices, dtype=torch.long, device=tensor.device)
++    return tensor.index_select(0, index)
++
++
+ def AttnFuncWithCPAndQKVOA2A(
+         query_layer,
+         key_layer,
+@@ -42,8 +107,14 @@ def AttnFuncWithCPAndQKVOA2A(
+         ulysses_comm_para
+ ):
+     spg = cp_group
+-    scatter_idx = ulysses_comm_para.get('scatter_idx')
+-    gather_idx = ulysses_comm_para.get('gather_idx')
++    is_thd = qkv_format == 'thd'
++    if is_thd:
++        # THD tensors are [tokens, heads, head_dim], so scatter over the heads
++        # dimension and gather the full sequence dimension.
++        scatter_idx, gather_idx = 1, 0
++    else:
++        scatter_idx = ulysses_comm_para.get('scatter_idx')
++        gather_idx = ulysses_comm_para.get('gather_idx')
+     seq_world_size = torch.distributed.get_world_size(spg)
+ 
+     if seq_world_size > key_layer.shape[scatter_idx] and query_layer.shape[scatter_idx] % key_layer.shape[scatter_idx] == 0:
+@@ -58,17 +129,18 @@ def AttnFuncWithCPAndQKVOA2A(
+ 
+     fa_config = get_fa_config(attn_mask_type)
+ 
+-    seq_length, bsz, n_head, head_dim = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
+-    head_dim_k, head_dim_v = k.shape[3], v.shape[3]
+-    q, k, v, _ = prepare_sbhd_format(q, k, v)
+-    shape_order = 'SBH'
+-
+-    if qkv_format == 'thd':
+-        q = rearrange(q, 's b (h d) -> (b s) h d', d=head_dim)
+-        k = rearrange(k, 's b (h d) -> (b s) h d', d=head_dim_k)
+-        v = rearrange(v, 's b (h d) -> (b s) h d', d=head_dim_v)
+-        _, cu_seqlens_q, cu_seqlens_kv = prepare_thd_format(q, cu_seqlens_q, cu_seqlens_kv)
++    if is_thd:
++        n_head, cu_seqlens_q, cu_seqlens_kv = prepare_thd_format(q, cu_seqlens_q, cu_seqlens_kv)
++        # The all-to-all gathers the rank-local zig-zag shards in rank order;
++        # restore the natural packed-sequence order before FlashAttention.
++        q = _reorder_thd_blocks(q, cu_seqlens_q, seq_world_size)
++        k = _reorder_thd_blocks(k, cu_seqlens_kv, seq_world_size)
++        v = _reorder_thd_blocks(v, cu_seqlens_kv, seq_world_size)
+         shape_order = 'TND'
++    else:
++        n_head = q.shape[2]
++        q, k, v, _ = prepare_sbhd_format(q, k, v)
++        shape_order = 'SBH'
+ 
+     context_layer = torch_npu.npu_fusion_attention(
+         q, k, v, n_head, shape_order,
+@@ -85,9 +157,9 @@ def AttnFuncWithCPAndQKVOA2A(
+         actual_seq_kvlen=cu_seqlens_kv
+     )[0]
+ 
+-    if qkv_format == 'thd':
+-        context_layer = rearrange(context_layer, '(b s) h d -> s b (h d)', b=bsz)
+-        shape_order = 'TND'
++    if is_thd:
++        # Restore the gathered rank order expected by the reverse all-to-all.
++        context_layer = _reorder_thd_blocks(context_layer, cu_seqlens_q, seq_world_size, reverse=True)
+ 
+     output = all_to_all(context_layer, spg, gather_idx, scatter_idx, query_layer.size(scatter_idx))
  

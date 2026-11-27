@@ -53,8 +53,10 @@ def _get_rank_tag() -> str:
 
 def _should_profile_train_rank(args) -> bool:
     ranks = getattr(args, "profile_ranks", None)
+    # Megatron's default is an empty list, which means "all ranks"; treating
+    # it as "no ranks" silently disabled the profiler.
     return _profile_this_rank() and (
-        ranks is None or torch.distributed.get_rank(group=torch.distributed.group.WORLD) in ranks
+        not ranks or torch.distributed.get_rank(group=torch.distributed.group.WORLD) in ranks
     )
 
 
