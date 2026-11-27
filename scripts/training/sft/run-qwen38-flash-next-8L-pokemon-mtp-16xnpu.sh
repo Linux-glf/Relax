@@ -670,10 +670,30 @@ mkdir -p log
 # die count, read off the visible dies, is the way to keep them in step.
 NPU_COUNT="$(awk -F, '{print NF}' <<< "${ASCEND_RT_VISIBLE_DEVICES}")"
 
+# Apply the verified 8L defaults after resolving the launch environment.
+TRAIN_ENV_JSON="$(python3 - "${RUNTIME_ENV_JSON:-}" <<'PY'
+import json
+import os
+import sys
+
+job_env = json.loads(sys.argv[1] or "{}").get("env_vars") or {}
+defaults = {
+    "QWEN38_MEGA_MOE": "1",
+    "QWEN38_HC_IMPL": "npu",
+    "QWEN38_QSA_GROUP": "1",
+    "QWEN38_QSA_INDEXER_IMPL": "auto",
+    "QWEN4_EXP_PLE_TABLE_IN_DCP": "1",
+    "QWEN4_EXP_MTP_INPUT_MASK": "0",
+}
+print(json.dumps({name: os.environ.get(name) or job_env.get(name) or value for name, value in defaults.items()}))
+PY
+)"
+
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${MASTER_ADDR:-127.0.0.1}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
-   --runtime-env-json="${RUNTIME_ENV_JSON}" \
+   --runtime-env-json="${RUNTIME_ENV_JSON:-"{}"}" \
    -- python3 -m relax.entrypoints.train \
+   --train-env-vars "${TRAIN_ENV_JSON}" \
    --resource "{\"sft\": [1, 0], \"actor\": [1, ${NPU_COUNT}]}" \
    --sft-max-in-flight-steps ${SFT_MAX_IN_FLIGHT_STEPS:-2} \
    --num-data-storage-units "${NPU_COUNT}" \
